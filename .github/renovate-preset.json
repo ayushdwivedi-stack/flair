@@ -65,7 +65,18 @@
       "groupName": null
     },
     {
-      "description": "Group GitHub Actions into a single PR so sub-actions land together. CodeQL rejects mixed versions across sub-actions (bob#58/#99), so all codeql-action sub-actions must land in one PR.",
+      "description": "Group github/codeql-action sub-action updates of every type, majors included, into one PR. CodeQL rejects mixed versions across init, autobuild and analyze, so all codeql-action sub-actions must land together.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchPackageNames": [
+        "github/codeql-action",
+        "github/codeql-action/**"
+      ],
+      "groupName": "github/codeql-action"
+    },
+    {
+      "description": "Group non-major GitHub Actions updates into a single PR so sub-actions land together.",
       "matchManagers": [
         "github-actions"
       ],
