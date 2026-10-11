@@ -2007,6 +2007,40 @@ jobs:
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@480db559a14342288b67e54bd959dd52dc3ee68f # v3
 
+  renovate-preset:
+    # flair#1937 — the shared org preset's packageRules decide how Renovate
+    # groups updates for every repo that extends it (flair, cli, ...). A rule
+    # that is too broad, too narrow, or in the wrong order silently changes the
+    # PRs Renovate opens: a github/codeql-action major left ungrouped opens one
+    # PR per sub-action, and each of those fails CodeQL's mixed-version check
+    # (flair#1937). Reviewing the JSON by eye cannot catch an ordering bug
+    # (packageRules are order-sensitive), so this job runs the real preset
+    # through Renovate's own validator and rule evaluator.
+    #
+    # Renovate is installed for THIS job only, at an exact bake-time-cleared
+    # version (docs/supply-chain-policy.md §1), and is deliberately not a
+    # devDependency: it would otherwise drag hundreds of packages into bun.lock
+    # for the blocking audit gate (§7) and the Socket scan to cover. See
+    # scripts/check-renovate-preset-rules.mjs for the assertions and the two
+    # mutation self-checks (remove the rule; move it before the majors rule).
+    name: "Renovate preset rules"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          # Renovate 44 declares engines.node ^24.11.0; match it for the one job
+          # that runs Renovate's own code.
+          node-version: "24"
+      - name: Resolve the pinned Renovate version
+        id: renovate
+        run: echo "version=$(node scripts/check-renovate-preset-rules.mjs --print-renovate-version)" >> "$GITHUB_OUTPUT"
+      - name: "Validate the preset and exercise its packageRules with Renovate"
+        run: >-
+          npx --yes --package="renovate@${{ steps.renovate.outputs.version }}"
+          -- node scripts/check-renovate-preset-rules.mjs
+
   doclint:
     name: "Doc/Code Lint: implementation-term leaks"
     runs-on: ubuntu-latest

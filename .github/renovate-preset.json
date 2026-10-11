@@ -65,7 +65,7 @@
       "groupName": null
     },
     {
-      "description": "Group github/codeql-action sub-action updates of every type, majors included, into one PR. CodeQL rejects mixed versions across init, autobuild and analyze, so all codeql-action sub-actions must land together.",
+      "description": "Group github/codeql-action MAJOR updates into one PR. CodeQL rejects mixed versions across init, autobuild and analyze, so the action and its sub-actions must bump together; the \"Major updates land as their own PRs\" rule above would otherwise leave a codeql-action major ungrouped and Renovate would open a separate PR per sub-action. Non-major codeql-action updates fall to the GitHub Actions rule below, which groups them under github-actions.",
       "matchManagers": [
         "github-actions"
       ],
@@ -73,10 +73,13 @@
         "github/codeql-action",
         "github/codeql-action/**"
       ],
+      "matchUpdateTypes": [
+        "major"
+      ],
       "groupName": "github/codeql-action"
     },
     {
-      "description": "Group non-major GitHub Actions updates into a single PR so sub-actions land together.",
+      "description": "Group minor, patch, pin and digest GitHub Actions updates into a single PR so sub-actions land together.",
       "matchManagers": [
         "github-actions"
       ],
