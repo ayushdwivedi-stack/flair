@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Structural regression check for the CodeQL Action major group (flair#1937).
+// Check that the preset assigns CodeQL Action major updates (github-actions manager)
+// the group name github/codeql-action (flair#1937).
 // Run: node scripts/check-renovate-preset-rules.mjs
 
 import assert from "node:assert/strict";
@@ -21,12 +22,12 @@ function checkPreset(preset) {
   assert.deepEqual(
     codeql.matchPackageNames,
     [CODEQL, `${CODEQL}/**`],
-    "CodeQL base action and every sub-action must be named without other packages",
+    "matchPackageNames must contain exactly github/codeql-action and github/codeql-action/**",
   );
-  assert.deepEqual(codeql.matchUpdateTypes, ["major"], "CodeQL updates must be major only");
-  assert.equal(codeql.groupName, CODEQL, "CodeQL majors must share the group name");
+  assert.deepEqual(codeql.matchUpdateTypes, ["major"], "CodeQL matchUpdateTypes must be exactly [major]");
+  assert.equal(codeql.groupName, CODEQL, "CodeQL groupName must be github/codeql-action");
   const majorsIndex = rules.findLastIndex(isMajorsRule);
-  assert.ok(majorsIndex >= 0, "the ungrouping majors rule must exist");
+  assert.ok(majorsIndex >= 0, "the majors rule setting groupName: null must exist");
   assert.ok(rules.indexOf(codeql) > majorsIndex, "CodeQL rule must follow the majors rule");
 }
 
