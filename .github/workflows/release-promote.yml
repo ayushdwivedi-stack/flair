@@ -9,31 +9,37 @@ name: Release promote
 # branch's copy of the file) and holds no npm credential, so it can only decide
 # WHETHER to start this job. This job runs `workflow_dispatch` ON the `v*` tag
 # ref — the ref the `release-promote` environment's deployment policy admits —
-# and it takes NOTHING from the poll but "run now on this ref". It re-derives
-# every fact it acts on from immutable inputs: the version from the tag ref, the
-# tag's ancestry, the release-attempt marker, and the registry bytes.
+# and it takes NOTHING from the poll but "run now on this ref". It re-reads and
+# validates every fact it acts on: the version from the tag ref, the tag's
+# ancestry, the release-attempt marker (a deployment record, which can be changed
+# or deleted, so it is re-read and validated, never trusted), and the registry
+# bytes.
 #
 # THE TRUST ANCHOR. `scripts/ci/*` and the workflow files at a tag are ordinary
 # repository code: a non-release PR could land an exfiltrating `canary-verdict.sh`
 # on main, the next release tags that tree, and a job that ran the tag's copy
-# under the token would hand a stranger the token. So NO step that can see
-# `NPM_TOKEN` executes a path from the tag's checkout. The tag's tree is used
-# ONLY to (a) compare the release machinery against `origin/main` byte-for-byte
-# (the recency guard `release-publish.yml` already uses, widened to every file
-# this job executes) and (b) nothing else. Everything that runs under the token
-# runs from a SEPARATE tree materialised from `origin/main` at the pinned sha.
-# The `canary.yml`/`scripts/ci/*` files this workflow executes are owned by the
-# release trust root in `.github/CODEOWNERS`, so only the trust root can land a
-# change to them on main. This closes the pre-tag-tampered class; the
-# malicious-on-main class is closed by review + that ownership, not by this file.
+# under the token would hand a stranger the token. So:
+#   - GitHub runs the TAG's copy of this file and of `canary.yml` (a dispatched
+#     workflow and a local reusable workflow both resolve at the dispatch ref).
+#     The promote job's FIRST act requires both, and every script any job here
+#     runs (the canary's install, boot and plugin checks and their helpers
+#     included), to be byte-identical to `origin/main`.
+#   - No job executes a script from the tag's checkout. `prepare` and the canary
+#     move their workspace to the `origin/main` commit `prepare` pinned before any
+#     repository script runs; `promote` runs everything from a separate tree
+#     materialised from `origin/main` at its own pinned sha.
+#   - Those files are owned by the release trust root in `.github/CODEOWNERS`, so
+#     only the trust root can land a change to them on main.
+# This closes the pre-tag-tampered class; the malicious-on-main class is closed by
+# review + that ownership, not by this file.
 #
-# THE SHAPE. `prepare` (unprivileged) resolves the version from the tag and reads
-# the certified package-set digest + the flair tarball sha256 from the marker and
-# the registry. `canary` calls `canary.yml` via `workflow_call` — one definition —
-# so the published bytes are installed and booted exactly as a user would before
-# any tag moves. `promote` (privileged) runs after the canary PASSES, re-derives
-# everything itself, and runs the promote block emitted by the trusted
-# `canary-verdict.sh --emit bash` under `NPM_TOKEN`.
+# THE SHAPE. `prepare` (unprivileged) resolves the version from the tag, pins
+# `origin/main`, reads the certified package-set digest from the marker and
+# hashes the flair tarball. `canary` calls `canary.yml` via `workflow_call` (one
+# definition) on that pinned commit, so the published bytes are installed and
+# booted as a user would before any tag moves. `promote` (privileged) runs after
+# the canary PASSES, re-derives everything itself, and runs the promote block
+# emitted by the trusted `canary-verdict.sh --emit bash` under `NPM_TOKEN`.
 #
 # THE CREDENTIAL. `NPM_TOKEN` is referenced in ONE place: the final dist-tag
 # step's `env`. It is never in a job-level `env`, never a command argument, never
@@ -85,6 +91,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       expected_sha256: ${{ steps.flair_sha.outputs.expected_sha256 }}
       package_set_digest: ${{ steps.marker.outputs.package_set_digest }}
+      trusted_sha: ${{ steps.trusted.outputs.trusted_sha }}
     steps:
       - name: Check out the tag ref (the dispatch ref)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
@@ -113,11 +120,12 @@ jobs:
           echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
           echo "  resolved version ${BASH_REMATCH[1]} from $REF_NAME"
 
-      - name: Verify the tag commit is an ancestor of origin/main
+      - name: Verify the tag is on origin/main, pin origin/main and move the workspace to it
         # A tag can point at any commit; require it to be merged to main, so a
-        # promote never documents an un-reviewed tree.
-        env:
-          GH_TOKEN: ${{ github.token }}
+        # promote never documents an un-reviewed tree. Then pin origin/main (the
+        # canary runs this same commit) and move the workspace to it, so the one
+        # script this job runs, the flair tarball hasher, comes from trusted main.
+        id: trusted
         run: |
           set -euo pipefail
           git fetch --no-tags origin main
@@ -125,13 +133,21 @@ jobs:
             echo "::error::commit ${GITHUB_SHA} is not an ancestor of origin/main; tag a merged release commit."
             exit 1
           fi
-          echo "  ok ${GITHUB_SHA} is on origin/main"
+          MAIN_SHA="$(git rev-parse origin/main)"
+          git checkout --quiet --detach "$MAIN_SHA"
+          if [ "$(git rev-parse HEAD)" != "$MAIN_SHA" ] || [ -n "$(git status --porcelain --untracked-files=all --ignored)" ]; then
+            echo "::error::release-promote: the workspace is not exactly origin/main ${MAIN_SHA}; refusing to run a script from it."
+            exit 1
+          fi
+          echo "trusted_sha=${MAIN_SHA}" >> "$GITHUB_OUTPUT"
+          echo "  ok ${GITHUB_SHA} is on origin/main; the workspace is origin/main ${MAIN_SHA}"
 
       - name: Read the certified package-set digest from the release-attempt marker
         # The version and the digest come from the MARKER (written by stage-publish
-        # from the artifact it staged), never from main's package.json, which moves
-        # on after a release. A missing or malformed marker is a refusal: this job
-        # never promotes a version nothing certified.
+        # from the artifact prepared for staging, before the staging requests),
+        # never from main's package.json, which moves on after a release. A missing
+        # or malformed marker is a refusal: this job never promotes a version
+        # nothing certified.
         id: marker
         env:
           GH_TOKEN: ${{ github.token }}
@@ -161,7 +177,7 @@ jobs:
           echo "package_set_digest=${PSD}" >> "$GITHUB_OUTPUT"
           echo "  marker v${VERSION} certifies package-set digest ${PSD}"
 
-      - name: Compute the flair tarball's published sha256 (canary input)
+      - name: Compute the flair tarball's published sha256 (canary input, trusted main's hasher)
         # The canary installs `@tpsdev-ai/flair@<version>` by exact version; its
         # `expected_sha256` is that published tarball's sha256, which this job
         # downloads and hashes. An unmeasurable read is a refusal.
@@ -184,15 +200,19 @@ jobs:
   canary:
     name: Post-publish canary (the published bytes)
     needs: prepare
-    # ONE definition: this calls the SAME canary a maintainer used to dispatch by
-    # hand, so the published bytes are installed and booted exactly as a user
-    # would before any tag moves. It is credential-less, so it may run the tag
-    # tree's copy.
+    # ONE definition: this calls the SAME canary a maintainer dispatches by hand.
+    # A called workflow can never hold more than its caller grants, so this job
+    # grants exactly what `canary.yml`'s job asks for (checkout) and nothing else.
+    permissions:
+      contents: read
     uses: ./.github/workflows/canary.yml
     with:
       version: ${{ needs.prepare.outputs.version }}
       expected_sha256: ${{ needs.prepare.outputs.expected_sha256 }}
       package_set_digest: ${{ needs.prepare.outputs.package_set_digest }}
+      # The origin/main commit `prepare` pinned: the canary moves its workspace to
+      # it before any repository script runs, so the tag supplies no executable.
+      trusted_sha: ${{ needs.prepare.outputs.trusted_sha }}
 
   promote:
     name: Promote latest under NPM_TOKEN
@@ -207,8 +227,8 @@ jobs:
       deployments: read    # the release-attempt marker
     steps:
       - name: Check out the tag ref (the dispatch ref)
-        # The tag's tree is used ONLY to compare the release machinery against
-        # origin/main below. No step that can see NPM_TOKEN executes a path here.
+        # This job executes nothing from this checkout: it is used only for the
+        # ancestry check and the byte comparison against origin/main below.
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
           persist-credentials: false
@@ -216,9 +236,11 @@ jobs:
 
       - name: Machinery-recency guard — pin origin/main and require the executed files to match
         # The FIRST act. `release-publish.yml` uses the same guard for its own
-        # workflow file; here it is widened to EVERY file this job executes, so a
-        # pre-tag-tampered copy of any of them is refused before anything runs under
-        # the token.
+        # workflow file; here it is widened to EVERY file this workflow executes,
+        # the canary's install, boot and plugin checks and their helpers included,
+        # so a pre-tag-tampered copy of any of them is refused before anything runs
+        # under the token. The list is the canary's script closure plus this job's
+        # own scripts (test/unit/release-promote-workflow.test.ts derives it).
         id: guard
         run: |
           set -euo pipefail
@@ -236,7 +258,13 @@ jobs:
             scripts/ci/lockstep-packages.mjs \
             scripts/ci/registry-tarball-sha256.mjs \
             scripts/ci/registry-latest-skew.mjs \
-            scripts/ci/package-set-digest.mjs ; do
+            scripts/ci/package-set-digest.mjs \
+            scripts/check-global-install-lockfile.mjs \
+            scripts/ci/check-instance-boot.sh \
+            scripts/ci/doctor-advisory.sh \
+            scripts/ci/boot-probe.mjs \
+            scripts/ci/check-plugin-canary.mjs \
+            scripts/lib/agent-identity.mjs ; do
             if [ ! -e "$f" ]; then
               echo "::error::release-promote: '$f' is absent from the tag's tree; refusing to promote from a tree that predates the release machinery."
               exit 1
@@ -412,6 +440,9 @@ jobs:
             exit 1
           fi
           NPMRC="$RUNNER_TEMP/npmrc"
+          # Single quotes on purpose: the file holds the literal `${NPM_TOKEN}`,
+          # which npm expands from the environment; the token never touches disk.
+          # shellcheck disable=SC2016
           printf '//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n' > "$NPMRC"
           export NPM_CONFIG_USERCONFIG="$NPMRC"
           cd "$TRUSTED"

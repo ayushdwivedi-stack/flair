@@ -182,33 +182,55 @@ describe("release-promote-poll — dispatch at most once per version (#1928 slic
     expect(script).toContain('gh workflow run release-promote.yml --ref "${ref}" -f dry_run=false');
   });
 
+  /**
+   * Run the poll's REAL `ALREADY="$(jq ...)"` line (extracted verbatim, flags and
+   * all) against `--paginate`-shaped output: one JSON object PER PAGE, written
+   * back to back, exactly as `gh api --paginate` prints a run list.
+   */
+  function already(pages: unknown[] | string): string {
+    const line = runScript()
+      .split("\n")
+      .find((l) => /^\s*ALREADY="\$\(jq /.test(l));
+    expect(line, "the poll's ALREADY= jq line is present").toBeDefined();
+    const dir = mkdtempSync(join(tmpdir(), "poll-runs-"));
+    try {
+      const runs = join(dir, "runs.json");
+      writeFileSync(runs, typeof pages === "string" ? pages : pages.map((p) => JSON.stringify(p)).join("\n"));
+      const sh = join(dir, "already.sh");
+      writeFileSync(sh, `set -euo pipefail\nversion=1.2.3\nRUNS=${JSON.stringify(runs)}\n${line!.trim()}\nprintf '%s' "$ALREADY"\n`);
+      const r = spawnSync("bash", [sh], { encoding: "utf8" });
+      return r.status === 0 ? r.stdout.trim() : `exit ${r.status}`;
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  const page = (...runs: unknown[]) => ({ total_count: 999, workflow_runs: runs });
+
   test("BEHAVIOURAL: the run-name / head-branch predicate identifies a version's run", () => {
-    const script = runScript();
-    const m = script.match(/'((?:\[|\{)[^']*any\([^']*\))'/);
-    expect(m, "the jq run predicate is present in the poll").not.toBeNull();
-    const filter = m![1]!;
-    const check = (runs: unknown[]): string => {
-      const dir = mkdtempSync(join(tmpdir(), "poll-runs-"));
-      try {
-        const f = join(dir, "runs.json");
-        writeFileSync(f, JSON.stringify({ workflow_runs: runs }));
-        const r = spawnSync(
-          "jq",
-          ["-r", "--arg", "t", "release-promote v1.2.3", "--arg", "b", "v1.2.3", filter, f],
-          { encoding: "utf8" },
-        );
-        expect(r.status, String(r.stderr)).toBe(0);
-        return r.stdout.trim();
-      } finally {
-        rmSync(dir, { recursive: true, force: true });
-      }
-    };
     // A run for THIS version, by run-name or by head branch → true (do not dispatch again).
-    expect(check([{ display_title: "release-promote v1.2.3", head_branch: "v1.2.3" }])).toBe("true");
-    expect(check([{ display_title: "other", head_branch: "v1.2.3" }])).toBe("true");
-    expect(check([{ display_title: "release-promote v1.2.3", head_branch: null }])).toBe("true");
+    expect(already([page({ display_title: "release-promote v1.2.3", head_branch: "v1.2.3" })])).toBe("true");
+    expect(already([page({ display_title: "other", head_branch: "v1.2.3" })])).toBe("true");
+    expect(already([page({ display_title: "release-promote v1.2.3", head_branch: null })])).toBe("true");
     // No run for this version → false (dispatch once).
-    expect(check([{ display_title: "release-promote v1.2.2", head_branch: "v1.2.2" }])).toBe("false");
-    expect(check([])).toBe("false");
+    expect(already([page({ display_title: "release-promote v1.2.2", head_branch: "v1.2.2" })])).toBe("false");
+    expect(already([page()])).toBe("false");
+  });
+
+  test("BEHAVIOURAL: every page is flattened into ONE decision — a match on page two is found", () => {
+    const p1 = page(
+      ...Array.from({ length: 100 }, (_, i) => ({ display_title: `release-promote v0.0.${i}`, head_branch: `v0.0.${i}` })),
+    );
+    const p2 = page({ display_title: "release-promote v1.2.3", head_branch: "v1.2.3" });
+    expect(already([p1, p2])).toBe("true");
+    // …and two pages with no match anywhere are ONE "false", not one value per page.
+    expect(already([p1, page({ display_title: "release-promote v1.2.2", head_branch: "v1.2.2" })])).toBe("false");
+  });
+
+  test("BEHAVIOURAL: an uninterpretable run list is never read as 'no run'", () => {
+    // A page without a workflow_runs array, or no page at all, yields neither
+    // accepted value, so the poll's next check errors out instead of dispatching.
+    expect(already([page(), { message: "Not Found" }])).toBe("invalid");
+    expect(already("")).toBe("invalid");
+    expect(already("{not json")).toMatch(/^exit [1-9]/);
   });
 });

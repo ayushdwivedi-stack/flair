@@ -223,14 +223,23 @@ cannot be re-staged under a different tag.
 
 ### Phase 4 — the post-publish canary
 
-With flair#1928 slice 2 merged, this phase runs for you. Once every staged package
-is approved and public, the unprivileged
+Once the [`release-promote` environment](#github-release-promote-environment-flair1928-slice-2)
+and its `NPM_TOKEN` exist, this phase runs for you. When every staged package is
+approved and public, the unprivileged
 [`release-promote-poll`](../.github/workflows/release-promote-poll.yml) poll dispatches
 the privileged [`release-promote`](../.github/workflows/release-promote.yml) workflow on
 the version's tag ref, and that workflow calls the
-[`post-publish canary`](../.github/workflows/canary.yml) — the same one below — before it
-promotes anything. To run the canary by hand instead, or to re-run a promote whose
-`release-promote` environment did not exist yet, dispatch it with three inputs:
+[`post-publish canary`](../.github/workflows/canary.yml) — the same one below, run from
+the default branch's tree at a pinned commit — before it promotes anything. The poll
+dispatches **at most once per version**: a run that fails (a red canary, a refusal, the
+environment missing) is not dispatched again. Re-run the promote by hand on the TAG
+ref, which re-runs its canary too:
+
+```bash
+gh workflow run release-promote.yml --ref v<ver> -f dry_run=false
+```
+
+To run the canary alone by hand (it moves nothing), dispatch it with three inputs:
 
 | Input | Value |
 | ----- | ----- |
@@ -268,15 +277,15 @@ none does. `flair` at `latest` 0.55.1 while `flair-client` / `flair-mcp` / the
 plugins sit at 0.54.2 is exactly the mismatch `flair#1383` detects at runtime —
 and 0.55.1's promote had to be assembled by hand, line by line, for this reason.
 
-With flair#1928 slice 2 merged, this phase also runs for you: the poll dispatches
-`release-promote` on the tag ref, that workflow re-derives the version, the tag's
-ancestry, the release-attempt marker and the certified package-set digest from
-immutable inputs, runs the canary above, and — on PASS — runs the promote block
-below, which it obtains as executable text from `scripts/ci/canary-verdict.sh`
-(`--emit bash`, the same block a human would paste). It is rehearsable: a manual
-dispatch of `release-promote` defaults `dry_run` to `true`, which runs the whole job
-and prints the block without moving a tag. The manual path below stays as the
-fallback.
+With the `release-promote` environment configured, a successful `release-promote` run
+does this phase too: it re-reads and validates the version, the tag's ancestry, the
+release-attempt marker and the certified package-set digest, runs the canary above,
+and — on PASS — runs the promote block below, which it obtains as executable text from
+`scripts/ci/canary-verdict.sh` (`--emit bash`, the same block a human would paste). It
+is rehearsable: a manual dispatch of `release-promote` defaults `dry_run` to `true`,
+which runs the whole job and prints the block without moving a tag. The manual path
+below stays as the fallback; a failed run's recovery is
+[described below](#slice-2-flair1928--the-privileged-promote).
 
 - **On PASS**, the canary emits the complete, sha256-bound promote block as ONE
   snippet to paste once, from a repo checkout on a machine logged into npm. It
@@ -308,7 +317,9 @@ fallback.
   ```
 
   The preflight `test` guards integrity: a stale PASS, a re-cut version, or a
-  paste from a failed run aborts before `latest` moves. Paste **all** of the block
+  paste from a failed run aborts before `latest` moves. Before the first move the
+  block also reads every package's current `latest` and refuses if any is already
+  NEWER than `<ver>`: a superseded version never moves `latest` backward. Paste **all** of the block
   or **none** — a partial paste is the skew this phase exists to prevent.
 
   The block runs under bash; `scripts/ci/canary-verdict.sh` is bash **3.2**-safe,
@@ -508,12 +519,16 @@ release-promote`) is the only job that can see `NPM_TOKEN`. It takes nothing fro
 poll but "run now on this ref" and re-derives everything it acts on. Each control below
 is a test in `test/unit/release-promote-workflow.test.ts`:
 
-- **No tag code under the token.** The job's first act compares every file it will
-  execute (its own workflow, `canary.yml`, `canary-verdict.sh`, `lockstep-packages.mjs`,
-  `registry-tarball-sha256.mjs`, `registry-latest-skew.mjs`, `package-set-digest.mjs`)
-  byte-for-byte against `origin/main`, then materialises a SEPARATE tree from the pinned
-  `origin/main` sha. Every step that can see the token runs paths only from that tree.
-- **Re-derived, fail-closed.** The version is `github.ref_name` matching
+- **No script from the tag's checkout.** GitHub runs the tag's copy of
+  `release-promote.yml` and of the `canary.yml` it calls; every script either runs comes
+  from the default branch. `prepare` pins `origin/main` and moves its workspace there;
+  the canary moves its workspace to that same commit before any repository script runs
+  (its install, boot and plugin checks included); the promote job materialises a
+  SEPARATE tree from its own pinned `origin/main`. The promote job's first act requires
+  both workflow files and every executed script (the canary's script closure included)
+  to be byte-identical between the tag and `origin/main`, and `.github/CODEOWNERS` puts
+  each of them in the release trust root.
+- **Re-read and validated, fail-closed.** The version is `github.ref_name` matching
   `v<major>.<minor>.<patch>` exactly (a prerelease is refused); the tag commit is an
   ancestor of `origin/main`; the `release-attempt` marker exists with that version and a
   64-hex digest; and the registry package set re-derives to exactly that digest. An
@@ -521,8 +536,29 @@ is a test in `test/unit/release-promote-workflow.test.ts`:
 - **Token hygiene.** `NPM_TOKEN` appears in ONE step's `env`, reaches npm only through a
   throwaway `.npmrc` indirection, and is never a command argument or echoed.
 - **Dispatch at most once per version.** The poll identifies a version's run by the
-  run-name `release-promote v<version>` (or its tag head branch) and does not dispatch a
-  second time for that version; a failed run-list read is an error, never a dispatch.
+  run-name `release-promote v<version>` (or its tag head branch), across every page of
+  the run list, and does not dispatch a second time for that version; a failed or
+  uninterpretable run-list read is an error, never a dispatch.
 
-The skew check after the moves is the emitted block's own convergence check; on a partial
-move it names the packages and prints the exact restore lines, and the job fails.
+**When the promote block fails.** Nothing is restored automatically (a restore cannot
+be told apart from clobbering a newer legitimate `latest`); the job fails and the run
+log carries the commands for a human:
+
+- **Superseded or unreadable, before any move.** A package whose current `latest`
+  cannot be read, or is already a NEWER version, stops the block before the first
+  `dist-tag add`. Nothing moved.
+- **A `dist-tag add` fails.** The block stops at that package, prints a RESTORE line for
+  every package it attempted (the failed one included: npm can apply a tag and still
+  exit non-zero) and lists the packages never attempted. The convergence check does not
+  run on this path.
+- **Every add succeeds, the convergence check does not.** Exit 1 (skew) or 2 (the
+  check could not read the state) prints the same RESTORE lines; exit 3 (the registry
+  still served a previous `latest` when the wait ended) prints the check's re-run command
+  first and the RESTORE lines as the fallback.
+
+**What a re-run is safe for.** Re-running the same version's promote after a partial or
+failed move converges the set: the block re-derives the certified digest, a package
+already at `<ver>` is left as it is, and a package whose `latest` is newer stops the run
+before any move, so `latest` never goes backward past a newer release. Not covered: two
+versions' promotes running at the same moment, or a move made by hand between the
+block's read and its moves; the read precedes the moves, it is not a lock.

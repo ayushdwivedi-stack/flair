@@ -23,9 +23,9 @@ name: Release promote poll
 # checkout brings exactly those, and the derivation FAILS CLOSED — a non-zero exit
 # or an empty list is an error exit that names the cause, never a silent "ready".
 #
-# Slice 2 (`release-promote.yml`) is not merged yet: until it exists the poll logs
-# "would dispatch" and exits 0 (the dispatch is gated behind the workflow file's
-# existence).
+# The dispatch stays gated on `release-promote.yml` existing on the default
+# branch (slice 2 lands it); without the file the poll logs "would dispatch" and
+# exits 0.
 
 on:
   # SCHEDULE ONLY. A schedule run always executes the DEFAULT BRANCH's copy of this file.
@@ -162,13 +162,16 @@ jobs:
               # sets `run-name: release-promote v<version>`, so a run already exists
               # iff one carries that title or that head branch. The list is a network
               # read: a failure is NOT "no run" — it is an error exit, never a
-              # dispatch on an unknown.
+              # dispatch on an unknown. `--paginate` writes one JSON object PER PAGE,
+              # so jq SLURPS them (-s) and flattens every page's `workflow_runs`
+              # into ONE `any(...)` decision; a page without that array (or no page
+              # at all) is uninterpretable, never "no run".
               RUNS="$(mktemp)"
               if ! gh api --paginate "repos/${REPO}/actions/workflows/release-promote.yml/runs?per_page=100" > "${RUNS}"; then
                 echo "release-promote-poll: ERROR — could not list runs of release-promote.yml; refusing to dispatch for v${version} (unknown is not 'no run')" >&2
                 exit 1
               fi
-              ALREADY="$(jq -r --arg t "release-promote v${version}" --arg b "v${version}" '[.workflow_runs[]?] | any(.display_title == $t or .head_branch == $b)' "${RUNS}")"
+              ALREADY="$(jq -s -r --arg t "release-promote v${version}" --arg b "v${version}" 'if length > 0 and all(.[]; (.workflow_runs | type) == "array") then [.[].workflow_runs[]] | any(.display_title == $t or .head_branch == $b) else "invalid" end' "${RUNS}")"
               if [ "${ALREADY}" != "true" ] && [ "${ALREADY}" != "false" ]; then
                 echo "release-promote-poll: ERROR — could not interpret the release-promote.yml run list for v${version}; refusing to dispatch" >&2
                 exit 1
@@ -180,6 +183,6 @@ jobs:
               gh workflow run release-promote.yml --ref "${ref}" -f dry_run=false
               echo "  dispatched release-promote.yml --ref ${ref}"
             else
-              echo "  would dispatch release-promote.yml --ref ${ref} (slice 2 not merged yet)"
+              echo "  would dispatch release-promote.yml --ref ${ref} (release-promote.yml is not on the default branch)"
             fi
           done < "${TSV}"

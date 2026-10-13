@@ -5,9 +5,9 @@ name: Post-publish canary — install + boot a published version
 # for ~1.5 h until a human moved the tag by hand. Nothing between publish and
 # announce installed the published artifact the way a user does and booted it.
 #
-# This is that last line. It is dispatched by whoever approved the staged package
-# on npmjs.com, immediately after the approval (npm exposes no approval webhook,
-# and polling a human action in CI is waste). `release-publish.yml` stages with
+# This is that last line. `release-promote.yml` calls it after the npm approval
+# (flair#1928: the poll notices the approval, since npm exposes no webhook), on
+# trusted main's tree; a maintainer can still dispatch it by hand. `release-publish.yml` stages with
 # `--tag staged`, so between approval and promote the version is public but NOT
 # `latest` — the window this canary uses.
 #
@@ -74,8 +74,8 @@ on:
         type: string
   # flair#1928 slice 2: the privileged `release-promote.yml` calls THIS workflow
   # (`workflow_call`) after the npm approval, so there is ONE canary definition,
-  # not a second copy embedded in the promote job. The three inputs are the same
-  # the manual dispatch takes; the canary is credential-less either way.
+  # not a second copy embedded in the promote job. It takes the manual dispatch's
+  # three inputs plus `trusted_sha`; the canary is credential-less either way.
   workflow_call:
     inputs:
       version:
@@ -88,6 +88,10 @@ on:
         type: string
       package_set_digest:
         description: "the certified package-set digest (64 hex); the canary re-derives the SAME digest from the tarballs it verified and requires equality before any verdict."
+        required: true
+        type: string
+      trusted_sha:
+        description: "the origin/main commit (40 hex) the caller pinned; the canary moves its workspace to it before any repository script runs, so the caller's tag supplies no executable."
         required: true
         type: string
 
@@ -114,6 +118,49 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
           persist-credentials: false
+          # Full history: a release-promote call moves this workspace to a pinned
+          # origin/main commit (next step) and checks its ancestry.
+          fetch-depth: 0
+
+      - name: Select the executed tree (a release-promote call runs trusted main, never the tag)
+        # flair#1928 slice 2. A manual dispatch runs its dispatch ref's tree, as
+        # before. A call (GitHub reports the CALLER's workflow in
+        # `github.workflow_ref`) must pass `trusted_sha`, an origin/main commit;
+        # this step moves the workspace to exactly that commit BEFORE any
+        # repository script runs. Every script, helper and data file the steps
+        # below read is then trusted main's, and the caller's tag checkout
+        # supplies no executable.
+        env:
+          TRUSTED_SHA: ${{ inputs.trusted_sha }}
+          RUN_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TRUSTED_SHA}" ]; then
+            case "$RUN_WORKFLOW_REF" in
+              */.github/workflows/canary.yml@*)
+                echo "  manual dispatch: running the dispatch ref's tree $(git rev-parse HEAD)"
+                exit 0 ;;
+            esac
+            echo "::error::canary: called from '${RUN_WORKFLOW_REF}' without a trusted_sha; refusing to run the caller's tree."
+            exit 1
+          fi
+          if ! [[ "$TRUSTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::canary: trusted_sha '${TRUSTED_SHA}' is not a 40-hex commit sha; refusing to run."
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$TRUSTED_SHA" origin/main; then
+            echo "::error::canary: trusted_sha ${TRUSTED_SHA} is not on origin/main; refusing to run its scripts."
+            exit 1
+          fi
+          git checkout --quiet --detach "$TRUSTED_SHA"
+          # The workspace must now BE that commit: no tracked change, and no
+          # untracked or ignored file left over from the caller's checkout.
+          if [ "$(git rev-parse HEAD)" != "$TRUSTED_SHA" ] || [ -n "$(git status --porcelain --untracked-files=all --ignored)" ]; then
+            echo "::error::canary: the workspace is not exactly ${TRUSTED_SHA}; refusing to run."
+            exit 1
+          fi
+          echo "  release-promote call: running trusted origin/main ${TRUSTED_SHA}"
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:

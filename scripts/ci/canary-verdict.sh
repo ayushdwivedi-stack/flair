@@ -28,8 +28,10 @@
 # PASS emits ONE block the operator pastes once, in THREE phases: a preflight that
 # re-derives the package-set digest from the published tarballs and requires it to
 # equal the release run's digest (nothing moves if the check fails — so a registry
-# hiccup or a re-cut version mid-paste cannot leave a partial promote), then the
-# `npm dist-tag add` lines (`@tpsdev-ai/flair` LAST), then the skew check.
+# hiccup or a re-cut version mid-paste cannot leave a partial promote), then reads
+# every package's current `latest` (refusing, before any move, if one is a NEWER
+# version: flair#1928), then the `npm dist-tag add` lines (`@tpsdev-ai/flair` LAST),
+# then the skew check.
 #
 # bash 3.2-safe (flair#1781 R0): the macOS canary leg runs this under stock
 # /bin/bash 3.2, so this file uses NO bash-4 feature (no `declare -A`, no
@@ -170,6 +172,11 @@ EOF
 # prints EXACTLY this; the human PASS text embeds it between fences — the two are
 # byte-identical by construction (a test generates both and compares).
 emit_promote_block() {
+  # The version's numeric parts, for the step-2 superseded check. Callers emit a
+  # block only for an exact <major>.<minor>.<patch> (is_release).
+  local _v_maj _v_min _v_pat _v_rest
+  _v_maj="${VERSION%%.*}"; _v_rest="${VERSION#*.}"
+  _v_min="${_v_rest%%.*}"; _v_pat="${_v_rest#*.}"
   cat <<EOF
 set -e
 
@@ -275,6 +282,17 @@ for _p in ${PACKAGES[*]}; do
   fi
   if ! [[ "\$_cur" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?\$ ]]; then
     echo "canary promote: the current latest of '\$_p' is not a version (raw '\$_cur') - NOTHING has moved; do not promote." >&2
+    exit 1
+  fi
+  # flair#1928: a NEWER release already holds latest => ${VERSION} is superseded.
+  # Refuse BEFORE the first move, so a re-run of an older version can never move
+  # latest backward. Equal is allowed (a re-run converges); a prerelease of the
+  # same major.minor.patch is older than the release.
+  _cur_core="\${_cur%%-*}"
+  _cur_maj="\${_cur_core%%.*}"; _cur_rest="\${_cur_core#*.}"
+  _cur_min="\${_cur_rest%%.*}"; _cur_pat="\${_cur_rest#*.}"
+  if [ "\$_cur_maj" -gt ${_v_maj} ] || { [ "\$_cur_maj" -eq ${_v_maj} ] && { [ "\$_cur_min" -gt ${_v_min} ] || { [ "\$_cur_min" -eq ${_v_min} ] && [ "\$_cur_pat" -gt ${_v_pat} ]; }; }; }; then
+    echo "canary promote: refused - the current latest of '\$_p' is \$_cur, NEWER than ${VERSION}; ${VERSION} is superseded - NOTHING has moved; do not promote." >&2
     exit 1
   fi
   printf '%s=%s\n' "\$_p" "\$_cur" >> "\$PREV_LATEST"
@@ -394,9 +412,10 @@ Promote ALL ${#PACKAGES[@]} lockstep packages to \`latest\`. **npm has no atomic
 all-or-none promote** — this block moves the tags SEQUENTIALLY and STOPS at the first
 failure (the failing move exits non-zero). It reads every package's CURRENT \`latest\`
 BEFORE the first move, and STOPS before moving a single tag if ANY read fails — a
-non-zero npm exit, an empty read, or a value that is not a version — so it only
-reaches the moves with a clean PREVIOUS \`latest\` for every package — the values its
-RESTORE lines print.
+non-zero npm exit, an empty read, or a value that is not a version — or if any
+package's \`latest\` is already NEWER than \`${VERSION}\` (a superseded version never
+moves \`latest\` backward), so it only reaches the moves with a clean PREVIOUS
+\`latest\` for every package — the values its RESTORE lines print.
 On the move-failure path it prints one RESTORE line per already-moved package
 (\`npm dist-tag add <pkg>@<previous> latest\`, never \`npm dist-tag rm\`) and then the
 packages it did NOT move; on the final-check path (every add call succeeded)

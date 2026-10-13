@@ -345,3 +345,28 @@ describe("canary-verdict — `--emit bash` is the machine surface (flair#1928 sl
     expect(r.status).toBe(2);
   });
 });
+
+describe("canary-verdict — a superseded version never moves latest backward (flair#1928)", () => {
+  /**
+   * The emitted block's OWN superseded check (step 2), extracted verbatim from
+   * `--emit bash` and run under the shell the macOS leg uses, against a table of
+   * current `latest` values. Numeric, not lexical: 1.10.0 and 1.2.10 are newer.
+   */
+  test("refuses a newer current latest, allows an older or equal one", () => {
+    const r = run(["pass", "1.2.3", RUN_URL, "--package-set-digest", CERTIFIED_DIGEST, "--emit", "bash"]);
+    expect(r.status).toBe(0);
+    const lines = r.stdout.split("\n");
+    const from = lines.findIndex((l) => l.trim().startsWith('_cur_core="${_cur%%-*}"'));
+    const to = lines.findIndex((l, i) => i > from && l.trim() === "fi");
+    expect(from, "the block carries the superseded check").toBeGreaterThan(0);
+    const check = lines.slice(from, to + 1).join("\n");
+    expect(check).toContain("is superseded");
+    const verdict = (cur: string) => {
+      const sh = `set -e\n_p=@tpsdev-ai/flair\n_cur=${cur}\n${check}\necho allowed\n`;
+      const out = spawnSync(process.platform === "darwin" ? "/bin/bash" : "bash", ["-c", sh], { encoding: "utf8" });
+      return out.status === 0 && out.stdout.trim() === "allowed" ? "allowed" : out.stderr.includes("is superseded") ? "refused" : `?${out.status}`;
+    };
+    for (const cur of ["1.2.2", "1.2.3", "1.2.3-rc.1", "0.99.99", "0.0.1"]) expect(verdict(cur), cur).toBe("allowed");
+    for (const cur of ["1.2.4", "1.3.0", "2.0.0", "1.10.0", "1.2.10"]) expect(verdict(cur), cur).toBe("refused");
+  });
+});
