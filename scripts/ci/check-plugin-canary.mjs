@@ -190,6 +190,44 @@ export function readInstalledVersion(prefix, packageName) {
   }
 }
 
+/**
+ * The plugin step's conditions that still RUN it after a failed boot (so it
+ * prints its own BOOT_FAILED_LINE instead of being skipped). flair#1928 slice 2
+ * adds the second: the same run-after-failure condition, gated on a successful
+ * tree selection so a failed selection never runs the caller's checkout.
+ */
+export const PLUGIN_STEP_CONDITIONS = Object.freeze([
+  "success() || failure()",
+  "(success() || failure()) && steps.select.outcome == 'success'",
+]);
+
+/**
+ * The plugin step's OWN `if:` (whitespace-normalised, `${{ }}` stripped), read
+ * from the step that carries `id: plugin` only, never from another step; null
+ * when that step has no `if:` or there is no such step.
+ */
+export function pluginStepCondition(yml) {
+  const lines = yml.split("\n");
+  const at = lines.findIndex((l) => /^\s+id:\s+plugin\s*$/.test(l));
+  if (at < 0) return null;
+  const indent = /^(\s*)/.exec(lines[at])[1].length;
+  const isStepStart = (l) => new RegExp(`^\\s{${Math.max(indent - 2, 0)}}-\\s`).test(l);
+  let start = at;
+  while (start > 0 && !isStepStart(lines[start])) start--;
+  let end = at + 1;
+  while (end < lines.length && !isStepStart(lines[end]) && !(lines[end].trim() && /^(\s*)/.exec(lines[end])[1].length < indent - 2)) end++;
+  for (const line of lines.slice(start, end)) {
+    const m = new RegExp(`^(?:\\s{${indent}}|\\s{${Math.max(indent - 2, 0)}}-\\s+)if:\\s*(.+?)\\s*$`).exec(line);
+    if (m) {
+      let v = m[1];
+      const wrapped = /^\$\{\{([\s\S]*)\}\}$/.exec(v);
+      if (wrapped) v = wrapped[1];
+      return v.replace(/\s+/g, " ").trim();
+    }
+  }
+  return null;
+}
+
 export function pluginCanaryWired(yml) {
   const hasScript = yml.includes("scripts/ci/check-plugin-canary.mjs");
   const hasId = /^\s+id:\s+plugin\s*$/m.test(yml);
@@ -199,7 +237,7 @@ export function pluginCanaryWired(yml) {
     yml.includes(BOOT_FAILED_LINE) &&
     yml.includes("--boot-outcome") &&
     yml.includes("BOOT_OUTCOME") &&
-    /if:\s*success\(\)\s*\|\|\s*failure\(\)/.test(yml);
+    PLUGIN_STEP_CONDITIONS.includes(pluginStepCondition(yml));
   return {
     hasScript,
     hasId,
