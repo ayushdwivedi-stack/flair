@@ -155,7 +155,29 @@ jobs:
             fi
             echo "v${version}: READY"
             if gh api "repos/${REPO}/actions/workflows/release-promote.yml" >/dev/null 2>&1; then
-              gh workflow run release-promote.yml --ref "${ref}"
+              # AT MOST ONCE PER VERSION (flair#1928 slice 2). Slice 1 fired this
+              # dispatch every 10 minutes until the version was promoted; once
+              # slice 2 exists that is a loop whenever the privileged job cannot run
+              # (the environment not yet created, a red canary). `release-promote.yml`
+              # sets `run-name: release-promote v<version>`, so a run already exists
+              # iff one carries that title or that head branch. The list is a network
+              # read: a failure is NOT "no run" — it is an error exit, never a
+              # dispatch on an unknown.
+              RUNS="$(mktemp)"
+              if ! gh api --paginate "repos/${REPO}/actions/workflows/release-promote.yml/runs?per_page=100" > "${RUNS}"; then
+                echo "release-promote-poll: ERROR — could not list runs of release-promote.yml; refusing to dispatch for v${version} (unknown is not 'no run')" >&2
+                exit 1
+              fi
+              ALREADY="$(jq -r --arg t "release-promote v${version}" --arg b "v${version}" '[.workflow_runs[]?] | any(.display_title == $t or .head_branch == $b)' "${RUNS}")"
+              if [ "${ALREADY}" != "true" ] && [ "${ALREADY}" != "false" ]; then
+                echo "release-promote-poll: ERROR — could not interpret the release-promote.yml run list for v${version}; refusing to dispatch" >&2
+                exit 1
+              fi
+              if [ "${ALREADY}" = "true" ]; then
+                echo "  v${version}: a release-promote run already exists — not dispatching again"
+                continue
+              fi
+              gh workflow run release-promote.yml --ref "${ref}" -f dry_run=false
               echo "  dispatched release-promote.yml --ref ${ref}"
             else
               echo "  would dispatch release-promote.yml --ref ${ref} (slice 2 not merged yet)"

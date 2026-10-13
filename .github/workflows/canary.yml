@@ -72,6 +72,24 @@ on:
         description: "the package-set digest printed by the release run's pack summary (64 hex); the canary re-derives the SAME digest from the tarballs it verified and requires equality before any verdict (A1c of #1671)."
         required: true
         type: string
+  # flair#1928 slice 2: the privileged `release-promote.yml` calls THIS workflow
+  # (`workflow_call`) after the npm approval, so there is ONE canary definition,
+  # not a second copy embedded in the promote job. The three inputs are the same
+  # the manual dispatch takes; the canary is credential-less either way.
+  workflow_call:
+    inputs:
+      version:
+        description: "Published version to canary, exact (e.g. 0.54.2). Must be 2FA-approved and public."
+        required: true
+        type: string
+      expected_sha256:
+        description: "sha256 of the published @tpsdev-ai/flair@<version> tarball (64 hex); the canary downloads and verifies it."
+        required: true
+        type: string
+      package_set_digest:
+        description: "the certified package-set digest (64 hex); the canary re-derives the SAME digest from the tarballs it verified and requires equality before any verdict."
+        required: true
+        type: string
 
 # Credential-less by construction: no top-level token, no OIDC. The job grants
 # only `contents: read` for checkout (with credentials not persisted).

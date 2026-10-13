@@ -166,3 +166,49 @@ describe("release-promote-poll — round 2: derivation, payload version, all pag
     expect(raw).not.toMatch(/^\s*workflow_dispatch\s*:/m); // assertion: no manual trigger key anywhere in the file
   });
 });
+
+describe("release-promote-poll — dispatch at most once per version (#1928 slice 2)", () => {
+  const runScript = () => (job("poll").steps ?? []).map((s) => s.run ?? "").join("\n");
+
+  test("the READY dispatch is gated on a run already existing for the version, read fail-closed", () => {
+    const script = runScript();
+    expect(script).toContain("release-promote.yml/runs");
+    expect(script).toContain("not dispatching again");
+    // A failed (or uninterpretable) read is an error exit, never a dispatch on an unknown.
+    expect(script).toContain("refusing to dispatch");
+    expect(script).toMatch(/if ! gh api --paginate "repos\/\$\{REPO\}\/actions\/workflows\/release-promote\.yml\/runs/);
+    // The auto-dispatch is a REAL promote (the workflow's dry_run defaults to true
+    // for a manual run), so the npm approval really is the only human action.
+    expect(script).toContain('gh workflow run release-promote.yml --ref "${ref}" -f dry_run=false');
+  });
+
+  test("BEHAVIOURAL: the run-name / head-branch predicate identifies a version's run", () => {
+    const script = runScript();
+    const m = script.match(/'((?:\[|\{)[^']*any\([^']*\))'/);
+    expect(m, "the jq run predicate is present in the poll").not.toBeNull();
+    const filter = m![1]!;
+    const check = (runs: unknown[]): string => {
+      const dir = mkdtempSync(join(tmpdir(), "poll-runs-"));
+      try {
+        const f = join(dir, "runs.json");
+        writeFileSync(f, JSON.stringify({ workflow_runs: runs }));
+        const r = spawnSync(
+          "jq",
+          ["-r", "--arg", "t", "release-promote v1.2.3", "--arg", "b", "v1.2.3", filter, f],
+          { encoding: "utf8" },
+        );
+        expect(r.status, String(r.stderr)).toBe(0);
+        return r.stdout.trim();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    };
+    // A run for THIS version, by run-name or by head branch → true (do not dispatch again).
+    expect(check([{ display_title: "release-promote v1.2.3", head_branch: "v1.2.3" }])).toBe("true");
+    expect(check([{ display_title: "other", head_branch: "v1.2.3" }])).toBe("true");
+    expect(check([{ display_title: "release-promote v1.2.3", head_branch: null }])).toBe("true");
+    // No run for this version → false (dispatch once).
+    expect(check([{ display_title: "release-promote v1.2.2", head_branch: "v1.2.2" }])).toBe("false");
+    expect(check([])).toBe("false");
+  });
+});
