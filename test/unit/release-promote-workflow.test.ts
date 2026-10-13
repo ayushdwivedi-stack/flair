@@ -4,9 +4,11 @@
  * Shape tests for `.github/workflows/release-promote.yml`, the PRIVILEGED
  * promote, and for the `workflow_call` trigger it adds to `canary.yml`.
  *
- * The control this file exists to guard: no job executes a script from the tag's
- * checkout, every executed file equals `origin/main`'s copy, and every fact the
- * promote acts on is re-read, validated and fails closed when it cannot be.
+ * The control this file exists to guard: no job runs a REPOSITORY script from the
+ * tag's checkout (after a failed tree selection, none runs at all), every executed
+ * repository file equals `origin/main`'s copy, and every fact the promote acts on
+ * is re-read, validated and fails closed when it cannot be. (The canary does run
+ * the published packages it installs: that is its test.)
  * The static tests pin the shape. The behavioural tests extract the real `run:`
  * scripts from the YAML and drive them: the derive and emit refusals with
  * fixtures; the guard, the materialisation, prepare's pin and the canary's tree
@@ -15,7 +17,7 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -148,7 +150,7 @@ describe("release-promote — the privileged job's credential and boundary", () 
     expect(withToken[0]?.run ?? "").not.toContain("--otp");
   });
 
-  test("no job executes a script from the tag's checkout", () => {
+  test("no job executes a repository script from the tag's checkout", () => {
     const runsScript = (st: Step) => /scripts\//.test(st.run ?? "");
     // prepare: the step that moves the workspace to the pinned origin/main precedes
     // every step that runs a repository script.
@@ -1032,7 +1034,7 @@ describe("release-promote — the promote job runs a known npm (exact pin, verif
   const pinIndex = () => steps().findIndex((s) => s.id === "npm_pin");
   const pinned = () => String(steps()[pinIndex()]?.env?.NPM_PINNED ?? "");
 
-  test("the pin-and-verify step exists, is exact, matches the canary's npm, and precedes every npm call", () => {
+  test("the pin-and-verify step exists, is exact, matches the canary's npm, and precedes the registry reads and tag moves", () => {
     expect(pinIndex(), "the npm_pin step exists").toBeGreaterThan(0);
     expect(pinned()).toMatch(/^\d+\.\d+\.\d+$/); // exact: no range, no tag
     const canaryPin = /npm install -g npm@(\d+\.\d+\.\d+)/.exec(canaryRaw)?.[1];
@@ -1088,5 +1090,143 @@ describe("release-promote — the promote job runs a known npm (exact pin, verif
     expect(r.status).toBe(1);
     expect(r.log).toContain(`npm is '10.9.4', not the pinned ${pinned()}; refusing to promote with an unverified npm`);
     expect(r.log).not.toContain("(pinned)");
+  });
+});
+
+// ── canary.yml: a FAILED tree selection runs no repository script ────────────
+//
+// GitHub's `if:` semantics for the expressions canary.yml uses: an expression
+// with no status function gets an implicit `success()`; `success()` is false and
+// `failure()` true once an earlier step failed; `always()` is true. The evaluator
+// accepts ONLY those tokens (anything else throws), so a new condition shape must
+// be taught here before the contract below can pass.
+function stepRuns(cond: string | undefined, failedEarlier: boolean, selectOutcome: string): boolean {
+  let expr = (cond ?? "").trim();
+  if (expr.startsWith("${{") && expr.endsWith("}}")) expr = expr.slice(3, -2).trim();
+  if (expr === "") expr = "success()";
+  if (!/\b(?:success|failure|always|cancelled)\(\)/.test(expr)) expr = `success() && (${expr})`;
+  const js = expr
+    .replace(/\bsuccess\(\)/g, "S")
+    .replace(/\bfailure\(\)/g, "F")
+    .replace(/\balways\(\)/g, "true")
+    .replace(/\bcancelled\(\)/g, "C")
+    .replace(/\bsteps\.select\.outcome\b/g, "O")
+    .replace(/==|!=/g, (m) => `${m}=`);
+  if (!/^(?:\s|S|F|C|O|true|&&|\|\||!==|===|!|\(|\)|'[a-z]+')*$/.test(js)) {
+    throw new Error(`unsupported if: expression: ${cond}`);
+  }
+  return new Function("S", "F", "C", "O", `return (${js});`)(!failedEarlier, failedEarlier, false, selectOutcome) as boolean;
+}
+/**
+ * Walk canary.yml's steps for one scenario: `select` is the selection's outcome
+ * and `failAt` the id of a later step that fails. Returns the steps that run.
+ */
+function canaryRunPlan(select: "success" | "failure", failAt?: string): Step[] {
+  const all = canaryWf.jobs?.canary?.steps ?? [];
+  const at = all.findIndex((s) => s.id === "select");
+  expect(at, "the tree selection has id: select").toBe(1);
+  let failed = select === "failure";
+  const ran: Step[] = [];
+  for (const st of all.slice(at + 1)) {
+    if (!stepRuns(st.if, failed, select)) continue;
+    ran.push(st);
+    if (failAt && st.id === failAt) failed = true;
+  }
+  return ran;
+}
+const runsRepoScript = (st: Step) => /scripts\//.test(st.run ?? "");
+const isVerdict = (st: Step) => (st.name ?? "").startsWith("Canary verdict — emit the promote or deprecate command");
+const isInlineFail = (st: Step) => (st.name ?? "").startsWith("Canary verdict — FAIL, the tree selection did not succeed");
+
+describe("canary.yml — a failed tree selection runs no repository script (contract)", () => {
+  test("after a FAILED selection: no step runs a repository script; the inline FAIL verdict runs", () => {
+    const ran = canaryRunPlan("failure");
+    expect(ran.filter(runsRepoScript).map((s) => s.name)).toEqual([]);
+    expect(ran.some(isInlineFail)).toBe(true);
+    expect(ran.some(isVerdict)).toBe(false);
+    // Positive control: the walk does see repository-script steps on success.
+    expect(canaryRunPlan("success").filter(runsRepoScript).length).toBeGreaterThanOrEqual(6);
+  });
+
+  test("after a SUCCESSFUL selection, a later failed check still reaches the scripted FAIL verdict", () => {
+    for (const failAt of ["sha", "install", "boot", "plugin"]) {
+      const ran = canaryRunPlan("success", failAt);
+      expect(ran.some(isVerdict), `verdict after a failed ${failAt}`).toBe(true);
+      expect(ran.some(isInlineFail), `no inline FAIL after a failed ${failAt}`).toBe(false);
+    }
+    // A failed boot still runs the plugin step, to emit its own distinct line.
+    expect(canaryRunPlan("success", "boot").some((s) => s.id === "plugin")).toBe(true);
+    const clean = canaryRunPlan("success");
+    expect(clean.some(isVerdict)).toBe(true);
+    expect(clean.some(isInlineFail)).toBe(false);
+  });
+
+  test("the inline FAIL verdict names the failure and prints no deprecate line", () => {
+    const st = (canaryWf.jobs?.canary?.steps ?? []).find(isInlineFail);
+    expect(st, "the inline FAIL step exists").toBeDefined();
+    expect(runsRepoScript(st!)).toBe(false);
+    const dir = scratch();
+    const summary = join(dir, "summary.md");
+    writeFileSync(summary, "");
+    const r = runStep(st?.run ?? "", dir, {
+      VERSION: "1.2.4",
+      OS_NAME: "ubuntu-latest",
+      SELECT_OUTCOME: "failure",
+      GITHUB_STEP_SUMMARY: summary,
+    });
+    expect(r.status).toBe(1);
+    const verdict = readFileSync(join(dir, "canary-logs", "verdict.txt"), "utf8");
+    expect(verdict).toContain("Canary FAIL — `ubuntu-latest` (tree selection: failure)");
+    expect(verdict).toContain("Do not promote.");
+    expect(verdict).not.toContain("npm deprecate");
+    expect(readFileSync(summary, "utf8")).toBe(verdict);
+  });
+});
+
+describe("canary.yml — a failed selection on a tampered tag executes none of the tag's code (real git)", () => {
+  const CALLED = "octo/repo/.github/workflows/release-promote.yml@refs/tags/v1.2.4";
+  test("selection refused in the tag workspace; every step that then runs leaves the tag's scripts unexecuted", () => {
+    const fx = gitFixture();
+    const MARK = "TAG-CODE-RAN";
+    // The tag's verdict and plugin-check scripts leave a mark if they ever run.
+    const tampered = commitPush(fx, {
+      "scripts/ci/canary-verdict.sh": `#!/usr/bin/env bash\ntouch "$PWD/${MARK}"\necho tampered verdict\n`,
+      [PLUGIN]: `import { writeFileSync } from "node:fs";\nwriteFileSync(process.cwd() + "/${MARK}", "plugin");\n`,
+      [BOOT]: `#!/usr/bin/env bash\ntouch "$PWD/${MARK}"\n`,
+    });
+    tag(fx, "v1.2.4", tampered);
+    const ws = workspaceAt(fx, tampered);
+    const summary = join(scratch(), "summary.md");
+    writeFileSync(summary, "");
+    const prefix = join(scratch(), "prefix");
+    const env: Record<string, string> = {
+      TRUSTED_SHA: "",
+      RUN_WORKFLOW_REF: CALLED,
+      VERSION: "1.2.4",
+      EXPECTED: "a".repeat(64),
+      PKG_SET_DIGEST: "a".repeat(64),
+      PACKAGE_SET_DIGEST: "a".repeat(64),
+      OS_NAME: "ubuntu-latest",
+      RUN_URL: "https://github.com/octo/repo/actions/runs/1",
+      SELECT_OUTCOME: "failure",
+      SHA_OUTCOME: "skipped",
+      INSTALL_OUTCOME: "skipped",
+      BOOT_OUTCOME: "skipped",
+      PLUGIN_OUTCOME: "skipped",
+      PREFIX: prefix,
+      HOME: scratch(),
+      GITHUB_STEP_SUMMARY: summary,
+    };
+    const select = (canaryWf.jobs?.canary?.steps ?? []).find((s) => s.id === "select");
+    const sel = runStep(select?.run ?? "", ws, env);
+    expect(sel.status).toBe(1);
+    expect(sel.log).toContain("without a trusted_sha");
+    expect(git(ws, "rev-parse", "HEAD")).toBe(tampered); // still the tag's tree
+    // Run, in order, every `run:` step GitHub would run after that failure.
+    const ran = canaryRunPlan("failure").filter((s) => s.run);
+    expect(ran.length).toBeGreaterThan(0);
+    for (const st of ran) runStep(st.run!, ws, env);
+    expect(existsSync(join(ws, MARK)), "no tag script ran").toBe(false);
+    expect(readFileSync(join(ws, "canary-logs", "verdict.txt"), "utf8")).toContain("Canary FAIL");
   });
 });

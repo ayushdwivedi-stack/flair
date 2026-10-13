@@ -27,8 +27,9 @@
 #
 # PASS emits ONE block the operator pastes once, in THREE phases: a preflight that
 # re-derives the package-set digest from the published tarballs and requires it to
-# equal the release run's digest (nothing moves if the check fails — so a registry
-# hiccup or a re-cut version mid-paste cannot leave a partial promote), then reads
+# equal the release run's digest (nothing moves if the check fails, so a registry
+# hiccup or a re-cut version DURING THE PREFLIGHT leaves no partial promote; a
+# move that fails after earlier moves prints RESTORE lines), then reads
 # every package's current `latest` (refusing, before any move, if one is a NEWER
 # version: flair#1928), then the `npm dist-tag add` lines (`@tpsdev-ai/flair` LAST),
 # then the skew check.

@@ -21,17 +21,20 @@ name: Release promote
 # under the token would hand a stranger the token. So:
 #   - GitHub runs the TAG's copy of this file and of `canary.yml` (a dispatched
 #     workflow and a local reusable workflow both resolve at the dispatch ref).
-#     The promote job's FIRST act requires both, and every script any job here
-#     runs (the canary's install, boot and plugin checks and their helpers
-#     included), to be byte-identical to `origin/main`.
-#   - No job executes a script from the tag's checkout. `prepare` and the canary
-#     move their workspace to the `origin/main` commit `prepare` pinned before any
-#     repository script runs; `promote` runs everything from a separate tree
-#     materialised from `origin/main` at its own pinned sha.
-#   - Those files are owned by the release trust root in `.github/CODEOWNERS`, so
-#     only the trust root can land a change to them on main.
+#     The promote job's FIRST act requires both, and every repository script any
+#     job here runs (the canary's install, boot and plugin checks and their
+#     helpers included), to be byte-identical to `origin/main`.
+#   - Repository scripts run only from `origin/main`. `prepare` and the canary
+#     move their workspace to the `origin/main` commit `prepare` pinned before
+#     any repository script runs, and a failed move runs none (the canary then
+#     emits an inline FAIL); `promote` runs everything from a separate tree
+#     materialised from `origin/main` at its own pinned sha. The canary does run
+#     the PUBLISHED Flair and plugin packages it installs: that is its test.
+#   - `.github/CODEOWNERS` names the release trust root as the reviewer of those
+#     files. That keeps a change to them off main only as far as the repository's
+#     rules require code-owner review.
 # This closes the pre-tag-tampered class; the malicious-on-main class is closed by
-# review + that ownership, not by this file.
+# review under those rules, not by this file.
 #
 # THE SHAPE. `prepare` (unprivileged) resolves the version from the tag, pins
 # `origin/main`, reads the certified package-set digest from the marker and
@@ -49,10 +52,11 @@ name: Release promote
 # and an `NPM_TOKEN` secret with write access to the lockstep packages), that step
 # fails closed with a named message and moves nothing.
 #
-# THE DRY RUN. `dry_run` defaults to `true`: the whole job runs — guard,
-# re-derivation, the emitted promote block — and the block is printed instead of
-# executed, so the first real promote can be rehearsed without moving a tag. The
-# poll's dispatch sets `dry_run=false`.
+# THE DRY RUN. `dry_run` defaults to `true`: the job validates through block
+# generation (guard, re-derivation, the canary, the emitted promote block) and
+# prints the block instead of executing it. It does not test the move: the
+# block's current-`latest` reads, its refusals and its `dist-tag` moves run only
+# under the token. The poll's dispatch sets `dry_run=false`.
 #
 # This file is dispatched on the tag ref only, so `github.ref_name` is the tag and
 # `github.sha` is the tagged commit.
@@ -60,7 +64,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "true (default): run the whole job and PRINT the promote block; false: run the block under NPM_TOKEN and move latest."
+        description: "true (default): validate through block generation and PRINT the promote block (the move is not tested); false: run the block under NPM_TOKEN and move latest."
         required: false
         default: true
         type: boolean
@@ -161,7 +165,7 @@ jobs:
           fi
           MARKER="$(jq -sc --arg ref "v${VERSION}" 'add // [] | map(select(.ref == $ref)) | last' "$DEPLOYMENTS")"
           if [ -z "$MARKER" ] || [ "$MARKER" = "null" ]; then
-            echo "::error::release-promote: no release-attempt marker for v${VERSION}; nothing was staged for this version. Refusing to promote."
+            echo "::error::release-promote: no release-attempt marker for v${VERSION}; staging cannot be verified for this version. Refusing to promote."
             exit 1
           fi
           PAYLOAD_VERSION="$(jq -r '.payload.version // ""' <<<"$MARKER")"
@@ -301,12 +305,13 @@ jobs:
           # NO registry-url: that writes an .npmrc for NODE_AUTH_TOKEN. The token
           # reaches npm only through the token step's own `.npmrc` below.
 
-      - name: Pin npm to an exact version and verify it (before any npm call)
-        # Every npm call in this job (the hasher's `npm view`, the block's
+      - name: Pin npm to an exact version and verify it (before the registry reads and tag moves that follow)
+        # Every LATER npm call in this job (the hasher's `npm view`, the block's
         # `dist-tag ls` / `dist-tag add`) runs a KNOWN npm: the canary's exact pin,
-        # the npm its skew check already ran. Installed from a job-created directory
-        # with an explicit userconfig, so no checkout's `.npmrc` can redirect the
-        # registry; then verified, and any other version is a refusal.
+        # the npm its skew check already ran. The install itself runs the runner's
+        # npm, from a job-created directory with an explicit userconfig, so no
+        # checkout's `.npmrc` can redirect the registry; then the version is
+        # verified, and any other is a refusal.
         id: npm_pin
         env:
           NPM_PINNED: "11.19.1"
@@ -348,7 +353,7 @@ jobs:
           fi
           MARKER="$(jq -sc --arg ref "v${VERSION}" 'add // [] | map(select(.ref == $ref)) | last' "$DEPLOYMENTS")"
           if [ -z "$MARKER" ] || [ "$MARKER" = "null" ]; then
-            echo "::error::release-promote: no release-attempt marker for v${VERSION}; nothing was staged for this version. Refusing to promote."
+            echo "::error::release-promote: no release-attempt marker for v${VERSION}; staging cannot be verified for this version. Refusing to promote."
             exit 1
           fi
           PAYLOAD_VERSION="$(jq -r '.payload.version // ""' <<<"$MARKER")"
@@ -433,8 +438,9 @@ jobs:
           echo "  emitted the promote block ($(wc -l < "$BLOCK") lines) from the trusted tree"
 
       - name: Dry run — print the promote block, move no tag
-        # default true. The whole job has run up to here; only the dist-tag step is
-        # skipped, so the first real promote can be rehearsed.
+        # default true. The job has validated through block generation; the token
+        # step (the block's reads, refusals and moves) is skipped, so the move
+        # itself is not tested.
         if: ${{ inputs.dry_run == true }}
         env:
           BLOCK: ${{ steps.emit.outputs.promote_block }}

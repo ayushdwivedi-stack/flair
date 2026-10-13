@@ -50,8 +50,9 @@ name: Post-publish canary — install + boot a published version
 #
 # WHAT IT EMITS
 #   PASS prints the complete, package-set-digest-bound promote block — one
-#   `npm dist-tag add` per lockstep package (all or none; `@tpsdev-ai/flair`
-#   LAST). FAIL prints one `npm deprecate` line per package. The human's job is
+#   `npm dist-tag add` per lockstep package (sequential, stopping at the first
+#   failure with RESTORE lines; npm has no atomic move; `@tpsdev-ai/flair` LAST).
+#   FAIL prints one `npm deprecate` line per package. The human's job is
 #   approve-on-npmjs, then paste the block — a stale PASS, a re-cut version, a
 #   different package set, or a paste-from-FAIL aborts at the digest preflight
 #   before `latest` can move. A SemVer prerelease is never promoted, so a
@@ -127,9 +128,14 @@ jobs:
         # before. A call (GitHub reports the CALLER's workflow in
         # `github.workflow_ref`) must pass `trusted_sha`, an origin/main commit;
         # this step moves the workspace to exactly that commit BEFORE any
-        # repository script runs. Every script, helper and data file the steps
-        # below read is then trusted main's, and the caller's tag checkout
-        # supplies no executable.
+        # repository script runs. After it SUCCEEDS, every repository script,
+        # helper and data file the steps below read is trusted main's. If it
+        # fails, the workspace may still be the caller's tag checkout, so every
+        # later step that runs a repository script is gated on this step's
+        # outcome and an inline step emits the FAIL verdict instead. (The canary
+        # still runs the PUBLISHED Flair and plugin packages it installs: that is
+        # what it tests.)
+        id: select
         env:
           TRUSTED_SHA: ${{ inputs.trusted_sha }}
           RUN_WORKFLOW_REF: ${{ github.workflow_ref }}
@@ -180,6 +186,7 @@ jobs:
 
       - name: Verify the published tarballs' sha256 (all lockstep packages)
         id: sha
+        if: steps.select.outcome == 'success'
         env:
           VERSION: ${{ inputs.version }}
           EXPECTED: ${{ inputs.expected_sha256 }}
@@ -267,6 +274,7 @@ jobs:
 
       - name: Install from the registry and run the four install-tree assertions
         id: install
+        if: steps.select.outcome == 'success'
         env:
           VERSION: ${{ inputs.version }}
         run: |
@@ -294,6 +302,7 @@ jobs:
 
       - name: Boot the installed instance on the product path
         id: boot
+        if: steps.select.outcome == 'success'
         run: |
           set -uo pipefail
           mkdir -p canary-logs
@@ -330,7 +339,9 @@ jobs:
         # Run after a failed boot so the step can emit its own distinct line
         # instead of being skipped (a skip looks like a second unexplained red
         # at verdict time). Cancelled jobs do not run.
-        if: success() || failure()
+        # Never after a failed tree selection: then this would run the caller's
+        # tag checkout.
+        if: (success() || failure()) && steps.select.outcome == 'success'
         env:
           VERSION: ${{ inputs.version }}
           BOOT_OUTCOME: ${{ steps.boot.outcome }}
@@ -395,6 +406,7 @@ jobs:
         # converges the set, so a pre-existing skew is reported, not blocked;
         # an unmeasurable check is named too, never silently green.
         id: skew
+        if: steps.select.outcome == 'success'
         env:
           VERSION: ${{ inputs.version }}
         run: |
@@ -424,8 +436,9 @@ jobs:
         # red step (no continue-on-error anywhere). This step exists so the
         # PASS/FAIL line — with the sha256-bound promote command, or the
         # deprecate command — is the last thing both the log and the run summary
-        # show.
-        if: always()
+        # show. It runs the trusted tree's canary-verdict.sh, so only after a
+        # SUCCESSFUL tree selection; a FAIL of any later check still reaches it.
+        if: always() && steps.select.outcome == 'success'
         env:
           VERSION: ${{ inputs.version }}
           EXPECTED: ${{ inputs.expected_sha256 }}
@@ -462,6 +475,27 @@ jobs:
             scripts/ci/canary-verdict.sh fail "$VERSION" "$RUN_URL" --os "$OS_NAME" | tee canary-logs/verdict.txt
           fi
           cat canary-logs/verdict.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Canary verdict — FAIL, the tree selection did not succeed (no repository script)
+        # The workspace may still be the caller's tag checkout, so this verdict is
+        # INLINE: it runs no repository script. Nothing was installed, booted or
+        # measured, so it prints no deprecate lines: those are for published
+        # bytes the canary measured as broken.
+        if: always() && steps.select.outcome != 'success'
+        env:
+          VERSION: ${{ inputs.version }}
+          OS_NAME: ${{ matrix.os }}
+          SELECT_OUTCOME: ${{ steps.select.outcome }}
+        run: |
+          set -euo pipefail
+          mkdir -p canary-logs
+          {
+            printf "### ❌ Canary FAIL — \`%s\` (tree selection: %s)\n\n" "$OS_NAME" "${SELECT_OUTCOME:-not run}"
+            printf "The canary could not select its trusted tree for \`%s\`, so it ran no check: nothing was installed, booted or measured. Do not promote. No deprecate lines: this run measured nothing about the published packages. Fix the call and re-run.\n" "$VERSION"
+          } | tee canary-logs/verdict.txt
+          cat canary-logs/verdict.txt >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::canary FAIL — the tree selection did not succeed; no repository script ran after it"
+          exit 1
 
       - name: Upload canary logs
         # flair#1782: the logs (boot, doctor, verdict, skew) are the EVIDENCE for
