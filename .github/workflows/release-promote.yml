@@ -295,6 +295,35 @@ jobs:
           echo "TRUSTED=${TRUSTED}" >> "$GITHUB_ENV"
           echo "  trusted tree materialised from origin/main ${MAIN_SHA}"
 
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          # NO registry-url: that writes an .npmrc for NODE_AUTH_TOKEN. The token
+          # reaches npm only through the token step's own `.npmrc` below.
+
+      - name: Pin npm to an exact version and verify it (before any npm call)
+        # Every npm call in this job (the hasher's `npm view`, the block's
+        # `dist-tag ls` / `dist-tag add`) runs a KNOWN npm: the canary's exact pin,
+        # the npm its skew check already ran. Installed from a job-created directory
+        # with an explicit userconfig, so no checkout's `.npmrc` can redirect the
+        # registry; then verified, and any other version is a refusal.
+        id: npm_pin
+        env:
+          NPM_PINNED: "11.19.1"
+        run: |
+          set -euo pipefail
+          PIN_DIR="$RUNNER_TEMP/npm-pin"
+          mkdir -p "$PIN_DIR"
+          printf 'registry=https://registry.npmjs.org/\n' > "$PIN_DIR/npmrc"
+          cd "$PIN_DIR"
+          npm install -g "npm@${NPM_PINNED}" --userconfig "$PIN_DIR/npmrc"
+          GOT="$(npm --version)"
+          if [ "$GOT" != "$NPM_PINNED" ]; then
+            echo "::error::release-promote: npm is '${GOT}', not the pinned ${NPM_PINNED}; refusing to promote with an unverified npm. No tag was moved."
+            exit 1
+          fi
+          echo "  npm ${GOT} (pinned)"
+
       - name: Re-derive the version, the marker and the certified digest (trusted tree only)
         # The privileged job re-derives EVERYTHING it acts on; it takes nothing
         # from the poll or the prepare job. Each check fails closed with a named

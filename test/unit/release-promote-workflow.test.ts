@@ -1026,3 +1026,67 @@ describe("release-promote — the token step with the real npm CLI against a loc
     }
   }, 120_000);
 });
+
+describe("release-promote — the promote job runs a known npm (exact pin, verified)", () => {
+  const steps = () => job("promote").steps ?? [];
+  const pinIndex = () => steps().findIndex((s) => s.id === "npm_pin");
+  const pinned = () => String(steps()[pinIndex()]?.env?.NPM_PINNED ?? "");
+
+  test("the pin-and-verify step exists, is exact, matches the canary's npm, and precedes every npm call", () => {
+    expect(pinIndex(), "the npm_pin step exists").toBeGreaterThan(0);
+    expect(pinned()).toMatch(/^\d+\.\d+\.\d+$/); // exact: no range, no tag
+    const canaryPin = /npm install -g npm@(\d+\.\d+\.\d+)/.exec(canaryRaw)?.[1];
+    expect(canaryPin, "the canary pins an exact npm").toBeDefined();
+    expect(pinned(), "the promote's npm is the npm the canary ran").toBe(canaryPin!);
+    const run = steps()[pinIndex()]?.run ?? "";
+    expect(run).toContain('npm install -g "npm@${NPM_PINNED}"');
+    expect(run).toContain('if [ "$GOT" != "$NPM_PINNED" ]; then');
+    // setup-node (sha-pinned, no registry-url) comes right before it.
+    const setup = steps()[pinIndex() - 1];
+    expect(setup?.uses ?? "").toMatch(/^actions\/setup-node@[0-9a-f]{40}$/);
+    expect(setup?.with?.["registry-url"]).toBeUndefined();
+    // Before derive (the hasher's `npm view`), emit, and the token step.
+    for (const id of ["derive", "emit"]) {
+      expect(pinIndex(), `npm is pinned before ${id}`).toBeLessThan(steps().findIndex((s) => s.id === id));
+    }
+    const token = steps().findIndex((s) => JSON.stringify(s.env ?? {}).includes("NPM_TOKEN"));
+    expect(pinIndex(), "npm is pinned before the token step").toBeLessThan(token);
+    // …and after the guard, which stays the FIRST act.
+    expect(pinIndex()).toBeGreaterThan(steps().findIndex((s) => s.id === "guard"));
+  });
+
+  /** Run the real pin step with a stub npm reporting `reports` from `npm --version`. */
+  function runPin(reports: string) {
+    const dir = scratch();
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    const log = join(dir, "npm.log");
+    writeFileSync(
+      join(bin, "npm"),
+      `#!/usr/bin/env bash\nprintf '%s|%s\\n' "$PWD" "$*" >> ${JSON.stringify(log)}\nif [ "$1" = "--version" ]; then echo ${JSON.stringify(reports)}; fi\nexit 0\n`,
+    );
+    chmodSync(join(bin, "npm"), 0o755);
+    const r = runStep(steps()[pinIndex()]?.run ?? "", REPO, {
+      PATH: `${bin}:${process.env.PATH}`,
+      NPM_PINNED: pinned(),
+    });
+    return { ...r, calls: readFileSync(log, "utf8").trim().split("\n") };
+  }
+
+  test("the pinned version is installed from a job directory with an explicit userconfig, then verified", () => {
+    const r = runPin(pinned());
+    expect(r.status, r.log).toBe(0);
+    expect(r.log).toContain(`npm ${pinned()} (pinned)`);
+    const [cwd, args] = r.calls[0]!.split("|");
+    expect(cwd).toEndWith("/npm-pin");
+    expect(args).toMatch(new RegExp(`^install -g npm@${pinned().replace(/\./g, "\\.")} --userconfig .*/npm-pin/npmrc$`));
+    expect(r.calls[1]).toEndWith("|--version");
+  });
+
+  test("any other npm version is a named refusal", () => {
+    const r = runPin("10.9.4");
+    expect(r.status).toBe(1);
+    expect(r.log).toContain(`npm is '10.9.4', not the pinned ${pinned()}; refusing to promote with an unverified npm`);
+    expect(r.log).not.toContain("(pinned)");
+  });
+});

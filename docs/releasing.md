@@ -534,7 +534,10 @@ is a test in `test/unit/release-promote-workflow.test.ts`:
   64-hex digest; and the registry package set re-derives to exactly that digest. An
   unmeasurable input is a refusal, never a pass.
 - **Token hygiene.** `NPM_TOKEN` appears in ONE step's `env`, reaches npm only through a
-  throwaway `.npmrc` indirection, and is never a command argument or echoed.
+  throwaway `.npmrc` indirection, and is never a command argument or echoed. Every npm
+  call in the job runs npm at the canary's exact pin (11.19.1), installed from a job
+  directory and verified with `npm --version` before any npm call; another version is a
+  refusal.
 - **Dispatch at most once per version.** The poll identifies a version's run by the
   run-name `release-promote v<version>` (or its tag head branch), across every page of
   the run list, and does not dispatch a second time for that version; a failed or
