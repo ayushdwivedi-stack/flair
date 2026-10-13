@@ -210,14 +210,20 @@ export function pluginStepCondition(yml) {
   const lines = yml.split("\n");
   const at = lines.findIndex((l) => /^\s+id:\s+plugin\s*$/.test(l));
   if (at < 0) return null;
-  const indent = /^(\s*)/.exec(lines[at])[1].length;
-  const isStepStart = (l) => new RegExp(`^\\s{${Math.max(indent - 2, 0)}}-\\s`).test(l);
+  // No regex is built at run time: indentation is COUNTED and compared, and the
+  // fixed prefixes are checked with string methods and literal regexes.
+  const indent = leadingWhitespace(lines[at]);
+  const dashIndent = Math.max(indent - 2, 0);
+  // A step's `- ` line: exactly `dashIndent` leading whitespace, `-`, whitespace.
+  const isStepStart = (l) => leadingWhitespace(l) === dashIndent && l[dashIndent] === "-" && /\s/.test(l.charAt(dashIndent + 1));
   let start = at;
   while (start > 0 && !isStepStart(lines[start])) start--;
   let end = at + 1;
-  while (end < lines.length && !isStepStart(lines[end]) && !(lines[end].trim() && /^(\s*)/.exec(lines[end])[1].length < indent - 2)) end++;
+  while (end < lines.length && !isStepStart(lines[end]) && !(lines[end].trim() && leadingWhitespace(lines[end]) < indent - 2)) end++;
   for (const line of lines.slice(start, end)) {
-    const m = new RegExp(`^(?:\\s{${indent}}|\\s{${Math.max(indent - 2, 0)}}-\\s+)if:\\s*(.+?)\\s*$`).exec(line);
+    const after = ifKeyEnd(line, indent, dashIndent);
+    if (after < 0) continue;
+    const m = /^\s*(.+?)\s*$/.exec(line.slice(after));
     if (m) {
       let v = m[1];
       const wrapped = /^\$\{\{([\s\S]*)\}\}$/.exec(v);
@@ -226,6 +232,27 @@ export function pluginStepCondition(yml) {
     }
   }
   return null;
+}
+
+/** The length of a line's leading whitespace (`\s`, as YAML indentation is read here). */
+function leadingWhitespace(line) {
+  return /^\s*/.exec(line)[0].length;
+}
+
+/**
+ * The index just past `if:` when `line` holds the step's `if:` key: at exactly
+ * `indent` whitespace, or after the step's own `- ` at exactly `dashIndent`;
+ * -1 otherwise.
+ */
+function ifKeyEnd(line, indent, dashIndent) {
+  const lead = leadingWhitespace(line);
+  if (lead === indent && line.startsWith("if:", indent)) return indent + 3;
+  if (lead === dashIndent && line[dashIndent] === "-") {
+    const gap = /^\s+/.exec(line.slice(dashIndent + 1));
+    const key = gap ? dashIndent + 1 + gap[0].length : -1;
+    if (key >= 0 && line.startsWith("if:", key)) return key + 3;
+  }
+  return -1;
 }
 
 export function pluginCanaryWired(yml) {
