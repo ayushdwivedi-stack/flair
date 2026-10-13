@@ -4,11 +4,17 @@
  * Shape tests for `.github/workflows/release-promote.yml`, the PRIVILEGED
  * promote, and for the `workflow_call` trigger it adds to `canary.yml`.
  *
- * The control this file exists to guard: no job runs a REPOSITORY script from the
- * tag's checkout (after a failed tree selection, none runs at all), every executed
- * repository file equals `origin/main`'s copy, and every fact the promote acts on
- * is re-read, validated and fails closed when it cannot be. (The canary does run
- * the published packages it installs: that is its test.)
+ * What this file guards is DEFENCE IN DEPTH inside the workflow, not the
+ * boundary. GitHub runs the TAG's copy of these workflows, so a changed copy
+ * could drop any check here. The boundary is the `v*` tag rulesets plus the
+ * `release-promote` environment, which the poll verifies before it dispatches
+ * (release-promote-poll-workflow.test.ts). For a tag whose copy is the reviewed
+ * one: no job runs a REPOSITORY script from the tag's checkout (after a failed
+ * tree selection, none runs at all), every executed repository file equals
+ * `origin/main`'s copy, and every fact the promote acts on is re-read, validated
+ * and fails closed when it cannot be. (The canary does run the published
+ * packages it installs: that is its test.) The guard tests run the CURRENT
+ * guard against tampered git trees, never a tampered workflow definition.
  * The static tests pin the shape. The behavioural tests extract the real `run:`
  * scripts from the YAML and drive them: the derive and emit refusals with
  * fixtures; the guard, the materialisation, prepare's pin and the canary's tree
@@ -585,7 +591,7 @@ function canaryStep(pred: (s: Step) => boolean): string {
   return st?.run ?? "";
 }
 
-describe("release-promote — the machinery-recency guard and the materialisation (real git)", () => {
+describe("release-promote — the machinery-recency guard and the materialisation (real git; defence in depth)", () => {
   test("a matching tag passes; the trusted tree is origin/main's, never the workspace's", () => {
     const fx = gitFixture();
     const tagSha = git(fx.src, "rev-parse", "HEAD");
@@ -670,7 +676,7 @@ describe("release-promote — prepare pins origin/main and runs its hasher from 
   });
 });
 
-describe("canary.yml — a release-promote call executes trusted main, never the tag (real git)", () => {
+describe("canary.yml — a release-promote call runs trusted main's scripts, never the tag's (real git; defence in depth)", () => {
   const select = () => canaryStep((s) => (s.name ?? "").startsWith("Select the executed tree"));
   const CALLED = "octo/repo/.github/workflows/release-promote.yml@refs/tags/v1.2.4";
   const MANUAL = "octo/repo/.github/workflows/canary.yml@refs/heads/main";
@@ -1185,7 +1191,7 @@ describe("canary.yml — a failed tree selection runs no repository script (cont
 
 describe("canary.yml — a failed selection on a tampered tag executes none of the tag's code (real git)", () => {
   const CALLED = "octo/repo/.github/workflows/release-promote.yml@refs/tags/v1.2.4";
-  test("selection refused in the tag workspace; every step that then runs leaves the tag's scripts unexecuted", () => {
+  test("selection refused in the tag workspace; every eligible run: step then leaves the tag's scripts unexecuted", () => {
     const fx = gitFixture();
     const MARK = "TAG-CODE-RAN";
     // The tag's verdict and plugin-check scripts leave a mark if they ever run.
@@ -1222,7 +1228,8 @@ describe("canary.yml — a failed selection on a tampered tag executes none of t
     expect(sel.status).toBe(1);
     expect(sel.log).toContain("without a trusted_sha");
     expect(git(ws, "rev-parse", "HEAD")).toBe(tampered); // still the tag's tree
-    // Run, in order, every `run:` step GitHub would run after that failure.
+    // Run, in order, every `run:` step GitHub would run after that failure (the
+    // `uses:` upload step is eligible too, but is an action, not executed here).
     const ran = canaryRunPlan("failure").filter((s) => s.run);
     expect(ran.length).toBeGreaterThan(0);
     for (const st of ran) runStep(st.run!, ws, env);

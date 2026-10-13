@@ -10,47 +10,53 @@ name: Release promote
 # WHETHER to start this job. This job runs `workflow_dispatch` ON the `v*` tag
 # ref — the ref the `release-promote` environment's deployment policy admits —
 # and it takes NOTHING from the poll but "run now on this ref". It re-reads and
-# validates every fact it acts on: the version from the tag ref, the tag's
-# ancestry, the release-attempt marker (a deployment record, which can be changed
-# or deleted, so it is re-read and validated, never trusted), and the registry
-# bytes.
+# validates what it acts on: the version from the tag ref, the tag's ancestry,
+# the release-attempt marker from the deployments API (a record that can be
+# changed or deleted, so it is validated, never trusted), and the package-set
+# digest from the registry bytes.
 #
-# THE TRUST ANCHOR. `scripts/ci/*` and the workflow files at a tag are ordinary
-# repository code: a non-release PR could land an exfiltrating `canary-verdict.sh`
-# on main, the next release tags that tree, and a job that ran the tag's copy
-# under the token would hand a stranger the token. So:
-#   - GitHub runs the TAG's copy of this file and of `canary.yml` (a dispatched
-#     workflow and a local reusable workflow both resolve at the dispatch ref).
-#     The promote job's FIRST act requires both, and every repository script any
-#     job here runs (the canary's install, boot and plugin checks and their
-#     helpers included), to be byte-identical to `origin/main`.
-#   - Repository scripts run only from `origin/main`. `prepare` and the canary
-#     move their workspace to the `origin/main` commit `prepare` pinned before
-#     any repository script runs, and a failed move runs none (the canary then
-#     emits an inline FAIL); `promote` runs everything from a separate tree
-#     materialised from `origin/main` at its own pinned sha. The canary does run
-#     the PUBLISHED Flair and plugin packages it installs: that is its test.
-#   - `.github/CODEOWNERS` names the release trust root as the reviewer of those
-#     files. That keeps a change to them off main only as far as the repository's
-#     rules require code-owner review.
-# This closes the pre-tag-tampered class; the malicious-on-main class is closed by
-# review under those rules, not by this file.
+# THE BOUNDARY IS OUTSIDE THIS FILE. GitHub runs the TAG's copy of this file and
+# of `canary.yml` (a dispatched workflow and a local reusable workflow both
+# resolve at the dispatch ref), so a tag carrying a changed copy could drop any
+# check written here, including the guard below. What stops that is two
+# repository settings, which the poll (the default branch's copy) verifies through
+# the API before it dispatches (docs/releasing.md, "The promote boundary"):
+#   - the tag rulesets `release-tags-create` (only its bypass actors may create a
+#     `v*` tag) and `release-tags-immutable` (no `v*` tag can be moved, force-
+#     updated or deleted), both active;
+#   - the `release-promote` environment holding `NPM_TOKEN`, with a deployment
+#     policy of exactly the tag pattern `v*` (required reviewers optional).
+#
+# DEFENCE IN DEPTH, not the boundary. For a tag whose copy of this file is the
+# reviewed one: the promote job first requires both workflow files, and every
+# repository script any job here runs (the canary's install, boot and plugin
+# checks and their helpers included), to be byte-identical to `origin/main`;
+# repository scripts run only from `origin/main` (`prepare` and the canary move
+# their workspace to the commit `prepare` pinned, and a failed move runs none;
+# `promote` runs a separate tree materialised from its own pinned `origin/main`).
+# The canary does run the PUBLISHED Flair and plugin packages it installs: that
+# is its test. `.github/CODEOWNERS` names the release trust root as the reviewer
+# of those files, enforced as far as the repository's rules require code-owner
+# review.
 #
 # THE SHAPE. `prepare` (unprivileged) resolves the version from the tag, pins
 # `origin/main`, reads the certified package-set digest from the marker and
 # hashes the flair tarball. `canary` calls `canary.yml` via `workflow_call` (one
-# definition) on that pinned commit, so the published bytes are installed and
-# booted as a user would before any tag moves. `promote` (privileged) runs after
-# the canary PASSES, re-derives everything itself, and runs the promote block
-# emitted by the trusted `canary-verdict.sh --emit bash` under `NPM_TOKEN`.
+# definition, which resolves at the tag); the canary's workspace then selects the
+# pinned commit, so the published bytes are installed and booted as a user would
+# before any tag moves. `promote` (privileged, in the `release-promote`
+# environment) runs after the canary PASSES, re-reads and validates everything
+# itself, and runs the promote block emitted by the trusted
+# `canary-verdict.sh --emit bash` under `NPM_TOKEN`.
 #
 # THE CREDENTIAL. `NPM_TOKEN` is referenced in ONE place: the final dist-tag
 # step's `env`. It is never in a job-level `env`, never a command argument, never
 # echoed. npm reads it through a throwaway `.npmrc` indirection
 # (`//registry.npmjs.org/:_authToken=${NPM_TOKEN}`). Until the `release-promote`
-# environment exists (an org admin creates it once: a `v*` tag deployment policy
-# and an `NPM_TOKEN` secret with write access to the lockstep packages), that step
-# fails closed with a named message and moves nothing.
+# environment exists (an admin creates it once: a `v*` tag deployment policy and
+# an `NPM_TOKEN` secret with write access to the lockstep packages), the poll
+# dispatches nothing; without the secret, the token step fails closed with a
+# named message and moves nothing.
 #
 # THE DRY RUN. `dry_run` defaults to `true`: the job validates through block
 # generation (guard, re-derivation, the canary, the emitted promote block) and
@@ -215,7 +221,8 @@ jobs:
       expected_sha256: ${{ needs.prepare.outputs.expected_sha256 }}
       package_set_digest: ${{ needs.prepare.outputs.package_set_digest }}
       # The origin/main commit `prepare` pinned: the canary moves its workspace to
-      # it before any repository script runs, so the tag supplies no executable.
+      # it before any repository script runs, so no repository script runs from
+      # the tag checkout (canary.yml itself resolves at the tag).
       trusted_sha: ${{ needs.prepare.outputs.trusted_sha }}
 
   promote:
@@ -239,7 +246,10 @@ jobs:
           fetch-depth: 0
 
       - name: Machinery-recency guard — pin origin/main and require the executed files to match
-        # The FIRST act. `release-publish.yml` uses the same guard for its own
+        # DEFENCE IN DEPTH, not the boundary: it runs from the tag's copy of this
+        # file, so it fires for a tag whose copy is the reviewed one (the tag
+        # rulesets + the environment are the boundary; see the header). The first
+        # act after checkout. `release-publish.yml` uses the same guard for its own
         # workflow file; here it is widened to EVERY file this workflow executes,
         # the canary's install, boot and plugin checks and their helpers included,
         # so a pre-tag-tampered copy of any of them is refused before anything runs

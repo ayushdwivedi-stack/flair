@@ -1,15 +1,17 @@
 - **A privileged `release-promote` workflow moves `latest` after the npm approval.**
-  Once its environment is configured, a successful run leaves the approval as the only
-  human action; a failed run is not dispatched again and is re-run by hand. The
-  unprivileged poll dispatches it on the version's tag ref once every lockstep package
-  is public and hashes to the certified digest; it runs the post-publish canary, then
-  the promote block. GitHub runs the tag's copy of the two workflow files, which must
-  equal the default branch's. Once a job's tree selection succeeds, every repository
-  script it runs, the canary's checks included, comes from the default branch at a
-  pinned commit; a failed selection runs none. A version whose `latest` is already
-  newer is refused before any tag moves.
+  The unprivileged poll dispatches it on the version's tag ref once every lockstep
+  package is public and hashes to the certified digest. It first verifies the promote
+  boundary through the API: the `v*` tag rulesets are active, and the `release-promote`
+  environment exists with a `v*`-only tag policy. The run executes the post-publish
+  canary, then the promote block, so the npm approval stays the one human action. The poll does not redispatch a version whose run is visible, and dispatches
+  each version at most once per poll; a failed run is re-run by hand. GitHub runs the
+  tag's copy of the workflow files, so those settings are the boundary. The workflow's
+  own checks (executed files equal to the default branch's, repository scripts only
+  from a pinned default-branch commit) are defence in depth. A version whose `latest`
+  is already newer is refused before any tag moves.
 
-  > **Heads-up:** an org admin creates the `release-promote` environment once — a `v*`
-  > tag deployment policy and an `NPM_TOKEN` with write access to the lockstep packages.
-  > Until then the job fails closed and moves nothing. A manual dispatch with `dry_run`
-  > at its default validates through block generation without testing the move.
+  > **Heads-up:** a repository admin creates the `release-promote` environment once: a
+  > deployment policy of exactly the tag pattern `v*` and an `NPM_TOKEN` with write
+  > access to the lockstep packages (required reviewers are optional). Until then the poll
+  > dispatches nothing. A manual dispatch with `dry_run` at its default validates
+  > through block generation without testing the move.

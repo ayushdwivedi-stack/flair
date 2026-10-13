@@ -223,17 +223,19 @@ cannot be re-staged under a different tag.
 
 ### Phase 4 — the post-publish canary
 
-Once the [`release-promote` environment](#github-release-promote-environment-flair1928-slice-2)
-and its `NPM_TOKEN` exist, this phase runs for you. When every staged package is
-approved and public, the unprivileged
-[`release-promote-poll`](../.github/workflows/release-promote-poll.yml) poll dispatches
-the privileged [`release-promote`](../.github/workflows/release-promote.yml) workflow on
-the version's tag ref, and that workflow calls the
-[`post-publish canary`](../.github/workflows/canary.yml) — the same one below, run from
-the default branch's tree at a pinned commit — before it promotes anything. The poll
-dispatches **at most once per version**: a run that fails (a red canary, a refusal, the
-environment missing) is not dispatched again. Re-run the promote by hand on the TAG
-ref, which re-runs its canary too:
+Once [the promote boundary](#the-promote-boundary-flair1928) is in place (the tag
+rulesets and the `release-promote` environment with its `NPM_TOKEN`), this phase runs
+for you. When every staged package is approved and public, the unprivileged
+[`release-promote-poll`](../.github/workflows/release-promote-poll.yml) poll verifies the
+boundary and dispatches the privileged
+[`release-promote`](../.github/workflows/release-promote.yml) workflow on the version's
+tag ref, and that workflow calls the
+[`post-publish canary`](../.github/workflows/canary.yml) — the same one below; its
+definition resolves at the tag and its workspace runs the default branch's scripts at a
+pinned commit — before it promotes anything. The poll does not redispatch a version
+whose run is visible in the run list, and dispatches each version at most once per
+poll, so a run that fails (a red canary, a refusal) is not dispatched again. Re-run the promote by hand on the TAG ref, which
+re-runs its canary too:
 
 ```bash
 gh workflow run release-promote.yml --ref v<ver> -f dry_run=false
@@ -278,10 +280,11 @@ version. npm has no atomic multi-package move, so the block moves them one at a 
 plugins sit at 0.54.2 is exactly the mismatch `flair#1383` detects at runtime —
 and 0.55.1's promote had to be assembled by hand, line by line, for this reason.
 
-With the `release-promote` environment configured, a successful `release-promote` run
-does this phase too: it re-reads and validates the version, the tag's ancestry, the
-release-attempt marker and the certified package-set digest, runs the canary above,
-and — on PASS — runs the promote block below, which it obtains as executable text from
+With the promote boundary in place, a successful `release-promote` run does this phase
+too: it re-reads and validates the version (from the tag ref),
+the tag's ancestry, the release-attempt marker (from the deployments API) and the
+certified package-set digest (from the registry bytes), runs the canary above, and —
+on PASS — runs the promote block below, which it obtains as executable text from
 `scripts/ci/canary-verdict.sh` (`--emit bash`, the same block a human would paste). A
 manual dispatch of `release-promote` defaults `dry_run` to `true`: it validates through
 block generation and prints the block, but does not test the move (the block's
@@ -414,25 +417,53 @@ review. Because the release is triggered by a tag push, its deployment policy mu
 **`v*` tags** (Settings → Environments → `release` → Deployment branches and tags →
 Selected branches and tags → add tag rule `v*`).
 
-### GitHub `release-promote` environment (flair#1928 slice 2)
+### The promote boundary (flair#1928)
 
-A repository admin creates this environment **once** before the first automated promote.
-It scopes the promote's npm write token to tag refs, so a scheduled poll can never hold
-it. Checklist:
+GitHub runs a dispatched workflow, and the reusable canary it calls, from the **tag's**
+copy. A tag carrying a changed `release-promote.yml` could therefore drop any check
+written in it, so no in-workflow check is the boundary. The boundary is these two
+repository settings. The poll, which always runs the default branch's copy, reads both
+through the API before it dispatches anything; if either is missing or different, it
+dispatches nothing and fails with the reason.
+
+**1. The `v*` tag rulesets** (Settings → Rules → Rulesets). Both must stay **Active**:
+
+- **`release-tags-create`** (id `24044017`): target tags, include `refs/tags/v*`, no
+  exclusions, rule **Restrict creations**. Only its bypass actors may create a `v*` tag:
+  repository admins, plus the release-tag App only if the auto-tagger is to create tags.
+- **`release-tags-immutable`** (id `23944797`): target tags, include `refs/tags/v*`, no
+  exclusions, rules **Restrict updates**, **Restrict deletions** and **Block force
+  pushes**, so a `v*` tag can never be moved to another commit.
+
+The poll checks each pinned id for enforcement, target, pattern and rule types. Its token
+cannot read bypass actors, so keeping that bypass list is part of this setting. A
+ruleset recreated under a new id fails closed until the pins in
+`release-promote-poll.yml` are updated.
+
+**2. The GitHub `release-promote` environment** (Settings → Environments), created once
+by a repository admin before the first automated promote:
 
 - Environment name: **`release-promote`**.
-- Deployment policy: allow **tag** refs matching **`v*`** only (Settings → Environments →
-  `release-promote` → Deployment branches and tags → Selected branches and tags → add
-  tag rule `v*`). No required reviewers — the human gate is the npm approval.
+- **Deployment branches and tags:** Selected branches and tags, with exactly one rule:
+  the **tag** pattern **`v*`**. The secret is then exposed only to runs on a `v*` tag,
+  which only the ruleset's bypass actors can create and nobody can move.
+- **Required reviewers:** not required. The release has one human action, the npm 2FA
+  approval. An operator may add reviewers; the poll accepts that, and each promote then
+  waits for that approval after its canary.
 - Secret: **`NPM_TOKEN`**, a granular npm access token with **read and write on the
   lockstep packages** (`node scripts/ci/lockstep-packages.mjs` prints the list), 2FA-bypass
   (automation), expiry ≤ 90 days with a rotation reminder. It needs exactly the scope to
   move a dist-tag on those packages.
 
-Until that environment and secret exist, `release-promote` fails closed with a message
-naming them and moves nothing. A manual dispatch of `release-promote` with `dry_run` left
-at its default (`true`) needs no token: it validates through block generation without
-testing the move.
+The checks inside `release-promote.yml` and `canary.yml` are **defence in depth**, not
+the boundary. They compare the executed files with `origin/main`, run repository scripts
+only from a pinned `origin/main` tree, and refuse on any unverifiable input. They fire
+only for a tag whose copy of the workflow is the reviewed one.
+
+Until the environment exists, the poll dispatches nothing; if it exists without its
+`NPM_TOKEN`, the token step refuses with a named message and moves nothing. A manual
+run of `release-promote` with `dry_run` left at its default (`true`) needs no token: it
+validates through block generation without testing the move.
 
 ### GitHub `adk-flair-publish` environment
 
@@ -519,10 +550,11 @@ on; it holds no npm credential (the poll runs on the automatic
 
 `release-promote.yml` (`workflow_dispatch` on the tag ref, `environment:
 release-promote`) is the only job that can see `NPM_TOKEN`. It takes nothing from the
-poll but "run now on this ref" and re-derives everything it acts on. Each control below
-is a test in `test/unit/release-promote-workflow.test.ts`:
+poll but "run now on this ref". The boundary is [the promote boundary](#the-promote-boundary-flair1928),
+which the poll verifies before dispatching; the controls below are defence in depth
+inside the workflow, each a test in `test/unit/release-promote-workflow.test.ts`:
 
-- **No repository script from the tag's checkout.** GitHub runs the tag's copy of
+- **No repository script from the tag's checkout** (defence in depth). GitHub runs the tag's copy of
   `release-promote.yml` and of the `canary.yml` it calls. `prepare` pins `origin/main`
   and moves its workspace there; the canary moves its workspace to that same commit
   before any repository script runs (its install, boot and plugin checks included), and
@@ -544,10 +576,13 @@ is a test in `test/unit/release-promote-workflow.test.ts`:
   pinned to the canary's exact version (11.19.1), installed from a job directory and
   verified with `npm --version` before the registry reads and tag moves that follow;
   another version is a refusal.
-- **Dispatch at most once per version.** The poll identifies a version's run by the
-  run-name `release-promote v<version>` (or its tag head branch), across every page of
-  the run list, and does not dispatch a second time for that version; a failed or
-  uninterpretable run-list read is an error, never a dispatch.
+- **No redispatch of a visible run; at most once per poll.** The poll identifies a
+  version's run by the run-name `release-promote v<version>` (or its tag head branch),
+  across every page of the run list, and does not redispatch a version whose run is
+  visible there. Within one poll it dispatches each version at most once, whatever the
+  number of marker rows. A failed or uninterpretable run-list read is an error, never a
+  dispatch. It is a list-then-dispatch check, not a reservation: a run that is not yet
+  visible in the list is not seen.
 
 **When the promote block fails.** Nothing is restored automatically (a restore cannot
 be told apart from clobbering a newer legitimate `latest`); the job fails and the run

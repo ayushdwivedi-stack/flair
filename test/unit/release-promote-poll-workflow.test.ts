@@ -8,10 +8,11 @@
  * promoted.
  */
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import yaml from "js-yaml";
 
 interface Step {
@@ -232,5 +233,292 @@ describe("release-promote-poll — dispatch at most once per version (#1928 slic
     expect(already([page(), { message: "Not Found" }])).toBe("invalid");
     expect(already("")).toBe("invalid");
     expect(already("{not json")).toMatch(/^exit [1-9]/);
+  });
+});
+
+// ── The promote boundary, verified before any dispatch (flair#1928) ──────────
+//
+// GitHub runs a dispatched workflow from the TAG's copy, so the boundary is two
+// repository settings, verified by this poll (the default branch's copy) through
+// the API. The API is an external service: a fake `gh` serves JSON in the live
+// shapes (rulesets 24044017 / 23944797 as read on 2026-10-13; the environment
+// as the REST API documents it).
+
+const POLL_STEP = (name: string) => {
+  const st = (job("poll").steps ?? []).find((s) => (s.name ?? "").startsWith(name));
+  expect(st, `poll step '${name}'`).toBeDefined();
+  return st!;
+};
+const POLL_ENV = (job("poll") as { env?: Record<string, string> }).env ?? {};
+
+/** A fake `gh`: `gh api [--paginate] <path>` serves FIXTURES[<path without query>] or exits 1 (404). */
+function fakeGh(dir: string, fixtures: Record<string, unknown>, extra = ""): string {
+  const bin = join(dir, "bin");
+  mkdirSync(bin, { recursive: true });
+  const fx = join(dir, "fixtures");
+  mkdirSync(fx, { recursive: true });
+  const index: Record<string, string> = {};
+  Object.entries(fixtures).forEach(([path, body], i) => {
+    const f = join(fx, `${i}.json`);
+    writeFileSync(f, typeof body === "string" ? body : JSON.stringify(body));
+    index[path] = f;
+  });
+  writeFileSync(join(fx, "index.json"), JSON.stringify(index));
+  writeFileSync(
+    join(bin, "gh"),
+    `#!/usr/bin/env bash
+${extra}
+if [ "$1" = "api" ]; then
+  shift; [ "$1" = "--paginate" ] && shift
+  path="\${1%%\\?*}"
+  f="$(jq -r --arg p "$path" '.[$p] // ""' ${JSON.stringify(join(fx, "index.json"))})"
+  if [ -n "$f" ]; then cat "$f"; exit 0; fi
+  echo "gh: Not Found (HTTP 404) $path" >&2; exit 1
+fi
+echo "fake gh: unhandled $*" >&2; exit 1
+`,
+  );
+  chmodSync(join(bin, "gh"), 0o755);
+  return bin;
+}
+
+const R = "octo/repo";
+const ENV_PATH = `repos/${R}/environments/release-promote`;
+const POL_PATH = `${ENV_PATH}/deployment-branch-policies`;
+const CREATE_PATH = `repos/${R}/rulesets/24044017`;
+const IMMUT_PATH = `repos/${R}/rulesets/23944797`;
+const goodEnv = () => ({
+  name: "release-promote",
+  protection_rules: [
+    { type: "required_reviewers", prevent_self_review: false, reviewers: [{ type: "User", reviewer: { login: "heskew" } }] },
+    { type: "branch_policy" },
+  ],
+  deployment_branch_policy: { protected_branches: false, custom_branch_policies: true },
+});
+const goodPolicies = () => ({ total_count: 1, branch_policies: [{ id: 1, name: "v*", type: "tag" }] });
+const goodCreate = () => ({
+  id: 24044017,
+  name: "release-tags-create",
+  target: "tag",
+  enforcement: "active",
+  conditions: { ref_name: { exclude: [], include: ["refs/tags/v*"] } },
+  rules: [{ type: "creation" }],
+  bypass_actors: null,
+});
+const goodImmutable = () => ({
+  id: 23944797,
+  name: "release-tags-immutable",
+  target: "tag",
+  enforcement: "active",
+  conditions: { ref_name: { exclude: [], include: ["refs/tags/v*", "refs/tags/adk-flair-v*"] } },
+  rules: [{ type: "deletion" }, { type: "non_fast_forward" }, { type: "update" }],
+  bypass_actors: null,
+});
+function boundaryFixtures(over: Record<string, unknown | undefined> = {}): Record<string, unknown> {
+  const all: Record<string, unknown | undefined> = {
+    [ENV_PATH]: goodEnv(),
+    [POL_PATH]: goodPolicies(),
+    [CREATE_PATH]: goodCreate(),
+    [IMMUT_PATH]: goodImmutable(),
+    ...over,
+  };
+  return Object.fromEntries(Object.entries(all).filter(([, v]) => v !== undefined));
+}
+/** Run the real boundary step; returns its outputs. */
+function runBoundary(fixtures: Record<string, unknown>) {
+  const dir = mkdtempSync(join(tmpdir(), "poll-boundary-"));
+  try {
+    const bin = fakeGh(dir, fixtures);
+    const out = join(dir, "out");
+    writeFileSync(out, "");
+    const sh = join(dir, "step.sh");
+    writeFileSync(sh, POLL_STEP("Verify the promote boundary").run ?? "");
+    const r = spawnSync("bash", ["--noprofile", "--norc", "-eo", "pipefail", sh], {
+      encoding: "utf8",
+      env: { ...process.env, ...POLL_ENV, PATH: `${bin}:${process.env.PATH}`, REPO: R, GH_TOKEN: "x", GITHUB_OUTPUT: out },
+    });
+    const outputs = Object.fromEntries(
+      readFileSync(out, "utf8").split("\n").filter(Boolean).map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]),
+    );
+    return { status: r.status, log: (r.stdout ?? "") + (r.stderr ?? ""), ok: outputs.ok, reason: outputs.reason ?? "" };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe("release-promote-poll — the promote boundary is verified before any dispatch", () => {
+  test("the pins name the environment the promote job uses and the two live v* tag rulesets", () => {
+    expect(POLL_ENV.PROMOTE_ENV).toBe("release-promote");
+    expect(POLL_ENV.TAG_CREATE_RULESET).toBe("24044017");
+    expect(POLL_ENV.TAG_IMMUTABLE_RULESET).toBe("23944797");
+    const promote = yaml.load(readFileSync(join(REPO, ".github", "workflows", "release-promote.yml"), "utf8")) as {
+      jobs?: Record<string, { environment?: string }>;
+    };
+    expect(promote.jobs?.promote?.environment).toBe(POLL_ENV.PROMOTE_ENV);
+    // The boundary step runs before the dispatching step, and the dispatch reads it.
+    const steps = job("poll").steps ?? [];
+    const b = steps.findIndex((s) => s.id === "boundary");
+    const d = steps.findIndex((s) => (s.name ?? "") === "Poll and dispatch");
+    expect(b).toBeGreaterThan(0);
+    expect(b).toBeLessThan(d);
+    expect(JSON.stringify(steps[d]?.env)).toContain("steps.boundary.outputs.ok");
+  });
+
+  test("present: environment with a v*-only tag policy (reviewers here, an operator choice), both rulesets active → ok", () => {
+    const r = runBoundary(boundaryFixtures());
+    expect(r.status, r.log).toBe(0);
+    expect(r.ok).toBe("true");
+    expect(r.reason).toBe("");
+  });
+
+  test("environment missing → refused, named", () => {
+    const r = runBoundary(boundaryFixtures({ [ENV_PATH]: undefined, [POL_PATH]: undefined }));
+    expect(r.status).toBe(0); // the step never fails the poll by itself…
+    expect(r.ok).toBe("false"); // …it records the refusal
+    expect(r.reason).toContain("environment 'release-promote' is missing or unreadable");
+  });
+
+  test("reviewers absent → ok (one human action: the npm approval; reviewers are optional)", () => {
+    const noRule = { ...goodEnv(), protection_rules: [{ type: "branch_policy" }] };
+    const empty = { ...goodEnv(), protection_rules: [{ type: "required_reviewers", reviewers: [] }, { type: "branch_policy" }] };
+    const none = { ...goodEnv(), protection_rules: [] };
+    for (const env of [noRule, empty, none]) {
+      const r = runBoundary(boundaryFixtures({ [ENV_PATH]: env }));
+      expect(r.status, r.log).toBe(0);
+      expect(r.ok).toBe("true");
+      expect(r.reason).toBe("");
+    }
+  });
+
+  test("wrong deployment policy → refused, named (all refs, protected branches, a branch rule, an extra rule)", () => {
+    const cases: [Record<string, unknown>, string][] = [
+      [{ [ENV_PATH]: { ...goodEnv(), deployment_branch_policy: null } }, "does not limit deployments to selected tags"],
+      [{ [ENV_PATH]: { ...goodEnv(), deployment_branch_policy: { protected_branches: true, custom_branch_policies: false } } }, "does not limit deployments to selected tags"],
+      [{ [POL_PATH]: { total_count: 1, branch_policies: [{ name: "v*", type: "branch" }] } }, "is not exactly the tag pattern v*"],
+      [{ [POL_PATH]: { total_count: 2, branch_policies: [{ name: "v*", type: "tag" }, { name: "main", type: "branch" }] } }, "is not exactly the tag pattern v*"],
+      [{ [POL_PATH]: { total_count: 1, branch_policies: [{ name: "*", type: "tag" }] } }, "is not exactly the tag pattern v*"],
+      [{ [POL_PATH]: undefined }, "could not read the deployment policies"],
+    ];
+    for (const [over, msg] of cases) {
+      const r = runBoundary(boundaryFixtures(over));
+      expect(r.ok, msg).toBe("false");
+      expect(r.reason).toContain(msg);
+    }
+  });
+
+  test("an inactive tag ruleset → refused, named", () => {
+    for (const enforcement of ["evaluate", "disabled"]) {
+      const r = runBoundary(boundaryFixtures({ [CREATE_PATH]: { ...goodCreate(), enforcement } }));
+      expect(r.ok).toBe("false");
+      expect(r.reason).toContain(`tag ruleset 24044017 (release-tags-create) is not active (enforcement '${enforcement}')`);
+    }
+    const r = runBoundary(boundaryFixtures({ [IMMUT_PATH]: { ...goodImmutable(), enforcement: "disabled" } }));
+    expect(r.reason).toContain("tag ruleset 23944797 (release-tags-immutable) is not active");
+  });
+
+  test("a tag ruleset missing, without its rule, or not covering refs/tags/v* → refused, named", () => {
+    const cases: [Record<string, unknown>, string][] = [
+      [{ [CREATE_PATH]: undefined }, "tag ruleset 24044017 (release-tags-create) is missing or unreadable"],
+      [{ [CREATE_PATH]: { ...goodCreate(), rules: [{ type: "update" }] } }, 'does not apply ["creation"] to refs/tags/v*'],
+      [{ [IMMUT_PATH]: { ...goodImmutable(), rules: [{ type: "deletion" }] } }, "(release-tags-immutable) does not apply"],
+      [{ [CREATE_PATH]: { ...goodCreate(), conditions: { ref_name: { exclude: [], include: ["refs/tags/adk-flair-v*"] } } } }, "(release-tags-create) does not apply"],
+      [{ [CREATE_PATH]: { ...goodCreate(), conditions: { ref_name: { exclude: ["refs/tags/v9*"], include: ["refs/tags/v*"] } } } }, "(release-tags-create) does not apply"],
+      [{ [CREATE_PATH]: { ...goodCreate(), target: "branch" } }, "(release-tags-create) does not apply"],
+    ];
+    for (const [over, msg] of cases) {
+      const r = runBoundary(boundaryFixtures(over));
+      expect(r.ok, msg).toBe("false");
+      expect(r.reason).toContain(msg);
+    }
+  });
+});
+
+// ── The poll step itself: dedup within a poll, and the boundary refusal ──────
+
+/** sha256 the stub hasher prints for `<version> <pkg>`. */
+const stubSha = (version: string, pkg: string) => createHash("sha256").update(`${version}\n${pkg}`).digest("hex");
+function setDigest(version: string, pkgs: string[]): string {
+  const rows = pkgs.map((p) => `${p}@${version} ${stubSha(version, p)}\n`).sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
+  return createHash("sha256").update(rows.join("")).digest("hex");
+}
+/** Run the real "Poll and dispatch" step in a fixture tree; returns the dispatches it made. */
+function runPoll(markers: unknown[], boundary: { ok: string; reason?: string }) {
+  const dir = mkdtempSync(join(tmpdir(), "poll-run-"));
+  try {
+    mkdirSync(join(dir, "scripts", "ci"), { recursive: true });
+    copyFileSync(join(REPO, "scripts", "ci", "lockstep-packages.mjs"), join(dir, "scripts", "ci", "lockstep-packages.mjs"));
+    writeFileSync(
+      join(dir, "scripts", "ci", "registry-tarball-sha256.mjs"),
+      `import { createHash } from "node:crypto";\nconst [v, p] = process.argv.slice(2);\nprocess.stdout.write(createHash("sha256").update(v + "\\n" + p).digest("hex") + "\\n");\n`,
+    );
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "@tpsdev-ai/flair", version: "0.0.0" }));
+    mkdirSync(join(dir, "packages", "client"), { recursive: true });
+    writeFileSync(join(dir, "packages", "client", "package.json"), JSON.stringify({ name: "@tpsdev-ai/flair-client", version: "0.0.0" }));
+    const dispatches = join(dir, "dispatches.log");
+    writeFileSync(dispatches, "");
+    const bin = fakeGh(
+      dir,
+      {
+        [`repos/${R}/deployments`]: markers,
+        [`repos/${R}/actions/workflows/release-promote.yml`]: { id: 1 },
+        [`repos/${R}/actions/workflows/release-promote.yml/runs`]: { total_count: 0, workflow_runs: [] },
+      },
+      `if [ "$1" = "workflow" ] && [ "$2" = "run" ]; then echo "$*" >> ${JSON.stringify(dispatches)}; exit 0; fi
+if [ "$1" = "api" ] && [[ "$*" == *"environment=promoted"* ]]; then echo '[]'; exit 0; fi`,
+    );
+    const sh = join(dir, "poll.sh");
+    writeFileSync(sh, POLL_STEP("Poll and dispatch").run ?? "");
+    const r = spawnSync("bash", ["--noprofile", "--norc", "-eo", "pipefail", sh], {
+      cwd: dir,
+      encoding: "utf8",
+      timeout: 60_000,
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        REPO: R,
+        GH_TOKEN: "x",
+        BOUNDARY_OK: boundary.ok,
+        BOUNDARY_REASON: boundary.reason ?? "",
+      },
+    });
+    return {
+      status: r.status,
+      log: (r.stdout ?? "") + (r.stderr ?? ""),
+      dispatches: readFileSync(dispatches, "utf8").split("\n").filter(Boolean),
+    };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+const PKGS = ["@tpsdev-ai/flair-client", "@tpsdev-ai/flair"];
+const marker = (version: string) => ({ ref: `v${version}`, payload: { version, package_set_digest: setDigest(version, PKGS) } });
+
+describe("release-promote-poll — each version is dispatched at most once per poll", () => {
+  test("duplicate marker rows for one version dispatch it once", () => {
+    const r = runPoll([marker("1.2.3"), marker("1.2.3"), marker("1.2.3")], { ok: "true" });
+    expect(r.status, r.log).toBe(0);
+    expect(r.dispatches).toEqual(["workflow run release-promote.yml --ref v1.2.3 -f dry_run=false"]);
+    expect(r.log).toContain("v1.2.3: duplicate marker row — already handled in this poll, skipping");
+  });
+
+  test("control: two distinct ready versions are each dispatched once", () => {
+    const r = runPoll([marker("1.2.3"), marker("1.2.4"), marker("1.2.3")], { ok: "true" });
+    expect(r.status, r.log).toBe(0);
+    expect(r.dispatches).toEqual([
+      "workflow run release-promote.yml --ref v1.2.3 -f dry_run=false",
+      "workflow run release-promote.yml --ref v1.2.4 -f dry_run=false",
+    ]);
+  });
+
+  test("a boundary NOT in place: an error exit naming the reason, and nothing dispatched", () => {
+    const reason = "environment 'release-promote' is missing or unreadable";
+    const r = runPoll([marker("1.2.3"), marker("1.2.4")], { ok: "false", reason });
+    expect(r.status).toBe(1);
+    expect(r.log).toContain(`refusing to dispatch release-promote for v1.2.3: the promote boundary is not in place: ${reason}`);
+    expect(r.dispatches).toEqual([]);
+    // An unverified boundary (no output at all) refuses the same way.
+    const unknown = runPoll([marker("1.2.3")], { ok: "" });
+    expect(unknown.status).toBe(1);
+    expect(unknown.dispatches).toEqual([]);
   });
 });
