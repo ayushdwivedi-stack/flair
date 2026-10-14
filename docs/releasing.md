@@ -234,8 +234,9 @@ tag ref, and that workflow calls the
 definition resolves at the tag and its workspace runs the default branch's scripts at a
 pinned commit — before it promotes anything. The poll does not redispatch a version
 whose run is visible in the run list, and dispatches each version at most once per
-poll, so a run that fails (a red canary, a refusal) is not dispatched again. Re-run the promote by hand on the TAG ref, which
-re-runs its canary too:
+poll, so a version whose failed run (a red canary, a refusal) is visible in the run
+list is not dispatched again. Re-running it is an operator step: dispatch the promote
+by hand on the TAG ref, which re-runs its canary too:
 
 ```bash
 gh workflow run release-promote.yml --ref v<ver> -f dry_run=false
@@ -324,8 +325,9 @@ below stays as the fallback; a failed run's recovery is
   The preflight `test` guards integrity: a stale PASS, a re-cut version, or a
   paste from a failed run aborts before `latest` moves. Before the first move the
   block also reads every package's current `latest` and refuses if any is already
-  NEWER than `<ver>`: a superseded version never moves `latest` backward. Paste **all** of the block
-  or **none** — a partial paste is the skew this phase exists to prevent.
+  NEWER than `<ver>` at that pre-move read: a superseded version is refused. Paste
+  **all** of the block or **none** — a partial paste is the skew this phase exists to
+  prevent.
 
   The block runs under bash; `scripts/ci/canary-verdict.sh` is bash **3.2**-safe,
   so stock macOS `/bin/bash` runs it (and the emitted block) locally — no newer
@@ -423,8 +425,9 @@ GitHub runs a dispatched workflow, and the reusable canary it calls, from the **
 copy. A tag carrying a changed `release-promote.yml` could therefore drop any check
 written in it, so no in-workflow check is the boundary. The boundary is these two
 repository settings. The poll, which always runs the default branch's copy, reads both
-through the API before it dispatches anything; if either is missing or different, it
-dispatches nothing and fails with the reason.
+through the API on every run. If either is missing or different, the poll records the
+reason as a warning and dispatches nothing; it fails, with the reason, when a ready
+version reaches the dispatch (a poll with nothing ready still succeeds).
 
 **1. The `v*` tag rulesets** (Settings → Rules → Rulesets). Both must stay **Active**:
 
@@ -454,6 +457,10 @@ by a repository admin before the first automated promote:
   lockstep packages** (`node scripts/ci/lockstep-packages.mjs` prints the list), 2FA-bypass
   (automation), expiry ≤ 90 days with a rotation reminder. It needs exactly the scope to
   move a dist-tag on those packages.
+
+Before creating the environment, audit the existing `v*` tags: none may carry a
+`release-promote.yml` that was not reviewed on main. On 2026-10-13 none of the 93 live
+`v*` tags carried the file at all (`git cat-file -e <tag>:.github/workflows/release-promote.yml`).
 
 The checks inside `release-promote.yml` and `canary.yml` are **defence in depth**, not
 the boundary. They compare the executed files with `origin/main`, run repository scripts
@@ -602,7 +609,8 @@ log carries the commands for a human:
 
 **What a re-run is safe for.** Re-running the same version's promote after a partial or
 failed move converges the set: the block re-derives the certified digest, a package
-already at `<ver>` is left as it is, and a package whose `latest` is newer stops the run
-before any move, so `latest` never goes backward past a newer release. Not covered: two
+already at `<ver>` is left as it is, and a package whose `latest` is newer at the
+block's pre-move read stops the run before any move, so `latest` does not go back past
+a newer release seen at that read. Not covered: two
 versions' promotes running at the same moment, or a move made by hand between the
 block's read and its moves; the read precedes the moves, it is not a lock.

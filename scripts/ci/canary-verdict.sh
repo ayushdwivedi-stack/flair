@@ -286,8 +286,9 @@ for _p in ${PACKAGES[*]}; do
     exit 1
   fi
   # flair#1928: a NEWER release already holds latest => ${VERSION} is superseded.
-  # Refuse BEFORE the first move, so a re-run of an older version can never move
-  # latest backward. Equal is allowed (a re-run converges); a prerelease of the
+  # Refuse BEFORE the first move, so a re-run of an older version does not move
+  # latest back past a newer version seen at this pre-move read (a move made
+  # between this read and the moves is not covered). Equal is allowed (a re-run converges); a prerelease of the
   # same major.minor.patch is older than the release.
   _cur_core="\${_cur%%-*}"
   _cur_maj="\${_cur_core%%.*}"; _cur_rest="\${_cur_core#*.}"
@@ -414,8 +415,8 @@ all-or-none promote** — this block moves the tags SEQUENTIALLY and STOPS at th
 failure (the failing move exits non-zero). It reads every package's CURRENT \`latest\`
 BEFORE the first move, and STOPS before moving a single tag if ANY read fails — a
 non-zero npm exit, an empty read, or a value that is not a version — or if any
-package's \`latest\` is already NEWER than \`${VERSION}\` (a superseded version never
-moves \`latest\` backward), so it only reaches the moves with a clean PREVIOUS
+package's \`latest\` is already NEWER than \`${VERSION}\` at that pre-move read (a
+superseded version is refused), so it only reaches the moves with a clean PREVIOUS
 \`latest\` for every package — the values its RESTORE lines print.
 On the move-failure path it prints one RESTORE line per already-moved package
 (\`npm dist-tag add <pkg>@<previous> latest\`, never \`npm dist-tag rm\`) and then the

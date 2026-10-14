@@ -64,7 +64,9 @@ name: Release promote
 # block's current-`latest` reads, its refusals and its `dist-tag` moves run only
 # under the token. The poll's dispatch sets `dry_run=false`.
 #
-# This file is dispatched on the tag ref only, so `github.ref_name` is the tag and
+# It is meant to be dispatched on a `v*` tag ref. GitHub also allows a dispatch on
+# a branch; `prepare` refuses it (ref type not tag) and the environment's tag-only
+# policy keeps the token from it. Past that check `github.ref_name` is the tag and
 # `github.sha` is the tagged commit.
 on:
   workflow_dispatch:
@@ -291,8 +293,9 @@ jobs:
           echo "  ok ${GITHUB_SHA} is on origin/main and every executed file matches origin/main"
 
       - name: Materialise the trusted tree from origin/main at the pinned sha
-        # Everything the token-holding step runs comes from HERE, never from the
-        # tag's checkout. `git archive` of the pinned sha keeps the tree immutable
+        # Every repository script the token-holding step runs, and the emitted
+        # block, comes from HERE, never from the tag's checkout (node and the
+        # pinned npm are the job's toolchain, not repository code). `git archive` of the pinned sha keeps the tree immutable
         # for the rest of the job.
         env:
           MAIN_SHA: ${{ steps.guard.outputs.main_sha }}

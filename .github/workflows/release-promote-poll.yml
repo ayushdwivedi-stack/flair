@@ -37,10 +37,14 @@ name: Release promote poll
 #     can be updated, force-moved or deleted), both active;
 #   - the `release-promote` environment that holds the npm token, with a
 #     deployment policy of exactly the tag pattern `v*`, so the token is only
-#     exposed to runs on a tag that only an admin could create. Required
+#     exposed to runs on a tag that only the creation ruleset's configured
+#     bypass actors could create (repository admins, plus the release-tag App
+#     if it is configured as one). Required
 #     reviewers are not required (Nathan's rule: one human action, the npm
 #     approval); if an operator adds them, that is accepted.
-# Either missing, the poll dispatches nothing and fails with the reason.
+# Either missing, every poll records the reason as a warning and dispatches
+# nothing; the poll FAILS, with the reason, when a ready version reaches the
+# dispatch. A poll with nothing ready still succeeds.
 
 on:
   # SCHEDULE ONLY. A schedule run always executes the DEFAULT BRANCH's copy of this file.
@@ -138,7 +142,7 @@ jobs:
             REASON="$(paste -sd ';' "${REASONS}" | sed 's/;/; /g')"
             echo "ok=false" >> "$GITHUB_OUTPUT"
             echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
-            echo "  promote boundary NOT in place: ${REASON}"
+            echo "::warning::promote boundary not in place (a ready version will be refused at dispatch): ${REASON}"
           else
             echo "ok=true" >> "$GITHUB_OUTPUT"
             echo "  promote boundary in place: environment ${PROMOTE_ENV} (v* tags only); tag rulesets ${TAG_CREATE_RULESET} + ${TAG_IMMUTABLE_RULESET} active"
@@ -246,8 +250,9 @@ jobs:
               # slice 2 exists that is a loop whenever the privileged job cannot run
               # (a refusal, a red canary). This is a list-then-dispatch check, not a
               # reservation: a run not yet visible in the list is not seen. `release-promote.yml`
-              # sets `run-name: release-promote v<version>`, so a run already exists
-              # iff one carries that title or that head branch. The list is a network
+              # sets `run-name: release-promote v<version>`, so the poll takes a
+              # VISIBLE run carrying that title or that head branch as this
+              # version's run: evidence from the list, not proof. The list is a network
               # read: a failure is NOT "no run" — it is an error exit, never a
               # dispatch on an unknown. `--paginate` writes one JSON object PER PAGE,
               # so jq SLURPS them (-s) and flattens every page's `workflow_runs`
@@ -265,7 +270,7 @@ jobs:
               fi
               if [ "${ALREADY}" = "true" ]; then
                 echo "${version}" >> "${HANDLED}"
-                echo "  v${version}: a release-promote run already exists — not dispatching again"
+                echo "  v${version}: a release-promote run for this version is visible in the run list — not dispatching again"
                 continue
               fi
               # THE BOUNDARY (the step above): no dispatch unless the environment

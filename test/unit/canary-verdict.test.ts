@@ -346,7 +346,7 @@ describe("canary-verdict — `--emit bash` is the machine surface (flair#1928 sl
   });
 });
 
-describe("canary-verdict — a superseded version never moves latest backward (flair#1928)", () => {
+describe("canary-verdict — a version older than latest at the pre-move read is refused (flair#1928)", () => {
   /**
    * The emitted block's OWN superseded check (step 2), extracted verbatim from
    * `--emit bash` and run under the shell the macOS leg uses, against a table of
