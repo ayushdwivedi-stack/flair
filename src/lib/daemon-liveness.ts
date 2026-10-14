@@ -57,7 +57,7 @@ export type IdentityResult =
 /** `kill(pid, 0)` is a FOUR-way, not a boolean. */
 export type PidLiveness =
   | { kind: "alive" }
-  | { kind: "gone" }                     // ESRCH — the pid does not exist
+  | { kind: "gone" }                     // ESRCH or zombie
   | { kind: "eperm" }                    // exists, but another user's
   | { kind: "unknown"; reason: string };  // the probe failed for another reason — NOT gone
 
@@ -130,6 +130,8 @@ export interface DaemonEvidence {
   dataDirUnsafe: string | null;
   pidfile: PidfileRead;
   lastKnownPid?: number;
+  sidecar?: SidecarRead;
+  sidecarLiveness?: PidLiveness | null;
   pidLiveness: PidLiveness | null;
   identity: IdentityResult;
   health: HealthResult;
@@ -331,6 +333,37 @@ export function parseProcStatStartTime(stat: string): number | null {
   // rest[0] is field 3 (state); field 22 (starttime) is therefore rest[19].
   const starttime = Number(rest[19]);
   return Number.isFinite(starttime) ? starttime : null;
+}
+
+/**
+ * Parse the state character (field 3) of `/proc/<pid>/stat`.
+ *
+ * Field 2 (comm) is parenthesised and may itself contain spaces and `)`
+ * characters, so the split is on the LAST `)` — the same rule
+ * `parseProcStatStartTime` uses. Returns null when no state follows the comm.
+ */
+export function parseProcStatState(stat: string): string | null {
+  const closeParen = stat.lastIndexOf(")");
+  if (closeParen < 0) return null;
+  const rest = stat.slice(closeParen + 1).trim();
+  return rest.length > 0 ? rest[0] : null;
+}
+
+/**
+ * Whether a process-state character names an EXITED process (flair#2313).
+ *
+ * After signal 0 succeeds the pid exists — but an exited child its parent has
+ * not yet reaped is a zombie: it exists, it answers signal 0, and it is not a
+ * running process. The kernel reports it as state `Z` (Linux field 3 of
+ * `/proc/<pid>/stat`; Darwin the first character of `ps -o stat=`), so `Z` is
+ * exited.
+ *
+ * Every other value — including `null`, a state that could not be read — is
+ * NOT evidence of exit: a read failure must never report a live process as
+ * exited (fail safe).
+ */
+export function isExitedState(state: string | null): boolean {
+  return state === "Z";
 }
 
 /**
@@ -546,8 +579,9 @@ export function shouldAdoptMissingSidecar(input: {
  * Whether the identity sidecar is stale — does it name a pid that is CONFIRMED
  * gone?
  *
- * Stale is a POSITIVE finding, never a default. Only `kill(pid, 0)` returning
- * ESRCH (`gone`) is stale; `eperm` (a live process owned by another user) and
+ * Stale is a POSITIVE finding, never a default. Only `gone` (ESRCH, or a zombie
+ * whose state read reports it) is stale; `eperm` (a live process owned by
+ * another user) and
  * every indeterminate answer — `null`, or a probe that failed with any other
  * errno (`unknown`) — are NOT stale. Unknown evidence never licenses an action,
  * so a non-stale sidecar stays evidence and the machine keeps refusing.
@@ -576,8 +610,9 @@ export function classifySidecarStaleness(
  * CONFIRMED gone AND a fresh O_NOFOLLOW read still names that same pid.
  *
  * `observedPid` is the pid the sidecar named when the stop was observed;
- * `observedPidLiveness` is that pid read AFTER the stop's wait — `gone` (ESRCH)
- * is the confirmation. A process that survived, one owned by another user
+ * `observedPidLiveness` is that pid read AFTER the stop's wait — `gone` (ESRCH,
+ * or a zombie whose state read reports it) is the confirmation. A process that
+ * survived, one owned by another user
  * (EPERM), or one whose liveness could not be read removes nothing.
  *
  * `sidecar` is a fresh O_NOFOLLOW read taken after the stop. A sidecar another

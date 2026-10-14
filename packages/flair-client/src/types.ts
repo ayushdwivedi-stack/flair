@@ -27,6 +27,29 @@ export type MemoryType = "session" | "lesson" | "decision" | "preference" | "fac
  */
 export type Visibility = "private" | "shared";
 
+/**
+ * A host-object pointer (flair#1940): the host object the writer CLAIMS as a
+ * memory's source (a run, a launch, a turn). The value shape the server
+ * validates, stores and returns is versioned JSON `{ v: 1, host, kind, id, url? }`.
+ * `memory.write()` sends `v: 1` only when the caller omits `v`, so a writer may
+ * pass the pointer as `{ host, kind, id, url? }`.
+ *
+ * On a read, `hostSource` is either this object or the string `"withheld"` (the
+ * server withholds a pointer from a reader who may see the record but not the
+ * pointer). It is a writer's claim, not verified host authorship.
+ */
+export interface HostSource {
+  /** Pointer schema version. `write()` applies `1` when omitted. */
+  v?: 1;
+  /** Host the object lives on, from the server's closed set (e.g. "openclaw", "cursor", "codex"). */
+  host: string;
+  /** Object kind, from the server's closed set (e.g. "run", "launch", "turn"). */
+  kind: string;
+  id: string;
+  /** https URL of the host object, if any. */
+  url?: string;
+}
+
 /** A memory record. */
 export interface Memory {
   id: string;
@@ -37,6 +60,22 @@ export interface Memory {
   tags: string[];
   subject?: string;
   metadata?: string | null;
+  /**
+   * flair#1940 — the host-source pointer joined into this record for the
+   * reader, or the string `"withheld"` when the reader may read the record but
+   * not its pointer. Absent when the record carries no pointer a reader may
+   * know about. `agentId` is the record's author.
+   */
+  hostSource?: HostSource | "withheld";
+  /** flair#1940 — the originating session id, when the writer set one. */
+  sessionId?: string;
+  /**
+   * Server JSON `{ v, verified: { agentId, timestamp, receivedAt }, claimed? }`,
+   * same shape as {@link Relationship.provenance}. `verified.*` is server-derived;
+   * `claimed.*` is the caller's unverified claim. Absent on rows written before
+   * the field existed.
+   */
+  provenance?: string;
   /** Writer-controlled sharing intent. Absent on records written before this
    *  field existed — the server treats absence as "shared" (migration-
    *  invariant: an existing memory keeps reading to exactly whoever holds a
@@ -47,6 +86,23 @@ export interface Memory {
   /** Always true after a successful write()/update() — the server never
    *  suppresses a write, so this is never false/absent on a real response. */
   written?: boolean;
+  /** How many credential-shaped values the server replaced in `content`,
+   *  `summary` and `trigger` before persisting the row (flair#2407). Present
+   *  only when above zero; absent means the server reported no replacement.
+   *  When present on a write()/update() result, each of those fields the write
+   *  carried holds its post-redaction value as that write committed it, taken
+   *  from the write response's `stored` with no read after the write
+   *  (flair#2467), unless `contentWithheld` is true. A field the redaction did
+   *  not change equals the caller's value; the caller's input is never
+   *  substituted for a field the server changed. */
+  redactedValues?: number;
+  /** flair#2467 — true on a write()/update() result whose response reported
+   *  `redactedValues` but did not return the stored text (a server from before
+   *  it returned `stored`). The result then has no `content`, `summary` or
+   *  `trigger`: at least one of them was changed by the redaction, the
+   *  response does not say which, and the input is never reported in their
+   *  place. Read the row to see the stored text. Absent otherwise. */
+  contentWithheld?: boolean;
   /** True when the server's conservative dedup gate found a near-duplicate.
    *  The new content was ALWAYS written regardless — this is a signal, not a
    *  suppression flag. See `matchedId` / `matchConfidence`. */
@@ -130,6 +186,14 @@ export interface SearchResult {
   durability?: Durability;
   tags?: string[];
   createdAt?: string;
+  /** flair#1940 — the record's author id (the server's `agentId`). */
+  author?: string;
+  /** flair#1940 — the joined host-source pointer, or `"withheld"`; see {@link Memory.hostSource}. */
+  hostSource?: HostSource | "withheld";
+  /** flair#1940 — the originating session id, when the writer set one. */
+  sessionId?: string;
+  /** Not returned by search() today: the server's default search projection omits provenance; read it via get()/list(). */
+  provenance?: string;
 }
 
 /** Bootstrap response — formatted context block. */
@@ -142,6 +206,34 @@ export interface BootstrapResult {
    *  live server; a caller that needs it (the action-recall refresh) treats an
    *  absent scope as "no cache". */
   scope?: { agentId?: string; isAdmin?: boolean; reads?: string };
+}
+
+/** One team-directory entry — an active agent-kind principal with an
+ *  published tps-mail contact (flair#2141 S3a). */
+export interface TeamDirectoryEntry {
+  /** Stable Agent ID. */
+  agentId: string;
+  /** Display label (the agent's name, else its id). */
+  name: string;
+  /** The published channel platform (`tps-mail`). */
+  platform: string;
+  /** The published address. */
+  email: string;
+  /** The stored publication time, normalized to ISO. */
+  publishedAt: string;
+  /** The entry's home instance id — the instance that published this entry's
+   *  contact; null when it is not resolvable. */
+  homeInstanceId: string | null;
+}
+
+/** A page of the team directory (flair#2141 S3a). */
+export interface TeamDirectoryResult {
+  entries: TeamDirectoryEntry[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  limit: number;
+  /** Server-stamped freshness of this page. */
+  generatedAt: string;
 }
 
 /** Client configuration. */

@@ -31,11 +31,15 @@
  * mock/import avoids that entirely.
  */
 
-import { mock, describe, it, expect, beforeEach } from "bun:test";
+import { mock, describe, it, expect, beforeEach, afterEach, setSystemTime } from "bun:test";
 
 // Capture what each resource ultimately persists.
 let workspacePut: any = null;
 let orgEventPut: any = null;
+
+// In-memory OrgEvent store, keyed by id — backs OrgEvent.post()'s ownership read
+// (`databases.flair.OrgEvent.get`) and static put().
+let orgEventStore: Map<string, any>;
 
 // In-memory WorkspaceState store, keyed by id — backs get()/search() for the
 // allowRead/get() ownership-scoping tests below. post()/put() still also set
@@ -95,12 +99,20 @@ class BaseWorkspaceState {
     }
     return gen();
   }
-  async delete(id: any) { workspaceStore.delete(id); return { ok: true }; }
+  async delete(id: any) { workspaceStore.delete(id); return true; }
+  // Harper's table is static-callable (`databases.flair.WorkspaceState.get/delete`),
+  // which is how the owner-delete confirmation reaches it (flair#2355).
+  static get(target: any) { return new BaseWorkspaceState().get(target); }
+  static delete(id: any) { workspaceStore.delete(id); return Promise.resolve(true); }
 }
 class BaseOrgEvent {
-  async put(content: any) { orgEventPut = content; return { ok: true, ...content }; }
-  async get(_id: any) { return null; }
-  async delete(_id: any) { return { ok: true }; }
+  async put(content: any) { orgEventPut = content; orgEventStore.set(content.id, { ...content }); return { ok: true, ...content }; }
+  async get(id: any) { return orgEventStore.get(id) ?? null; }
+  async delete(id: any) { orgEventStore.delete(id); return { ok: true }; }
+  // OrgEvent.post() reads the stored row through the static table call
+  // (`databases.flair.OrgEvent.get(id, {})`), which Harper exposes.
+  static get(id: any) { return orgEventStore.get(id) ?? null; }
+  static delete(id: any) { orgEventStore.delete(id); return Promise.resolve({ ok: true }); }
 }
 
 const databasesMock = {
@@ -108,14 +120,19 @@ const databasesMock = {
     WorkspaceState: BaseWorkspaceState,
     OrgEvent: Object.assign(BaseOrgEvent, {
       // OrgEvent.post() calls `databases.flair.OrgEvent.put(content)` directly
-      // (Harper-5 upsert), so the static put must capture too.
-      put: async (content: any) => { orgEventPut = content; return { ok: true, ...content }; },
+      // (Harper-5 upsert), so the static put must capture AND persist too.
+      put: async (content: any) => { orgEventPut = content; orgEventStore.set(content.id, { ...content }); return { ok: true, ...content }; },
     }),
     Agent: { get: async () => null, search: async () => [] },
   },
 };
 
 mock.module("harper", () => ({ server: { http: () => {}, getUser: async () => null }, databases: databasesMock, Resource: class {} }));
+
+// Harper assigns `transaction` onto the global at load; the owner-delete
+// confirmation (resources/owner-delete-recheck.ts) creates one when the caller
+// has none. This mock's delete is not staged, so the stand-in just runs the cb.
+(globalThis as any).transaction = (_ctx: any, cb: () => any) => cb();
 
 const { WorkspaceState } = await import("../../resources/WorkspaceState.ts");
 const { OrgEvent } = await import("../../resources/OrgEvent.ts");
@@ -139,6 +156,7 @@ beforeEach(() => {
   workspacePut = null;
   orgEventPut = null;
   workspaceStore = new Map();
+  orgEventStore = new Map();
 });
 
 describe("WorkspaceState.post() — agent-self attribution (no forging)", () => {
@@ -202,6 +220,60 @@ describe("OrgEvent.post() — agent-self attribution (no forging)", () => {
     const oe = makeOrgEvent(agentCtx("agent-alpha"));
     await oe.post({ authorId: "agent-victim", kind: "status", summary: "x" });
     expect(String(orgEventPut.id).startsWith("agent-alpha-")).toBe(true);
+  });
+});
+
+// ─── OrgEvent.post() id ownership + collision-resistant ids (flair#2333 N2/H9) ───────────────
+describe("OrgEvent.post() — refuses a non-admin POST for a row observed at the guard's lookup as owned by another agent (N2)", () => {
+  it("refuses a POST for a row observed at the guard's lookup as owned by another agent", async () => {
+    orgEventStore.set("owned-1", { id: "owned-1", authorId: "agent-a", kind: "status", summary: "original" });
+    const oe = makeOrgEvent(agentCtx("agent-b"));
+    const res = await oe.post({ id: "owned-1", kind: "coord.claim", summary: "overwrite attempt" });
+    expect(res instanceof Response).toBe(true);
+    expect((res as Response).status).toBe(403);
+    expect(orgEventStore.get("owned-1").summary).toBe("original");
+    expect(orgEventStore.get("owned-1").authorId).toBe("agent-a");
+  });
+
+  it("refuses a POST claiming the observed owner's authorId", async () => {
+    orgEventStore.set("owned-2", { id: "owned-2", authorId: "agent-a", kind: "status", summary: "original" });
+    const oe = makeOrgEvent(agentCtx("agent-b"));
+    const res = await oe.post({ id: "owned-2", authorId: "agent-a", kind: "coord.claim", summary: "forged" });
+    expect(res instanceof Response).toBe(true);
+    expect((res as Response).status).toBe(403);
+    expect(orgEventStore.get("owned-2").authorId).toBe("agent-a");
+  });
+
+  it("allows an agent to write an id it already owns", async () => {
+    orgEventStore.set("mine-1", { id: "mine-1", authorId: "agent-b", kind: "status", summary: "before" });
+    const oe = makeOrgEvent(agentCtx("agent-b"));
+    const res = await oe.post({ id: "mine-1", kind: "status", summary: "after" });
+    expect(res instanceof Response).toBe(false);
+    expect(orgEventStore.get("mine-1").summary).toBe("after");
+  });
+
+  it("an admin may write an id owned by another agent", async () => {
+    orgEventStore.set("owned-3", { id: "owned-3", authorId: "agent-a", kind: "status", summary: "original" });
+    const oe = makeOrgEvent(agentCtx("admin-1", true));
+    const res = await oe.post({ id: "owned-3", authorId: "agent-a", kind: "status", summary: "admin edit" });
+    expect(res instanceof Response).toBe(false);
+    expect(orgEventStore.get("owned-3").summary).toBe("admin edit");
+  });
+});
+
+describe("OrgEvent.post() — avoids deterministic same-millisecond collisions (random UUID, H9)", () => {
+  afterEach(() => { setSystemTime(); });
+
+  it("avoids deterministic same-millisecond collisions (random UUID)", async () => {
+    setSystemTime(new Date("2026-10-11T00:00:00.000Z"));
+    const oe = makeOrgEvent(agentCtx("agent-alpha"));
+    await oe.post({ kind: "status", summary: "first" });
+    const first = String(orgEventPut.id);
+    await oe.post({ kind: "status", summary: "second" });
+    const second = String(orgEventPut.id);
+    expect(second).not.toBe(first);
+    expect(orgEventStore.size).toBe(2);
+    expect([...orgEventStore.values()].map((r) => r.summary).sort()).toEqual(["first", "second"]);
   });
 });
 
@@ -320,10 +392,9 @@ describe("WorkspaceState.delete() — ownership check uses the raw record (super
   it("deleting a non-existent id is a clean no-op (not mis-routed into FORBIDDEN by the new get() override)", async () => {
     const ws = makeWorkspace(agentCtx("agent-owner"));
     const res = await (ws as any).delete("does-not-exist");
-    // super.delete() on the mock always returns { ok: true } — asserting it's
-    // NOT the FORBIDDEN Response proves delete() used super.get() (raw lookup,
-    // null for a missing id), not this.get() (which would 404 a denied id as
-    // a truthy Response and fall through into the ownership-mismatch branch).
+    // super.delete() on the mock returns true and is not the FORBIDDEN Response:
+    // no forbidden Response came back. This observes the outcome only — it does
+    // not by itself prove which get() ran.
     expect(res instanceof Response).toBe(false);
   });
 });

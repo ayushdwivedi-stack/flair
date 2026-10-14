@@ -55,9 +55,9 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const ALLOWLIST_PATH = join(REPO_ROOT, ".github", "audit-allowlist.json");
@@ -81,7 +81,7 @@ const REQUIRED_ENTRY_FIELDS = [
 // (`bun audit`); `npm-install` is the installed-tree observation (`npm audit
 // --omit=dev --json` on the packed-and-installed prefix). An allowlist entry
 // declares which of these it expects to see its advisory in.
-const VALID_SOURCES = new Set(["bun", "npm-install"]);
+const VALID_SOURCES = new Set(["bun", "npm-install", "npm-install-adk"]);
 
 const VALID_CLASSES = new Set([
   // No patched version exists anywhere yet. Nothing to do but wait upstream.
@@ -156,11 +156,154 @@ export function isVulnerable(version, range) {
  * Inputs                                                             *
  * ------------------------------------------------------------------ */
 
+/** A short description of a parsed JSON value, for audit-report refusal messages. */
+function jsonShapeOf(value) {
+  if (value === undefined) return "nothing";
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "an array";
+  if (typeof value !== "object") return `a ${typeof value}`;
+  const keys = Object.keys(value);
+  return keys.length === 0 ? "an empty object" : `an object with keys ${keys.slice(0, 6).join(", ")}`;
+}
+
+/** The remedy the report refusals below name, so an operator knows what to do. */
+const AUDIT_REMEDY = "Re-run the stage; if it keeps failing, check registry access.";
+
 /**
- * `bun audit --json` writes clean JSON to stdout and its banner to stderr.
- * It exits non-zero when advisories exist, so a non-zero exit is expected and
- * is NOT itself the failure signal — unparseable stdout is.
+ * Refuses a value that is not a JSON object (null, an array, a string, a
+ * number), and an object whose own `error` property is a string or an object.
+ * Returns the reason, or null. Passing this check does not make the value a
+ * report; each stage adds its own checks.
  */
+function errorEnvelopeRefusal(parsed) {
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return `did not produce a JSON report object (got ${jsonShapeOf(parsed)})`;
+  }
+  const e = parsed.error;
+  if (
+    Object.hasOwn(parsed, "error") &&
+    (typeof e === "string" || (e !== null && typeof e === "object" && !Array.isArray(e)))
+  ) {
+    const code = e !== null && typeof e === "object" ? e.code : e;
+    return `returned an error object instead of a report${code === undefined ? "" : ` (${String(code)})`}`;
+  }
+  return null;
+}
+
+/**
+ * Refuses what `errorEnvelopeRefusal` refuses, and an object whose
+ * `vulnerabilities` property is missing or is not an object (the empty object
+ * `{}` included). `{"vulnerabilities":{}}` passes. The entries inside
+ * `vulnerabilities` are not checked here. Returns the reason, or null.
+ */
+export function npmAuditReportRefusal(parsed) {
+  const envelope = errorEnvelopeRefusal(parsed);
+  if (envelope) return envelope;
+  const v = parsed.vulnerabilities;
+  if (v === null || typeof v !== "object" || Array.isArray(v)) {
+    return `report has no "vulnerabilities" object (got ${jsonShapeOf(v)})`;
+  }
+  return null;
+}
+
+/**
+ * Applies the envelope check only, so `{}` passes. The values in bun's map of
+ * package name to advisory array are not checked here; `bunAuditOutcomeRefusal`
+ * compares the report with bun's exit status and stderr. Returns the reason,
+ * or null.
+ */
+export function bunAuditReportRefusal(parsed) {
+  return errorEnvelopeRefusal(parsed);
+}
+
+/** Refuse an audit report: the reason, then the stage and remedy an operator acts on. */
+function refuseAuditReport(stage, reason) {
+  return new Error(`${stage} ${reason}. ${AUDIT_REMEDY}`);
+}
+
+/** The first stderr line matching `pattern`, with ANSI colour codes removed, or null. */
+function stderrLineMatching(stderr, pattern) {
+  for (const raw of String(stderr ?? "").split(/\r?\n/)) {
+    const line = raw.replace(/\x1b\[[0-9;]*m/g, "").trim();
+    if (pattern.test(line)) return line.slice(0, 300);
+  }
+  return null;
+}
+
+/** How a refusal names the exit: spawnSync reports a null status when a signal ended the tool. */
+function exitText(status) {
+  return status === null || status === undefined ? "ended without an exit status" : `exited ${status}`;
+}
+
+/**
+ * The failure lines bun 1.3.10 printed in the real-tool tests:
+ * `error: ...` and `<Name>: audit request failed`.
+ */
+const BUN_STDERR_ERROR = /^error:|audit request failed/i;
+/**
+ * npm's failure lines: `npm error` (npm 10.9 and 11.19 in the real-tool tests)
+ * and the older `npm ERR!`.
+ */
+const NPM_STDERR_ERROR = /^npm (error|ERR!)/;
+
+/**
+ * Refuses a bun report when bun's stderr has a line matching
+ * `BUN_STDERR_ERROR`, or when bun exited non-zero (or without an exit status)
+ * and the report lists no advisories. bun exits 1 when its report lists
+ * advisories, so a non-zero exit with advisories passes this check. Returns
+ * the reason, or null.
+ */
+export function bunAuditOutcomeRefusal(parsed, status, stderr = "") {
+  const errorLine = stderrLineMatching(stderr, BUN_STDERR_ERROR);
+  if (errorLine) return `wrote an error to stderr (${errorLine})`;
+  if (status !== 0 && flattenAdvisories(parsed).length === 0) {
+    return `${exitText(status)} but its report lists no advisories`;
+  }
+  return null;
+}
+
+/**
+ * Refuses an npm report when npm's stderr has a line matching
+ * `NPM_STDERR_ERROR`, or when npm exited non-zero (or without an exit status)
+ * and the `vulnerabilities` object is empty. Returns the reason, or null.
+ */
+export function npmAuditOutcomeRefusal(parsed, status, stderr = "") {
+  const errorLine = stderrLineMatching(stderr, NPM_STDERR_ERROR);
+  if (errorLine) return `wrote an error to stderr (${errorLine})`;
+  if (status !== 0 && Object.keys(parsed.vulnerabilities).length === 0) {
+    return `${exitText(status)} but its report lists no vulnerabilities`;
+  }
+  return null;
+}
+
+/**
+ * Parse `bun audit --json` output. Refused: no stdout, stdout that is not valid
+ * JSON, the envelope check, and the exit-status and stderr checks in
+ * `bunAuditOutcomeRefusal`.
+ */
+export function parseBunAuditOutput(stdout, status, stderr = "") {
+  const stage = "`bun audit`";
+  const trimmed = (stdout || "").trim();
+  if (!trimmed) {
+    throw new Error(
+      `${stage} produced no output on stdout (exit ${status}). ` +
+        `stderr: ${(stderr || "").trim().slice(0, 500) || "<empty>"}`,
+    );
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (e) {
+    throw new Error(
+      `${stage} stdout was not valid JSON (exit ${status}): ${e.message}. ` +
+        `First 300 chars: ${trimmed.slice(0, 300)}`,
+    );
+  }
+  const refusal = bunAuditReportRefusal(parsed) ?? bunAuditOutcomeRefusal(parsed, status, stderr);
+  if (refusal) throw refuseAuditReport(stage, refusal);
+  return parsed;
+}
+
 export function runBunAudit() {
   const res = spawnSync("bun", ["audit", "--json"], {
     cwd: REPO_ROOT,
@@ -172,22 +315,7 @@ export function runBunAudit() {
     throw new Error(`could not execute \`bun audit\`: ${res.error.message}`);
   }
 
-  const stdout = (res.stdout || "").trim();
-  if (!stdout) {
-    throw new Error(
-      `\`bun audit\` produced no output on stdout (exit ${res.status}). ` +
-        `stderr: ${(res.stderr || "").trim().slice(0, 500) || "<empty>"}`,
-    );
-  }
-
-  try {
-    return JSON.parse(stdout);
-  } catch (e) {
-    throw new Error(
-      `\`bun audit\` stdout was not valid JSON (exit ${res.status}): ${e.message}. ` +
-        `First 300 chars: ${stdout.slice(0, 300)}`,
-    );
-  }
+  return parseBunAuditOutput(res.stdout, res.status, res.stderr);
 }
 
 /** Flatten bun's {package: [advisory,...]} shape into a flat advisory list. */
@@ -219,25 +347,31 @@ export function flattenAdvisories(auditJson) {
  * which the lockfile observation (`bun audit`) cannot — harper's
  * npm-shrinkwrap pins versions the root overrides never reach under npm.
  *
- * Like `runBunAudit`, a non-zero exit is expected when advisories exist and is
- * NOT itself the failure signal — unparseable stdout is.
+ * Refused: no stdout, stdout that is not valid JSON, the checks in
+ * `npmAuditReportRefusal`, and the exit-status and stderr checks in
+ * `npmAuditOutcomeRefusal`.
  */
 export function parseNpmAuditOutput(stdout, prefix, status, stderr = "") {
+  const stage = `\`npm audit --omit=dev --json\` in ${prefix}`;
   const trimmed = (stdout || "").trim();
   if (!trimmed) {
     throw new Error(
-      `\`npm audit --omit=dev --json\` in ${prefix} produced no output on stdout (exit ${status}). ` +
+      `${stage} produced no output on stdout (exit ${status}). ` +
         `stderr: ${(stderr || "").trim().slice(0, 500) || "<empty>"}`,
     );
   }
+  let parsed;
   try {
-    return JSON.parse(trimmed);
+    parsed = JSON.parse(trimmed);
   } catch (e) {
     throw new Error(
-      `\`npm audit --omit=dev --json\` in ${prefix} stdout was not valid JSON (exit ${status}): ${e.message}. ` +
+      `${stage} stdout was not valid JSON (exit ${status}): ${e.message}. ` +
         `First 300 chars: ${trimmed.slice(0, 300)}`,
     );
   }
+  const refusal = npmAuditReportRefusal(parsed) ?? npmAuditOutcomeRefusal(parsed, status, stderr);
+  if (refusal) throw refuseAuditReport(stage, refusal);
+  return parsed;
 }
 
 export function runNpmAudit(prefix) {
@@ -266,8 +400,13 @@ export function runNpmAudit(prefix) {
  * harper (`node_modules/harper/node_modules/<pkg>`). The vendor-pinned check
  * below examines every npm-audit-reported node; one harper node cannot cover
  * a hoisted copy reported by npm audit.
+ *
+ * `source` labels which installed tree this report came from. The root tarball
+ * observation is the default `"npm-install"`; the published ADK package's own
+ * consumer install passes `"npm-install-adk"` so an entry can name the tree it
+ * covers (flair#2398).
  */
-export function flattenNpmAdvisories(npmJson) {
+export function flattenNpmAdvisories(npmJson, source = "npm-install") {
   const out = [];
   const vulns = npmJson?.vulnerabilities ?? {};
   for (const [pkg, v] of Object.entries(vulns)) {
@@ -292,7 +431,7 @@ export function flattenNpmAdvisories(npmJson) {
             .filter((node) => typeof node === "string" && Object.hasOwn(npmJson?.packages ?? {}, node))
             .map((node) => [node, npmJson.packages[node]?.version ?? null]),
         ),
-        source: "npm-install",
+        source,
       });
     }
   }
@@ -469,6 +608,63 @@ export function vendorPinnedNodeProblems(adv, npmPrefix) {
   return problems;
 }
 
+function adkVendorPinnedNodeProblems(adv, npmPrefix, entry) {
+  if (!Array.isArray(adv.nodes) || adv.nodes.length === 0) {
+    return [`${adv.ghsa} (${adv.package}): npm audit reported no nodes.`];
+  }
+  try {
+    const chain = entry.introducedBy.split(" -> ");
+    if (chain[0] !== "@tpsdev-ai/adk-flair" || chain[1] !== "@google/adk" ||
+        chain.at(-1) !== adv.package ||
+        !chain.every((pkg) => /^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/.test(pkg))) {
+      throw new Error("invalid ADK dependency chain");
+    }
+    const prefix = resolve(npmPrefix);
+    let parent = prefix;
+    let manifest;
+    for (const pkg of chain) {
+      if (manifest && !Object.hasOwn(manifest.dependencies ?? {}, pkg)) {
+        throw new Error(`${manifest.name} does not depend on ${pkg}`);
+      }
+      let search = parent;
+      while (!existsSync(join(search, "node_modules", pkg, "package.json"))) {
+        if (search === prefix) throw new Error(`cannot resolve ${pkg}`);
+        search = dirname(search);
+      }
+      parent = join(search, "node_modules", pkg);
+      manifest = JSON.parse(readFileSync(join(parent, "package.json"), "utf8"));
+      if (manifest.name !== pkg) throw new Error(`package name mismatch for ${pkg}`);
+    }
+    const expected = relative(prefix, parent).split("\\").join("/");
+    return adv.nodes.flatMap((node) => {
+      if (node !== expected) {
+        return [`${adv.ghsa} (${adv.package}): node ${JSON.stringify(node)} is outside the dependency chain ${entry.introducedBy} (resolved node ${expected}).`];
+      }
+      try {
+        const installed = JSON.parse(readFileSync(join(prefix, node, "package.json"), "utf8"))?.version;
+        const reported = adv.nodeVersions?.[node];
+        if (typeof entry.version !== "string" || !entry.version.trim()) {
+          throw new Error("missing or invalid allowlist version");
+        }
+        if (typeof installed !== "string" || !installed.trim()) {
+          throw new Error("missing or invalid installed version");
+        }
+        if (installed !== entry.version) {
+          throw new Error(`installed version ${installed} differs from allowlist version ${entry.version}`);
+        }
+        if (reported !== undefined && reported !== installed) {
+          throw new Error(`audit version ${JSON.stringify(reported)} conflicts with installed version ${installed}`);
+        }
+        return [];
+      } catch (e) {
+        return [`${adv.ghsa} (${adv.package}): cannot verify ADK node ${JSON.stringify(node)} version: ${e.message}.`];
+      }
+    });
+  } catch (e) {
+    return [`${adv.ghsa} (${adv.package}): cannot verify ADK dependency chain: ${e.message}.`];
+  }
+}
+
 async function latestPublishedVersion(pkg) {
   const url = registryUrlFor(pkg);
   const res = await fetch(url, { headers: { accept: "application/json" } });
@@ -506,12 +702,30 @@ async function main() {
     process.exit(2);
   }
 
+  // --adk-npm-install-prefix <dir>: the consumer install of the published ADK
+  // package, observed the same way as the root tarball. MANDATORY for the same
+  // reason --npm-install-prefix is: a check that can be skipped is not a check.
+  // npm overrides in a package do not apply to its consumers, so the root
+  // tarball's clean tree says nothing about what a consumer of @tpsdev-ai/adk-flair
+  // resolves; an install of that tarball is what shows it (flair#2398).
+  const adkPrefixIdx = process.argv.indexOf("--adk-npm-install-prefix");
+  const adkPrefix = adkPrefixIdx !== -1 ? process.argv[adkPrefixIdx + 1] : null;
+  if (!adkPrefix) {
+    console.error(
+      "DEPENDENCY AUDIT GATE: missing --adk-npm-install-prefix <dir> — the published ADK package's consumer-install observation is mandatory; the gate refuses to run without it.",
+    );
+    process.exit(2);
+  }
+
   let allowlist;
   let advisories;
   try {
     allowlist = loadAllowlist();
     advisories = flattenAdvisories(runBunAudit());
     advisories = advisories.concat(flattenNpmAdvisories(runNpmAudit(npmPrefix)));
+    advisories = advisories.concat(
+      flattenNpmAdvisories(runNpmAudit(adkPrefix), "npm-install-adk"),
+    );
   } catch (e) {
     console.error(`\n  DEPENDENCY AUDIT GATE: FAILED TO RUN\n\n  ${e.message}\n`);
     console.error("  The gate fails closed: an audit that cannot run is not an audit that passed.\n");
@@ -587,8 +801,10 @@ async function main() {
       continue;
     }
 
-    if (entry.class === "vendor-pinned" && adv.source === "npm-install") {
-      const nodeProblems = vendorPinnedNodeProblems(adv, npmPrefix);
+    if (entry.class === "vendor-pinned" && (adv.source === "npm-install" || adv.source === "npm-install-adk")) {
+      const nodeProblems = adv.source === "npm-install-adk"
+        ? adkVendorPinnedNodeProblems(adv, adkPrefix, entry)
+        : vendorPinnedNodeProblems(adv, npmPrefix);
       if (nodeProblems.length) {
         for (const problem of nodeProblems) fail(problem);
         blocked.push(adv);

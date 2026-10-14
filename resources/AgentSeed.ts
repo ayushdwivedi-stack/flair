@@ -1,3 +1,4 @@
+import { AGENT_ID_ERROR, invalidAgentIdMessage, isValidAgentId } from "../src/lib/agent-id-rule.js";
 import { randomUUID } from "node:crypto";
 /**
  * POST /AgentSeed
@@ -27,6 +28,7 @@ import { reconcileAdminFields } from "./agent-admin.js";
 import { noteMemoryUpsert } from "./bm25-index-service.js";
 import { stripUndeclaredMemoryAttributes, stripServerStampedFields } from "./memory-declared-attributes.js";
 import { rejectSkillWritePath } from "./skill-write.js";
+import { stampEphemeralExpiry } from "./memory-durability.js";
 import { stampOriginatorOnCreate } from "./originator-instance.js";
 import { SKILL_ASSIGNMENT_KEY } from "./skill-provenance.js";
 
@@ -64,9 +66,13 @@ export class AgentSeed extends Resource {
     if (denied) return denied;
 
     const { agentId, displayName, role = "agent", soulTemplate, starterMemories } = data || {};
-    if (!agentId) return new Response(JSON.stringify({ error: "agentId required" }), { status: 400 });
-    if (!/^[a-zA-Z0-9_-]{1,64}$/.test(agentId)) {
-      return new Response(JSON.stringify({ error: "invalid agentId" }), { status: 400 });
+    // flair#2359 — the ONE shared agent-ID rule, which refuses an absent id
+    // (`undefined`/`null`/empty) exactly as it refuses a malformed one.
+    if (!isValidAgentId(agentId)) {
+      return new Response(
+        JSON.stringify({ error: AGENT_ID_ERROR, message: invalidAgentIdMessage(agentId) }),
+        { status: 400, headers: { "content-type": "application/json" } },
+      );
     }
 
     const now = new Date().toISOString();
@@ -194,6 +200,10 @@ export class AgentSeed extends Resource {
         record.instanceToken = randomUUID();
         // flair#1965 r2: raw Memory create — stamp the local instance id.
         await stampOriginatorOnCreate(record);
+        // flair#2274: the seed is a Memory writer — give an ephemeral starter
+        // memory the tier expiry the shared rule stamps (this raw put bypasses
+        // Memory.post()/put()).
+        stampEphemeralExpiry(record);
         await (databases as any).flair.Memory.put(record);
         noteMemoryUpsert(record);
         memories.push(record);

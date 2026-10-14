@@ -72,6 +72,9 @@ import { flairCliVersion, clearFlairCliVersionCache, mcpServerSpec, unpinnedSpec
 import { harperPortValue } from "./lib/harper-port-value.js";
 import { flairConfigPath, flairDataDir } from "./lib/flair-paths.js";
 import { encodeRecordId } from "./lib/record-id-path.js";
+import { invalidAgentIdMessage, isValidAgentId } from "./lib/agent-id-rule.js";
+import { agentHomeEndpoint, decideProbedPairIdentity, readHttpInstanceIdentity, resolveTargetInstanceId, resolveTargetInstanceIdentity, stampAgentHome, type ProbedPairIdentity } from "./lib/agent-home.js";
+import { proveLocalInstancePair, type LocalInstancePairProof } from "./lib/local-instance-pair.js";
 import {
   httpBind,
   httpCorsAccessList,
@@ -163,6 +166,7 @@ import {
   LAUNCHCTL_QUERY_TIMEOUT_MS,
   type LaunchctlLister,
   type LaunchdManagement,
+  type ManagedStartConfirmation,
 } from "./lib/launchd-management.js";
 import {
   classifyPlist,
@@ -245,6 +249,8 @@ import {
   classifySidecarStaleness,
   shouldRemoveSidecarAfterStop,
   livenessFromKillError,
+  parseProcStatState,
+  isExitedState,
   parseNullSeparatedEnviron,
   extractRootPath,
   type DaemonEvidence,
@@ -1270,6 +1276,26 @@ function readOpsPortFromConfig(path: string = configPath()): number | null {
 }
 
 /**
+ * The HTTP value treated as NAMED: a `--port` value accepted by the existing
+ * resolver, else the first `:digits` match in `FLAIR_URL` converted to a number;
+ * null when neither supplies one. These are the first two rungs of
+ * `resolveHttpPort`, which reads them through this function, so
+ * `resolveAgentHomeTarget` and `resolveHttpPort` agree on what was named.
+ */
+function namedHttpPort(opts: { port?: string | number }): number | null {
+  if (opts.port !== undefined && opts.port !== null) {
+    const n = Number(opts.port);
+    if (!isNaN(n) && n > 0) return n;
+  }
+  const envUrl = process.env.FLAIR_URL;
+  if (envUrl) {
+    const m = envUrl.match(/:(\d+)/);
+    if (m) return Number(m[1]);
+  }
+  return null;
+}
+
+/**
  * Unified port resolution: `--port` flag > `FLAIR_URL` env > Harper's own config
  * in the instance's data directory > (default install only) the per-user config
  * > default.
@@ -1308,15 +1334,8 @@ function readOpsPortFromConfig(path: string = configPath()): number | null {
  * it is for the default install that has always relied on it.
  */
 function resolveHttpPort(opts: { port?: string | number; dataDir?: string }, mode: "address" | "create" = "address"): number {
-  if (opts.port !== undefined && opts.port !== null) {
-    const n = Number(opts.port);
-    if (!isNaN(n) && n > 0) return n;
-  }
-  const envUrl = process.env.FLAIR_URL;
-  if (envUrl) {
-    const m = envUrl.match(/:(\d+)/);
-    if (m) return Number(m[1]);
-  }
+  const named = namedHttpPort(opts);
+  if (named !== null) return named;
 
   const dataDir = instanceDataDir(opts);
 
@@ -1538,6 +1557,283 @@ function resolveOpsPort(opts: { opsPort?: string | number; port?: string | numbe
   } catch { /* ignore */ }
   // Default: httpPort - 1
   return resolveHttpPort(opts) - 1;
+}
+
+/** The named refusal for a configured-pair conflict or an unpaired one-sided target (flair#2474). */
+export const AMBIGUOUS_INSTANCE_TARGET_ERROR = "ambiguous_instance_target";
+
+/** The remedy appended to an {@link AMBIGUOUS_INSTANCE_TARGET_ERROR} refusal. */
+export const INSTANCE_TARGET_REMEDY = "Pass both ports (--port and --ops-port) for one instance.";
+
+/** Inputs to {@link decideAgentHomeTarget}. */
+export interface AgentHomeTargetInputs {
+  /** The HTTP port `resolveHttpPort` resolved. */
+  httpPort: number;
+  /** Whether the caller NAMED that HTTP port (`--port` or `FLAIR_URL`), rather than it being derived. */
+  httpNamed: boolean;
+  /** The ops port the caller NAMED (`--ops-port` or `FLAIR_OPS_PORT`), or null. */
+  namedOps: number | null;
+  /** The HTTP port resolved from config, or null. */
+  configuredHttp: number | null;
+  /** The ops port resolved from config, or null. */
+  configuredOps: number | null;
+  /** The ops port the ordinary ladder (`resolveOpsPort`) derives; used only when neither port is named and the config records no complete pair. */
+  deriveOps: () => number;
+}
+
+/**
+ * The pairing rule of {@link resolveAgentHomeTarget} (flair#2474).
+ * With a COMPLETE configured pair (both ports recorded):
+ *   - an ops port that is not named is the pair's ops port;
+ *   - if exactly ONE of the two ports equals its side of the pair, the target is
+ *     REFUSED: the target conflicts with the configured pair;
+ *   - if both equal the pair, the pair is used; if NEITHER does, the ports are
+ *     used as given (from resolveAgentHomeTarget that happens only when the
+ *     caller named both, since a port it does not name is the pair's).
+ *
+ * With NO complete configured pair resolved (one side or both null):
+ *   - exactly one port named is REFUSED: its counterpart cannot be established
+ *     from a configured pair, so the two could address different instances;
+ *   - both named: used as given;
+ *   - neither named: the HTTP port as resolved and the ops port from `deriveOps`.
+ *
+ * Ports used "as given" are NOT VERIFIED: nothing here contacts an instance to
+ * confirm that two named ports belong to one instance.
+ */
+export function decideAgentHomeTarget(i: AgentHomeTargetInputs): { httpPort: number; opsPort: number } {
+  const { httpPort, httpNamed, namedOps, configuredHttp, configuredOps } = i;
+  const remedy = INSTANCE_TARGET_REMEDY;
+  if (configuredHttp !== null && configuredOps !== null) {
+    const opsPort = namedOps ?? configuredOps;
+    const httpMatches = httpPort === configuredHttp;
+    const opsMatches = opsPort === configuredOps;
+    if (httpMatches !== opsMatches) {
+      throw new Error(
+        `${AMBIGUOUS_INSTANCE_TARGET_ERROR}: the target (HTTP port ${httpPort}, ops port ${opsPort}) conflicts with the configured pair — `
+          + `the config pairs HTTP ${configuredHttp} with ops ${configuredOps}. ${remedy}`,
+      );
+    }
+    return { httpPort, opsPort };
+  }
+  const opsNamed = namedOps !== null;
+  if (httpNamed !== opsNamed) {
+    const [named, namedPort, other] = httpNamed ? ["HTTP", httpPort, "ops"] : ["ops", namedOps, "HTTP"];
+    throw new Error(
+      `${AMBIGUOUS_INSTANCE_TARGET_ERROR}: only the ${named} port (${namedPort}) was named, and no complete port pair could be resolved from config `
+        + `(HTTP ${configuredHttp ?? "none"}, ops ${configuredOps ?? "none"}) to take the ${other} port from, so the two ports could address different instances. ${remedy}`,
+    );
+  }
+  if (namedOps !== null) return { httpPort, opsPort: namedOps };
+  return { httpPort, opsPort: i.deriveOps() };
+}
+
+/**
+ * The ports `flair agent stamp-home` and `flair principal add` address
+ * (flair#2474). Each command talks to an ops API (stamp-home's roster read and
+ * read-backs; principal add's stored-home reads and its insert) AND sends its
+ * guarded PATCH to the Agent resource on the HTTP port. Resolving the two
+ * INDEPENDENTLY — `resolveOpsPort(opts)` and `resolveHttpPort(opts)` — let
+ * `--ops-port` name one instance and `--port` another, so the read landed on the
+ * first and the write on the second.
+ *
+ * The configured pair is what the instance's config records: Harper's config in
+ * its data directory records `http.port` and `operationsApi.network.port`; for
+ * the default install, `~/.flair/config.yaml`'s `port`/`opsPort` supplies a side
+ * Harper's config does not record. The pairing rule is
+ * {@link decideAgentHomeTarget}: a port that matches its side of a COMPLETE
+ * configured pair binds the other to that pair; a target with only ONE port
+ * named is refused when no complete configured pair is resolved; two ports the
+ * caller names that match neither side of a complete pair (or any two named
+ * ports when there is no complete pair) are used as given, without
+ * verification. Every refusal is `ambiguous_instance_target`.
+ */
+export function resolveAgentHomeTarget(opts: { port?: string | number; opsPort?: string | number; dataDir?: string }, httpPortOverride?: number): {
+  httpPort: number;
+  opsPort: number;
+} {
+  // `flair doctor` probes the port it actually reached (a PID-discovered
+  // `effectivePort` can differ from the configured one), so it passes that port
+  // here; every other caller lets the resolver resolve it.
+  const httpPort = httpPortOverride ?? resolveHttpPort(opts);
+  const dataDir = instanceDataDir(opts);
+  const fromHarper = harperPortValue(readHarperConfig(dataDir)?.operationsApi?.network?.port);
+  const configuredOps = fromHarper ?? (isDefaultDataDir(dataDir) ? readOpsPortFromConfig() : null);
+  const configuredHttp = readPortFromHarperConfig(dataDir) ?? (isDefaultDataDir(dataDir) ? readPortFromConfig() : null);
+  let namedOps: number | null = null;
+  if (opts.opsPort !== undefined && opts.opsPort !== null) {
+    const n = Number(opts.opsPort);
+    if (!(Number.isInteger(n) && n >= 1 && n <= 65535)) {
+      // An invalid --ops-port is refused by resolveOpsPort, which exits.
+      return { httpPort, opsPort: resolveOpsPort(opts) };
+    }
+    namedOps = n;
+  } else if (process.env.FLAIR_OPS_PORT) {
+    const n = Number(process.env.FLAIR_OPS_PORT);
+    namedOps = Number.isInteger(n) && n >= 1 && n <= 65535 ? n : null;
+  }
+  return decideAgentHomeTarget({
+    httpPort,
+    httpNamed: namedHttpPort(opts) !== null,
+    namedOps,
+    configuredHttp,
+    configuredOps,
+    deriveOps: () => resolveOpsPort(opts),
+  });
+}
+
+/**
+ * The remedy `flair doctor` prints when it cannot establish the pair check
+ * between the HTTP port it probed and the ops endpoint (flair#2483): select the
+ * actual instance's ports, or correct that instance's configuration and restart
+ * it. Recording a pair that merely matches is not a remedy: configured ports
+ * are not proof of the live process.
+ */
+export const DOCTOR_ROSTER_TARGET_REMEDY =
+  "Pass --port with the HTTP port of the instance to inspect, and unset FLAIR_OPS_PORT or set it to that instance's ops port; "
+  + "if that instance's configuration records ports it does not serve, correct its configuration and restart it.";
+
+/**
+ * The remedy `flair doctor` prints when the ops endpoint refuses its admin
+ * credential, so the configuration check could not run (flair#2483).
+ */
+export const DOCTOR_ROSTER_CREDENTIAL_REMEDY =
+  "Check that the admin credential doctor reads (FLAIR_ADMIN_USER, and FLAIR_ADMIN_PASS or ~/.flair/admin-pass) "
+  + "is the probed instance's, and unset or correct FLAIR_OPS_PORT if it is set.";
+
+/** Whether `flair doctor` may read the probed instance over the ops API, and from which ops endpoint. */
+export type DoctorRosterTargetDecision =
+  | { kind: "run"; opsPort: number }
+  | { kind: "not-run"; reason: string; remedy: string };
+
+/**
+ * The candidate ops endpoint for `flair doctor`'s instance reads (flair#2483,
+ * #2520), picked by {@link resolveAgentHomeTarget}'s pairing rule
+ * (flair#2474/#2491) against the HTTP port doctor actually probed.
+ *
+ * This only picks the candidate: the pairing rule works from config and named
+ * ports and cannot show which instance an ops port addresses — it DELIBERATELY
+ * trusts two ports the caller names. Doctor therefore checks the candidate
+ * before the reads ({@link verifyDoctorRosterInstance}). A refusal here (a
+ * probed port that conflicts with the configured pair, or exactly one port
+ * named with no complete pair to complete it) is likewise NOT RUN, naming the
+ * reason and the remedy.
+ */
+export function resolveDoctorRosterTarget(
+  opts: { port?: string | number; opsPort?: string | number; dataDir?: string },
+  probedHttpPort?: number,
+): DoctorRosterTargetDecision {
+  try {
+    return { kind: "run", opsPort: resolveAgentHomeTarget(opts, probedHttpPort).opsPort };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // The resolver's refusal ends with the stamp-home-shaped remedy; doctor has
+    // no --ops-port flag, so drop it and let the caller print doctor's own.
+    const reason = message.endsWith(INSTANCE_TARGET_REMEDY)
+      ? message.slice(0, -INSTANCE_TARGET_REMEDY.length).trimEnd()
+      : message;
+    return { kind: "not-run", reason, remedy: DOCTOR_ROSTER_TARGET_REMEDY };
+  }
+}
+
+/**
+ * Whether the candidate ops endpoint's own configured HTTP/ops pair matches the
+ * HTTP port doctor probed (flair#2483). `proof` is
+ * {@link proveLocalInstancePair}'s answer for `opsPort` — the same check the
+ * local delete paths use (src/lib/local-delete-instance.ts): the configuration
+ * records `opsPort` as its ops port and an HTTP port bound on loopback or on all
+ * interfaces. This decides `run` only when that configured HTTP port is
+ * `probedHttpPort`. A check that could not complete, or a configuration naming
+ * another HTTP port, is `not-run`: the pair check cannot be established.
+ * Configured ports are not proof of the live process, so a match establishes
+ * only that the configuration agrees.
+ */
+export function decideDoctorRosterPair(
+  opsPort: number,
+  probedHttpPort: number,
+  proof: LocalInstancePairProof,
+): DoctorRosterTargetDecision {
+  if (proof.kind === "unproven") {
+    return {
+      kind: "not-run",
+      reason: `the ops endpoint on port ${opsPort} did not report a usable configured HTTP/ops pair (${proof.detail}), so this check cannot be established for the probed HTTP port ${probedHttpPort}`,
+      remedy: proof.status === 401 || proof.status === 403 ? DOCTOR_ROSTER_CREDENTIAL_REMEDY : DOCTOR_ROSTER_TARGET_REMEDY,
+    };
+  }
+  if (proof.httpPort !== probedHttpPort) {
+    return {
+      kind: "not-run",
+      reason: `the configured HTTP/ops pair does not match: the ops endpoint on port ${opsPort} is configured with HTTP port ${proof.httpPort}, not the probed HTTP port ${probedHttpPort}, so this check cannot be established`,
+      remedy: DOCTOR_ROSTER_TARGET_REMEDY,
+    };
+  }
+  return { kind: "run", opsPort };
+}
+
+/**
+ * The additional instance-identity comparison behind doctor's instance reads
+ * (flair#2483), applied only after {@link decideDoctorRosterPair} decided
+ * `run`. The configuration read reports CONFIGURED ports, not which instance
+ * serves the probed port. When the probed HTTP port and the ops endpoint each
+ * report one `flair.Instance` id and the two differ, they are two instances:
+ * `not-run`. Every other identity outcome (equal ids, no row on either side as
+ * on a fresh install, several rows, or an unread table) leaves the
+ * configuration check's `run` standing.
+ */
+export function decideDoctorRosterIdentity(opsPort: number, pair: ProbedPairIdentity): DoctorRosterTargetDecision {
+  if (pair.kind === "different") {
+    return {
+      kind: "not-run",
+      reason: `the ops endpoint on port ${opsPort} is configured with the probed HTTP port, but the two report different instance identities, so they are not one instance`,
+      remedy: DOCTOR_ROSTER_TARGET_REMEDY,
+    };
+  }
+  return { kind: "run", opsPort };
+}
+
+/**
+ * The ops endpoint `flair doctor` may read the probed instance from, or a
+ * refusal naming why it may not (flair#2483).
+ *
+ * 1. Picks the candidate with {@link resolveDoctorRosterTarget} against the HTTP
+ *    port doctor actually probed (a PID-discovered port included).
+ * 2. Asks the candidate for its configuration ({@link proveLocalInstancePair},
+ *    the check the local delete paths use) and requires it to record the
+ *    candidate as its ops port and the probed port as its HTTP port, bound on
+ *    loopback or on all interfaces ({@link decideDoctorRosterPair}). No
+ *    Instance row is needed, so a fresh install passes.
+ * 3. Only then compares the instance identities both endpoints report
+ *    ({@link decideDoctorRosterIdentity}): two different single ids refuse.
+ *
+ * Any `not-run` means doctor reports the sections that use this answer NOT
+ * RUN, and their diagnostic reads do not run: all four section reads, unless a
+ * `--fix` step that may have changed the serving process made the roster and
+ * home sections ask again (the answer describes the process serving the probed
+ * port when it was taken). Reaching a `not-run` may itself have read the
+ * candidate's configuration (step 2) and both endpoints' instance identities
+ * (step 3). The limit: step 2 reads configured ports, which are not proof of
+ * the live process, and step 3 adds a check only when both endpoints have
+ * exactly one Instance row.
+ */
+export async function verifyDoctorRosterInstance(
+  opts: { port?: string | number; opsPort?: string | number; dataDir?: string },
+  probedHttpPort: number,
+  adminPass: string,
+): Promise<DoctorRosterTargetDecision> {
+  const candidate = resolveDoctorRosterTarget(opts, probedHttpPort);
+  if (candidate.kind === "not-run") return candidate;
+  const adminUser = resolveAdminUser(undefined);
+  const authorization = `Basic ${Buffer.from(`${adminUser}:${adminPass}`).toString("base64")}`;
+  const configured = decideDoctorRosterPair(
+    candidate.opsPort,
+    probedHttpPort,
+    await proveLocalInstancePair(candidate.opsPort, authorization),
+  );
+  if (configured.kind === "not-run") return configured;
+  const [httpIdentity, opsIdentity] = await Promise.all([
+    readHttpInstanceIdentity(`http://127.0.0.1:${probedHttpPort}`, adminUser, adminPass),
+    resolveTargetInstanceIdentity(agentHomeEndpoint(candidate.opsPort, adminUser, adminPass)),
+  ]);
+  return decideDoctorRosterIdentity(candidate.opsPort, decideProbedPairIdentity(httpIdentity, opsIdentity));
 }
 
 // Ops API bind-host resolution (flair#670, #863): --ops-bind flag >
@@ -2679,12 +2975,13 @@ export function isCredentialOnlyFailure(result: ProbeResult): boolean {
   return result.healthy === true && result.authFailureKind === "credentials";
 }
 
-async function waitForHealth(httpPort: number, adminUser: string, adminPass: string, timeoutMs: number): Promise<void> {
+async function waitForHealth(httpPort: number, adminUser: string, adminPass: string, timeoutMs: number, beforeRequest?: () => Promise<void>): Promise<void> {
   const url = `http://127.0.0.1:${httpPort}/Health`;
   const deadline = Date.now() + timeoutMs;
   let attempt = 0;
   while (Date.now() < deadline) {
     attempt++;
+    await beforeRequest?.();
     try {
       const res = await fetch(url, {
         headers: { Authorization: `Basic ${Buffer.from(`${adminUser}:${adminPass}`).toString("base64")}` },
@@ -3236,10 +3533,6 @@ export async function checkAgentRegistered(
   }
 }
 
-// Blocks until the given PID is gone (ESRCH from signal 0), or timeout.
-// Used during restart to confirm the old Harper process actually exited before
-// we start polling /Health — otherwise the still-shutting-down old process can
-// answer and we'd declare restart success while a gap is still ahead.
 /**
  * Is `pid` a process that exists right now? Signal 0 performs the permission
  * and existence checks without delivering anything (flair#1022) — a `hdb.pid`
@@ -3250,13 +3543,22 @@ function isProcessAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-async function waitForProcessExit(pid: number, timeoutMs: number): Promise<void> {
+// Used during restart to confirm the old Harper process actually exited before
+// we start polling /Health — otherwise the still-shutting-down old process can
+// answer and we'd declare restart success while a gap is still ahead.
+// Cap sleeps at the remaining time; probe once after the last wake, then stop (flair#2357).
+export async function waitForProcessExit(
+  pid: number,
+  timeoutMs: number,
+  probe: (pid: number) => PidLiveness = probePidLiveness,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (probePidLiveness(pid).kind === "gone") return;
-    await new Promise((r) => setTimeout(r, HEALTH_POLL_INTERVAL_MS));
+  while (true) {
+    if (probe(pid).kind === "gone") return;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await new Promise((r) => setTimeout(r, Math.min(HEALTH_POLL_INTERVAL_MS, remaining)));
   }
-  if (probePidLiveness(pid).kind === "gone") return;
   throw new Error(`Process ${pid} did not exit within ${timeoutMs}ms`);
 }
 
@@ -3496,7 +3798,21 @@ export async function seedAgentViaOpsApi(
    * is not assumed to be the process that rejected this request.
    */
   occupiedListener?: OperationsPortAttribution,
+  /**
+   * The target instance's own federation id, resolved by the caller through
+   * the rule in src/lib/agent-home.ts. When supplied (including an explicit
+   * null), the new Agent row carries it as its home (`originatorInstanceId`),
+   * and the create ignores any other source. When omitted, the field is left
+   * off the row.
+   */
+  homeInstanceId?: string | null,
 ): Promise<void> {
+  // flair#2359 — the ONE agent-ID rule, before the operations-API insert. This
+  // is the write path for `flair agent add`, `flair import` and `flair init`,
+  // so a caller-supplied id is refused here by name before any HTTP call.
+  if (!isValidAgentId(agentId)) {
+    throw new Error(invalidAgentIdMessage(agentId));
+  }
   const url = typeof opsPortOrUrl === "number"
     ? `http://127.0.0.1:${opsPortOrUrl}/`
     : `${opsPortOrUrl.replace(/\/$/, "")}/`;
@@ -3509,23 +3825,29 @@ export async function seedAgentViaOpsApi(
   // and is invisible to roster/presence/Office-Space queries that filter on
   // status='active' or kind='agent' (#521). Mirror Agent.post() exactly here.
   const now = new Date().toISOString();
+  const record: Record<string, unknown> = {
+    id: agentId,
+    name: agentId,
+    type: "agent",
+    kind: "agent",
+    status: "active",
+    displayName: agentId,
+    admin: false,
+    defaultTrustTier: "unverified",
+    publicKey: pubKeyB64url,
+    createdAt: now,
+    updatedAt: now,
+  };
+  // flair#2433 — the new row's home is the creating instance's id. A create
+  // stamps it and ignores anything else; the caller passes the id it resolved
+  // through the one shared rule (src/lib/agent-home.ts). An omitted id leaves the
+  // field off (the pre-fix shape, for callers that do not stamp).
+  if (homeInstanceId !== undefined) stampAgentHome(record, homeInstanceId);
   const body = {
     operation: "insert",
     database: "flair",
     table: "Agent",
-    records: [{
-      id: agentId,
-      name: agentId,
-      type: "agent",
-      kind: "agent",
-      status: "active",
-      displayName: agentId,
-      admin: false,
-      defaultTrustTier: "unverified",
-      publicKey: pubKeyB64url,
-      createdAt: now,
-      updatedAt: now,
-    }],
+    records: [record],
   };
   await opsSeedInsertWithRetry({
     url,
@@ -3543,7 +3865,7 @@ export async function seedAgentViaOpsApi(
       try {
         after = occupiedListener.reread();
       } catch {
-        after = { port: occupiedListener.before.port, pids: [], dataDirs: [] };
+        after = { port: occupiedListener.before.port, pids: [], dataDirs: [], pidsKnown: false };
       }
       return occupiedListenerAuthFailure({
         lead: "Operations API insert failed (401): ",
@@ -3561,6 +3883,26 @@ export async function seedAgentViaOpsApi(
 // ops-insert body to the REST root, which Harper 405s as a collection POST to
 // /Agent (the Agent table resource has no POST handler). It was removed in the
 // #499 fix; do not reintroduce a REST-root insert path.
+
+/**
+ * Seed an agent through the ops API, stamping the TARGET instance's own
+ * federation id as the new row's home (flair#2433). The id is resolved through
+ * the one shared rule (src/lib/agent-home.ts, over the same
+ * src/lib/instance-identity-row.ts decision the server uses), so this path
+ * cannot disagree with the Agent resource's own stamp. A null id (no single
+ * Instance row) writes an explicit null — the defined local-origin state.
+ */
+export async function seedAgentWithLocalHome(
+  opsPortOrUrl: number | string,
+  agentId: string,
+  pubKeyB64url: string,
+  adminUser: string,
+  adminPass?: string,
+  occupiedListener?: OperationsPortAttribution,
+): Promise<void> {
+  const home = await resolveTargetInstanceId(agentHomeEndpoint(opsPortOrUrl, adminUser, adminPass));
+  await seedAgentViaOpsApi(opsPortOrUrl, agentId, pubKeyB64url, adminUser, adminPass, occupiedListener, home);
+}
 
 // ─── FederationInstance seed via ops API ──────────────────────────────────────
 //
@@ -4649,6 +4991,7 @@ bindInitCli({
   repointMainServiceUnit,
   resolveHttpPort,
   writeAdminPassFile,
+  proveAdminPassAgainstInstance,
   resolveOpsBindHost,
   resolveHttpBindFor,
   resolveOpsPort,
@@ -4657,6 +5000,7 @@ bindInitCli({
   resolveTarget,
   runSoulWizard,
   seedAgentViaOpsApi,
+  seedAgentWithLocalHome,
   seedFederationInstanceViaOpsApi,
   readOccupiedListener,
   resolveInstanceServingPid,
@@ -4683,8 +5027,10 @@ bindAgentCli({
   shouldShowInlineSecretWarning,
   resolveHttpPort,
   resolveOpsPort,
+  resolveAgentHomeTarget,
   resolveEffectiveOpsUrl,
   seedAgentViaOpsApi,
+  seedAgentWithLocalHome,
   agentRecordIsAdmin,
 });
 registerAgent(program);
@@ -4733,6 +5079,8 @@ bindPrincipalCli({
   pubKeyPath,
   relativeTime,
   resolveOpsPort,
+  resolveHttpPort,
+  resolveAgentHomeTarget,
 });
 registerPrincipal(program);
 
@@ -5130,27 +5478,122 @@ export function readSidecar(dataDir: string): SidecarRead {
   return { kind: "present", ...parsed };
 }
 
-/** `kill(pid, 0)` as a four-way: alive / gone (ESRCH) / eperm (another user's) / unknown. */
-function probePidLiveness(pid: number): PidLiveness {
+export const DARWIN_STATE_READ_TIMEOUT_MS = 5_000;
+const DARWIN_STATE_READ_MIN_MS = 1_000;
+type StateReadErrorHandler = (error: unknown, timeoutMs: number) => void;
+
+function readDarwinProcessState(pid: number, timeoutMs: number, onReadError?: StateReadErrorHandler): string | null {
+  try {
+    const out = execFileSync("/bin/ps", ["-o", "stat=", "-p", String(pid)], {
+      encoding: "utf-8",
+      env: { ...(process.env as Record<string, string>), LC_ALL: "C" },
+      timeout: timeoutMs,
+      killSignal: "SIGKILL",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return out.length > 0 ? out[0] : null;
+  } catch (error) {
+    onReadError?.(error, timeoutMs);
+    return null;
+  }
+}
+
+/**
+ * The kernel's state character for an existing pid, or null when it cannot be
+ * read (flair#2313). Linux reads field 3 of `/proc/<pid>/stat`; Darwin reads the
+ * first character of `/bin/ps -o stat=` (flair#2330). A read failure returns
+ * null — the caller treats that as "not exited", never as exited (fail safe).
+ */
+function readProcessState(pid: number, timeoutMs: number, onReadError?: StateReadErrorHandler): string | null {
+  if (process.platform === "linux") {
+    try { return parseProcStatState(readFileSync(`/proc/${pid}/stat`, "utf-8")); } catch { return null; }
+  }
+  if (process.platform === "darwin") return readDarwinProcessState(pid, timeoutMs, onReadError);
+  return null;
+}
+
+/**
+ * Process liveness: alive / gone (ESRCH or zombie) / eperm (another user's) /
+ * unknown.
+ *
+ * Signal 0 says the pid EXISTS, which is not the same as running: an exited
+ * child whose parent has not reaped it is a zombie (state `Z`, `<defunct>`) that
+ * still answers signal 0. After the signal-0 probe succeeds, read the process
+ * state and report a zombie as `gone`, so `flair doctor`'s stop wait stops
+ * waiting on a process that has already exited (flair#2313). An unreadable
+ * state stays `alive` — a read failure must never report a live process as
+ * exited.
+ *
+ * The state reader is injectable so the unreadable and retried branches are
+ * unit-testable without a real unreadable process.
+ */
+export function probePidLiveness(
+  pid: number,
+  readState: (pid: number, timeoutMs: number, onReadError?: StateReadErrorHandler) => string | null = readProcessState,
+  deadlineMs: number = Infinity,
+  onReadError?: StateReadErrorHandler,
+): PidLiveness {
   try {
     process.kill(pid, 0);
-    return { kind: "alive" };
   } catch (err: any) {
     // `gone` ONLY for ESRCH. Any other errno (EINVAL, EACCES, ...) is `unknown`,
     // which must never be read as "gone" — that is the whole point of the
     // classifier's unknown state (flair#2055).
     return livenessFromKillError(err?.code);
   }
+  let state: string | null = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const remainingMs = deadlineMs - Date.now();
+    if (remainingMs <= 0) break;
+    const timeoutMs = Math.min(DARWIN_STATE_READ_TIMEOUT_MS, Math.max(DARWIN_STATE_READ_MIN_MS, remainingMs));
+    state = readState(pid, timeoutMs, onReadError);
+    if (state !== null) break;
+  }
+  return isExitedState(state) ? { kind: "gone" } : { kind: "alive" };
+}
+
+/**
+ * Poll the process-liveness probe for `pid` until it reports `gone` or
+ * `deadlineMs` passes; return whether `gone` was read and the last read
+ * (flair#2330). This is `flair doctor`'s stop wait.
+ *
+ * If both state reads fail, that poll stays `alive`.
+ * Check expiry before each read; an admitted read gets at least 1s to finish.
+ * Readers honoring their timeout allow deadline + 1s, plus scheduling and subprocess overhead.
+ */
+export async function waitForPidGone(
+  pid: number,
+  deadlineMs: number,
+  readState: (pid: number, timeoutMs: number, onReadError?: StateReadErrorHandler) => string | null = readProcessState,
+  pollMs: number = HEALTH_POLL_INTERVAL_MS,
+  onReadError?: StateReadErrorHandler,
+): Promise<{ gone: boolean; last: PidLiveness }> {
+  let last: PidLiveness = { kind: "unknown", reason: "the stop deadline passed before a probe" };
+  while (Date.now() < deadlineMs) {
+    last = probePidLiveness(pid, readState, deadlineMs, onReadError);
+    if (last.kind === "gone") return { gone: true, last };
+    if (Date.now() >= deadlineMs) return { gone: false, last };
+    const remaining = deadlineMs - Date.now();
+    if (remaining <= 0) break;
+    await new Promise((r) => setTimeout(r, Math.min(pollMs, remaining)));
+  }
+  return { gone: false, last };
 }
 
 /**
  * The health probe (flair#1478): ok only when the response is 2xx AND the
  * body is flair's /Health shape. A decoy that answers 200 is `foreign`,
  * not healed.
+ *
+ * flair#2485: the probe answers only for the port it probed. `redirect:
+ * "manual"` stops it following a 3xx — a redirect from this port is a
+ * response that is not a Flair health answer (`foreign`), so a port that
+ * merely forwards elsewhere is never reported as ours (a followed redirect
+ * could land on a Flair instance on another port and pass the fingerprint).
  */
 async function probeHealth(port: number): Promise<HealthResult> {
   try {
-    const res = await fetch(`http://127.0.0.1:${port}/Health`, { signal: AbortSignal.timeout(2000) });
+    const res = await fetch(`http://127.0.0.1:${port}/Health`, { redirect: "manual", signal: AbortSignal.timeout(2000) });
     let body: unknown;
     try { body = await res.json(); } catch { body = null; }
     return classifyHealthProbe({ kind: "response", status: res.status, body });
@@ -5160,7 +5603,17 @@ async function probeHealth(port: number): Promise<HealthResult> {
   }
 }
 
-async function probeHealthBeforeDeadline(port: number, deadline: number): Promise<HealthResult> {
+/**
+ * The adopt stop path's port-free probe (stopDirectProcessForAdopt). It
+ * classifies the response with classifyHealthProbe, as probeHealth does, and
+ * returns `unreachable` after 2 s or at `deadline`, whichever comes first.
+ * Exported for tests.
+ *
+ * flair#2485: like probeHealth, it answers only for the port it probed —
+ * `redirect: "manual"` stops it following a 3xx, so a redirect from this port
+ * is a response that is not a Flair health answer (`foreign`).
+ */
+export async function probeHealthBeforeDeadline(port: number, deadline: number): Promise<HealthResult> {
   const timeoutMs = Math.min(2000, deadline - Date.now());
   if (timeoutMs <= 0) return { kind: "unreachable" };
   const controller = new AbortController();
@@ -5173,7 +5626,7 @@ async function probeHealthBeforeDeadline(port: number, deadline: number): Promis
   });
   const observe = async (): Promise<HealthResult> => {
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/Health`, { signal: controller.signal });
+      const res = await fetch(`http://127.0.0.1:${port}/Health`, { redirect: "manual", signal: controller.signal });
       let body: unknown;
       try { body = await res.json(); } catch { body = null; }
       return classifyHealthProbe({ kind: "response", status: res.status, body });
@@ -5274,15 +5727,24 @@ function inspectServingFlairPackage(pid: number): boolean | null {
   return resolveServingFlairPackage(pid) !== null;
 }
 
-/** Gather every piece of evidence the classifier needs, in one place. */
-export async function gatherDaemonEvidence(port: number, dataDir: string): Promise<DaemonEvidence> {
+export function gatherDaemonOwnerEvidence(dataDir: string): Omit<DaemonEvidence, "identity" | "health"> & { sidecar: SidecarRead } {
   const dataDirUnsafe = checkDataDirSafe(dataDir);
   const pidfile = readPidfile(dataDir);
-  let sidecar = readSidecar(dataDir);
+  const sidecar = readSidecar(dataDir);
+  const sidecarLiveness = sidecar.kind === "present" ? probePidLiveness(sidecar.pid) : null;
   const lastKnownPid = pidfile.kind === "absent" && sidecar.kind === "present" ? sidecar.pid : undefined;
   const pidLiveness = pidfile.kind === "present" ? probePidLiveness(pidfile.pid)
     : lastKnownPid !== undefined ? probePidLiveness(lastKnownPid)
     : pidfile.kind === "absent" && sidecar.kind === "unreadable" ? { kind: "unknown" as const, reason: sidecar.reason } : null;
+
+  return { dataDirUnsafe, pidfile, lastKnownPid, pidLiveness, sidecar, sidecarLiveness };
+}
+
+/** Gather every piece of evidence the classifier needs, in one place. */
+export async function gatherDaemonEvidence(port: number, dataDir: string): Promise<DaemonEvidence> {
+  const owner = gatherDaemonOwnerEvidence(dataDir);
+  const { dataDirUnsafe, pidfile, lastKnownPid, pidLiveness, sidecarLiveness } = owner;
+  let sidecar = owner.sidecar;
 
   // flair#2055: a sidecar that names a pid which is CONFIRMED gone is STALE, not
   // a disagreement with hdb.pid. After `flair stop` ended a directly started
@@ -5295,7 +5757,7 @@ export async function gatherDaemonEvidence(port: number, dataDir: string): Promi
   // Liveness that cannot be determined is NOT stale: the sidecar stays and the
   // refusal stands (unknown evidence never licenses an action).
   if (sidecar.kind === "present" && dataDirUnsafe === null) {
-    if (classifySidecarStaleness(sidecar, probePidLiveness(sidecar.pid)).kind === "stale") {
+    if (classifySidecarStaleness(sidecar, sidecarLiveness!).kind === "stale") {
       sidecar = { kind: "absent" };
     }
   }
@@ -5318,8 +5780,7 @@ export async function gatherDaemonEvidence(port: number, dataDir: string): Promi
   // A stale or foreign pid holding the port is NOT healed. False-green is
   // worse than no self-heal.
   //
-  // The write uses the same O_NOFOLLOW / 0600 / atomic-rename posture as every
-  // other sidecar write. We skip self-heal when the dataDir is unsafe
+  // The write uses mode 0600 and atomic rename. We skip self-heal when the dataDir is unsafe
   // (symlink / world-writable) — the check has already happened above.
   let portOwner: PortOwnerResult = { kind: "unavailable" };
   let instanceMatch: InstanceMatch = { kind: "unavailable" };
@@ -5367,16 +5828,15 @@ export async function gatherDaemonEvidence(port: number, dataDir: string): Promi
     sidecar,
     readStartTime: readProcessStartTimeMs,
   });
-  return { dataDirUnsafe, pidfile, lastKnownPid, pidLiveness, identity, health };
+  return { ...owner, identity, health };
 }
 
 /**
- * Write the identity sidecar atomically (temp + rename) at spawn time or
- * during self-heal (flair#1454 decision 3). `pid` is the spawned process's
- * pid — the same number Harper writes to `hdb.pid`, since Harper runs
- * in-process. `startTimeMs` defaults to `Date.now()` for a fresh spawn.
+ * Write the identity sidecar atomically (temp + rename) for direct starts,
+ * confirmed managed starts, or self-heal (flair#1454 decision 3).
+ * `startTimeMs` defaults to `Date.now()` for a fresh direct spawn.
  *
- * Self-heal callers pass the live process's actual start time (from
+ * Managed start and self-heal callers pass the live process's actual start time (from
  * readProcessStartTimeMs) so the sidecar records an accurate epoch, not a
  * wall-clock approximation. Note: in the self-heal path the ±2s start-time
  * check in verifyIdentity is NOT what prevents recycled-pid adoption —
@@ -5400,39 +5860,21 @@ function writeDaemonSidecar(dataDir: string, pid: number, port: number, startTim
 }
 
 /**
- * Remove the identity sidecar left behind by a stop (flair#2055).
- *
- * A sidecar that still names a pid which is CONFIRMED gone is a leftover, and
- * leaving it makes a later instance under a DIFFERENT supervisor refuse
- * ("its identity could not be verified"). The removal is gated twice:
- *
- *   1. the pid the sidecar names must be CONFIRMED gone (ESRCH) — `unknown` or
- *      EPERM liveness removes nothing; and
- *   2. a FRESH O_NOFOLLOW read taken just before the unlink must still name
- *      that pid. A sidecar another supervisor rewrote in between names a
- *      different pid and is left alone; a symlinked or malformed one reads as
- *      `unreadable` and is not removed either, because the re-read never
- *      followed the link.
- *
- * There is no lock: the re-read narrows the window to the gap between the read
- * and the unlink, and the only loser of that race is a start that rewrote the
- * sidecar in the gap — a live daemon left with no sidecar, which a later
- * port-based stop or restart can RECOVER by self-heal once the live process
- * supplies the required pidfile and health evidence (shouldAdoptMissingSidecar
- * adopts the identity from the live process; see the recovery test). `flair
- * status` does not re-adopt. A lock would buy
- * nothing here and add a crash-recovery hazard, so the design relies on the
- * self-heal instead. A writer OUTSIDE flair could substitute a symlink after
- * the final read; that is out of scope (same as any other path flair re-reads
- * by name). Best-effort: a failure to unlink is reported, never fatal.
+ * Best-effort removal of a sidecar naming a PID the probe observed gone.
+ * A matching confirmedGonePid skips another liveness probe; null probes it.
+ * A fresh O_NOFOLLOW read must still name that PID. Non-ENOENT unlink errors are logged.
  */
-export function removeStaleSidecarIfConfirmedDead(dataDir: string): void {
+export function removeStaleSidecarIfConfirmedDead(
+  dataDir: string,
+  confirmedGonePid: number | null = null,
+  probe: (pid: number) => PidLiveness = probePidLiveness,
+): void {
   const observed = readSidecar(dataDir);
   if (observed.kind !== "present") return;
   const observedPid = observed.pid;
-  const observedPidLiveness = probePidLiveness(observedPid);
-  // Re-read: only the sidecar that still names the confirmed-dead pid is ours
-  // to remove (a sidecar rewritten in the gap is left alone).
+  const observedPidLiveness: PidLiveness =
+    confirmedGonePid !== null && confirmedGonePid === observedPid ? { kind: "gone" } : probe(observedPid);
+  // A re-read naming a different PID is left alone.
   const fresh = readSidecar(dataDir);
   if (!shouldRemoveSidecarAfterStop({ observedPid, observedPidLiveness, sidecar: fresh })) return;
   const sidecarPath = join(dataDir, "flair-daemon.json");
@@ -5514,6 +5956,7 @@ bindServiceCli({
   ensureLaunchdServiceLoaded,
   flairPackageDir,
   gatherDaemonEvidence,
+  gatherDaemonOwnerEvidence,
   guardEngineNotBackwards,
   harperBinNotFoundMessage,
   harperSearchRoots,
@@ -5522,6 +5965,7 @@ bindServiceCli({
   observeLaunchdManagement,
   probeHealth,
   readyOpsSocketPosture,
+  recordManagedStartSidecar,
   resolveHarperBin,
   resolveHttpBindHost,
   resolveHttpPort,
@@ -6151,6 +6595,113 @@ function observeLaunchdManagement(dataDir: string, port: number): LaunchdManagem
   });
 }
 
+/**
+ * Record the identity sidecar for the instance a launchd-managed start brought
+ * up during a CLI-managed start (flair#2411). The direct start path writes one
+ * immediately after spawn. A launchd KeepAlive relaunch does not write one.
+ *
+ * The sidecar is written after launchd reports the same pid before and after a
+ * Flair-shaped health response and matching serving-pid and hdb.pid reads.
+ * The writer uses an atomic temp+rename and mode 0600; pidfile and sidecar
+ * reads use O_NOFOLLOW.
+ *
+ * A throwing waitForHealth call rethrows its original error so the caller's
+ * existing fallback still runs; a failed Flair fingerprint and the other
+ * unconfirmed cases return `recorded: false`. Each unconfirmed return also
+ * names what the confirmation probe saw in `confirmation`, so the caller's
+ * warning can report it (flair#2422).
+ */
+export async function recordManagedStartSidecar(
+  dataDir: string,
+  port: number,
+  label: string,
+  deps: {
+    adminUser?: string;
+    adminPass?: string;
+    timeoutMs?: number;
+    list?: LaunchctlLister;
+    waitForHealth?: (port: number, adminUser: string, adminPass: string, timeoutMs: number) => Promise<void>;
+    probeHealth?: (port: number) => Promise<HealthResult>;
+    servingPid?: (dataDir: string, port: number) => number | null;
+    readStartTime?: (pid: number) => number | null;
+    write?: (dataDir: string, pid: number, port: number, startTimeMs: number) => void;
+    warn?: (line: string) => void;
+  } = {},
+): Promise<{ recorded: true; pid: number; detail: string } | { recorded: false; confirmation: ManagedStartConfirmation; detail: string }> {
+  const warn = deps.warn ?? ((line: string) => console.error(line));
+  const timeoutMs = deps.timeoutMs ?? STARTUP_TIMEOUT_MS;
+  try {
+    await (deps.waitForHealth ?? waitForHealth)(
+      port,
+      deps.adminUser ?? DEFAULT_ADMIN_USER,
+      deps.adminPass ?? process.env.HDB_ADMIN_PASSWORD ?? "",
+      timeoutMs,
+    );
+  } catch (err: any) {
+    warn(`⚠️  the instance for launchd job ${label} did not answer health within ${timeoutMs}ms, so its identity sidecar was not written (${err?.message ?? err})`);
+    throw err;
+  }
+  // flair#2422: read launchd's job state, then probe health BEFORE branching on
+  // that read. The probe is the confirmation's second look at the port, and its
+  // result is what an unconfirmed start's warning reports.
+  const job = readLaunchctlJobState(label, deps.list ?? realLaunchctlLister);
+  const health = await (deps.probeHealth ?? probeHealth)(port);
+  if (health.kind !== "ok") {
+    const detail = `the instance for launchd job ${label} did not return Flair health (${health.kind}), so its identity sidecar was not written`;
+    warn(`⚠️  ${detail}`);
+    return { recorded: false, confirmation: health.kind, detail };
+  }
+  if (!job.registered) {
+    const detail = `could not read launchd job ${label}, so its identity sidecar was not written`;
+    warn(`⚠️  ${detail}`);
+    return { recorded: false, confirmation: "flair", detail };
+  }
+  if (job.pid === null) {
+    const detail = `launchd did not report a running pid for job ${label}, so its identity sidecar was not written`;
+    warn(`⚠️  ${detail}`);
+    return { recorded: false, confirmation: "flair", detail };
+  }
+  const serving = (deps.servingPid ?? ((_dataDir, httpPort) => {
+    const listeners = resolveListenerPids(httpPort);
+    return listeners?.length === 1 ? listeners[0] : null;
+  }))(dataDir, port);
+  if (serving === null) {
+    const detail = `launchd job ${label} runs as process ${job.pid}, but the process serving this instance could not be identified, so its identity sidecar was not written`;
+    warn(`⚠️  ${detail}`);
+    return { recorded: false, confirmation: "flair", detail };
+  }
+  if (serving !== job.pid) {
+    const detail = `the process answering on port ${port} is ${serving}, not launchd's process ${job.pid} for job ${label}, so its identity sidecar was not written`;
+    warn(`⚠️  ${detail}`);
+    return { recorded: false, confirmation: "flair", detail };
+  }
+  const again = readLaunchctlJobState(label, deps.list ?? realLaunchctlLister);
+  if (!again.registered) {
+    const detail = `could not re-read launchd job ${label}, so its identity sidecar was not written`;
+    warn(`⚠️  ${detail}`);
+    return { recorded: false, confirmation: "flair", detail };
+  }
+  if (again.pid !== job.pid) {
+    const detail = `launchd job ${label} changed pid during health confirmation, so its identity sidecar was not written`;
+    warn(`⚠️  ${detail}`);
+    return { recorded: false, confirmation: "flair", detail };
+  }
+  const pidfile = readPidfile(dataDir);
+  if (pidfile.kind !== "present" || pidfile.pid !== job.pid) {
+    const detail = `hdb.pid does not confirm launchd job ${label}'s process ${job.pid}, so its identity sidecar was not written`;
+    warn(`⚠️  ${detail}`);
+    return { recorded: false, confirmation: "flair", detail };
+  }
+  const startTimeMs = (deps.readStartTime ?? readProcessStartTimeMs)(job.pid);
+  if (startTimeMs === null) {
+    const detail = `could not read the start time of launchd job ${label}'s process ${job.pid}, so its identity sidecar was not written`;
+    warn(`⚠️  ${detail}`);
+    return { recorded: false, confirmation: "flair", detail };
+  }
+  (deps.write ?? writeDaemonSidecar)(dataDir, job.pid, port, startTimeMs);
+  return { recorded: true, pid: job.pid, detail: `launchd job ${label} is running as process ${job.pid}` };
+}
+
 // `preserveHttpPortValue` / `preserveSecurePort` / `bindHostOf` live in
 // src/lib/http-bind.ts so the CLI's plist writer and the pure repair PLANNER
 // (src/lib/launchd-repair.ts) share the exact same preservation rules, and the
@@ -6294,26 +6845,25 @@ function resolveAdminPassAvailability(path: string): AdminPassAvailability {
   };
 }
 
-/**
- * Prove an admin credential belongs to the running instance before adoption
- * materializes it into the 0600 pass file (flair#1685). The admin-gated
- * /HealthDetail read is the proof: a rejected Basic credential produces 401 and
- * is NOT retried through the agent-key floor (that floor only engages when no
- * credential was sent at all), so success here means THIS credential was
- * accepted by THIS instance. Never logs the secret.
- */
-async function proveAdminPassAgainstInstance(
+export async function proveAdminPassAgainstInstance(
   port: number,
   adminPass: string,
 ): Promise<string | null> {
   try {
-    await api("GET", "/HealthDetail", undefined, {
+    await api("GET", "/FederationPeers", undefined, {
       baseUrl: `http://127.0.0.1:${port}`,
       explicitAdminPass: adminPass,
+      adminUser: DEFAULT_ADMIN_USER,
     });
     return null;
   } catch (err) {
-    return err instanceof Error ? err.message : String(err);
+    if (err instanceof Error && err.cause instanceof ApiHttpError) err = err.cause;
+    if (err instanceof ApiHttpError && (err.status === 401 || err.status === 403)) {
+      return `the supplied admin credential was rejected (HTTP ${err.status})`;
+    }
+    const detail = err instanceof Error ? err.message : String(err);
+    const status = err instanceof ApiHttpError ? `HTTP ${err.status}: ` : "";
+    return `admin credential verification could not be completed (${status}${detail})`;
   }
 }
 
@@ -6417,10 +6967,6 @@ export type WriteInitLaunchdPlistResult =
  *      file and the command named and write NO plist. Never a plist whose
  *      launcher argv cannot be satisfied.
  *
- * The proof uses the same authed `GET /HealthDetail` as the doctor arms (a
- * rejected Basic credential is a 401 and never falls through to the agent-key
- * floor), so a credential that does not belong to THIS instance is refused
- * rather than baked into a pass file the instance would reject.
  */
 export async function writeInitLaunchdPlist(
   opts: WriteInitLaunchdPlistOptions,
@@ -7524,10 +8070,14 @@ async function commitLaunchdRepair(p: PreparedLaunchdRepair): Promise<LaunchdRep
     if (p.arm === "adopt") {
       const stop = await stopDirectProcessForAdopt(p.port, p.dataDir);
       if (stop) {
-        if (done.unloadedPrior && (stop.kind === "failed" || stop.kind === "refused")) {
-          stop.detail += " Previously loaded launchd jobs were unloaded.";
+        if (done.unloadedPrior && (stop.failure.kind === "failed" || stop.failure.kind === "refused")) {
+          stop.failure.detail += " Previously loaded launchd jobs were unloaded.";
         }
-        return stop;
+        if (stop.observedExit && stop.failure.kind === "failed") {
+          done.stopped = true;
+          throw new Error(stop.failure.detail);
+        }
+        return stop.failure;
       }
       done.stopped = true;
     }
@@ -7718,9 +8268,14 @@ async function restoreAfterFailedRepair(
   };
 }
 
+interface AdoptStopOutcome {
+  failure: LaunchdRepairResult;
+  observedExit: boolean;
+}
+
 /**
  * Clean-stop the direct (non-launchd) process serving `dataDir`+`port` for the
- * adopt path (flair#1573 slice b2). Returns a `failed` result when the process
+ * adopt path (flair#1573 slice b2). Returns a failure outcome when the process
  * cannot be attributed (never stop a foreign process) or the port is still
  * occupied after the stop; returns null when the port is free and the caller
  * should proceed to regenerate + load.
@@ -7730,10 +8285,12 @@ async function restoreAfterFailedRepair(
  * verdict refuses rather than gambling on a recycled pid. The stop is SIGTERM +
  * wait for exit — never kill -9.
  */
-async function stopDirectProcessForAdopt(port: number, dataDir: string): Promise<LaunchdRepairResult | null> {
+async function stopDirectProcessForAdopt(port: number, dataDir: string): Promise<AdoptStopOutcome | null> {
   const evidence = await gatherDaemonEvidence(port, dataDir);
   const state = classifyDaemonState(evidence, { port, dataDir });
   const stopDeadline = Date.now() + ADOPT_STOP_TIMEOUT_MS;
+  let observedExit = false;
+  const failure = (result: LaunchdRepairResult): AdoptStopOutcome => ({ failure: result, observedExit });
   const timeoutResult = (stage: string): LaunchdRepairResult => ({
     kind: "failed",
     detail: `Timed out after ${ADOPT_STOP_TIMEOUT_MS}ms ${stage} for ${dataDir}. No replacement launchd job was loaded.`,
@@ -7751,23 +8308,20 @@ async function stopDirectProcessForAdopt(port: number, dataDir: string): Promise
       readStartTime: (pid) => readProcessStartTimeMs(pid, Math.min(stopDeadline, Date.now() + 2_000)),
     });
     const identityObservedAt = Date.now();
-    while (Date.now() < stopDeadline && probePidLiveness(state.pid).kind !== "gone") {
-      const remaining = stopDeadline - Date.now();
-      if (remaining <= 0) break;
-      await new Promise((r) => setTimeout(r, Math.min(HEALTH_POLL_INTERVAL_MS, remaining)));
-    }
-    if (Date.now() >= stopDeadline) {
-      const liveness = probePidLiveness(state.pid);
+    const stopGone = await waitForPidGone(state.pid, stopDeadline);
+    if (!stopGone.gone) {
+      const liveness = stopGone.last;
       const result = timeoutResult(`waiting for direct Harper process ${state.pid} to exit`);
       const identityDetail = identityObservedAt < stopDeadline
         ? `${identity.kind}, observed at ${new Date(identityObservedAt).toISOString()}`
         : "not observed before the deadline";
       if (result.kind === "failed") result.detail += ` ${signalResult}; not observed to exit before the deadline (liveness: ${liveness.kind}; identity: ${identityDetail}).`;
-      return result;
+      return failure(result);
     }
+    observedExit = true;
   }
   const stateDecision = decideAdoptStop(state, { kind: "refused" });
-  if (stateDecision !== "proceed") return stateDecision;
+  if (stateDecision !== "proceed") return failure(stateDecision);
   let health: HealthResult = { kind: "unreachable" };
   while (Date.now() < stopDeadline) {
     health = await probeHealthBeforeDeadline(port, stopDeadline);
@@ -7777,11 +8331,11 @@ async function stopDirectProcessForAdopt(port: number, dataDir: string): Promise
     if (remaining <= 0) break;
     await new Promise((r) => setTimeout(r, Math.min(250, remaining)));
   }
-  if (Date.now() >= stopDeadline) return timeoutResult(`waiting for port ${port} to free (last health probe: ${health.kind})`);
+  if (Date.now() >= stopDeadline) return failure(timeoutResult(`waiting for port ${port} to free (last health probe: ${health.kind})`));
   const decision = decideAdoptStop(state, health);
-  if (decision !== "proceed") return decision;
+  if (decision !== "proceed") return failure(decision);
   const listenerTimeout = Math.min(2_000, stopDeadline - Date.now());
-  if (listenerTimeout <= 0) return timeoutResult(`checking the final listener on port ${port}`);
+  if (listenerTimeout <= 0) return failure(timeoutResult(`checking the final listener on port ${port}`));
   let output: string;
   let noMatch = false;
   try {
@@ -7795,32 +8349,41 @@ async function stopDirectProcessForAdopt(port: number, dataDir: string): Promise
       output = "";
       noMatch = true;
     } else {
-      return {
+      return failure({
         kind: "failed",
         detail: `Final listener probe failed for port ${port} (${err?.code ?? err?.signal ?? err?.status ?? "unknown error"}). No replacement launchd job was loaded.`,
         remedy: ["Check lsof; run flair doctor --fix after resolving the probe failure"],
-      };
+      });
     }
   }
-  if (Date.now() >= stopDeadline) return timeoutResult(`checking the final listener on port ${port}`);
+  if (Date.now() >= stopDeadline) return failure(timeoutResult(`checking the final listener on port ${port}`));
   if (noMatch) return null;
   if (typeof output !== "string" || output.trim() === "") {
-    return { kind: "failed", detail: `Final listener probe failed for port ${port} (unusable lsof output).`, remedy: ["Check lsof", "flair doctor --fix"] };
+    return failure({ kind: "failed", detail: `Final listener probe failed for port ${port} (unusable lsof output).`, remedy: ["Check lsof", "flair doctor --fix"] });
   }
   const lines = output.trim().split("\n");
   if (lines.some((line) => !/^[1-9][0-9]*$/.test(line.trim()) || !Number.isSafeInteger(Number(line.trim())))) {
-    return { kind: "failed", detail: `Final listener probe failed for port ${port} (unusable lsof output).`, remedy: ["Check lsof", "flair doctor --fix"] };
+    return failure({ kind: "failed", detail: `Final listener probe failed for port ${port} (unusable lsof output).`, remedy: ["Check lsof", "flair doctor --fix"] });
   }
   const listeners = lines.map(Number);
   if (listeners.length > 0) {
-    return {
+    return failure({
       kind: "failed",
       detail: `port still occupied after stopping the direct process (listener pid ${listeners.join(", ")})`,
       remedy: ["flair stop", "flair doctor --fix"],
-    };
+    });
   }
   return null;
 }
+
+/** The restart flow's exit wait for the old process (flair#2365); injectable for tests. */
+type ExitWait = (pid: number, timeoutMs: number) => Promise<void>;
+type StopFlairDeps = {
+  waitForExit?: ExitWait;
+  launchctl?: { list: LaunchctlLister; unload: (plistPath: string) => void };
+};
+
+type StopExitOutcome = { pid: number | null; exited: boolean };
 
 /**
  * Stop the local Flair (Harper) process — launchd `stop` on darwin when a
@@ -7846,7 +8409,18 @@ async function stopDirectProcessForAdopt(port: number, dataDir: string): Promise
  * the liveness machine. Callers already treat a failed stop as fatal, which
  * is the point: refusing beats quiescing the wrong install.
  */
-async function stopFlairProcess(port: number, dataDir: string): Promise<void> {
+async function stopFlairProcess(
+  port: number,
+  dataDir: string,
+  opts: StopFlairDeps = {},
+): Promise<StopExitOutcome> {
+  const waitForExit = opts.waitForExit ?? waitForProcessExit;
+  let launchdExitFailure: { pid: number; exited: false } | null = null;
+  const fallbackOutcome = (outcome: StopExitOutcome): StopExitOutcome => {
+    if (!launchdExitFailure) return outcome;
+    if (probePidLiveness(launchdExitFailure.pid).kind !== "gone") return launchdExitFailure;
+    return { pid: outcome.pid ?? launchdExitFailure.pid, exited: outcome.exited };
+  };
   if (process.platform === "darwin") {
     // resolveLaunchdLabel (flair#693) finds whichever label this data dir
     // is currently registered under (new instance-scoped, or a
@@ -7894,20 +8468,29 @@ async function stopFlairProcess(port: number, dataDir: string): Promise<void> {
             plistPath,
             instancePid: oldPid,
             plistExists: existsSync,
-            list: realLaunchctlLister,
+            list: opts.launchctl?.list ?? realLaunchctlLister,
           })
           : null;
         // unload stops the job AND prevents KeepAlive from respawning it.
         // launchctl stop alone is insufficient for a KeepAlive job (flair#874).
-        try { execSync(`launchctl unload "${plistPath}"`, { stdio: "pipe" }); } catch {}
+        try {
+          if (opts.launchctl) opts.launchctl.unload(plistPath);
+          else execSync(`launchctl unload "${plistPath}"`, { stdio: "pipe" });
+        } catch {}
         if (managed && isDetached(managed)) {
           throw new Error(
             `launchd is not running this instance — ${managed.detail}`
             + `${managed.remedy?.length ? ` Fix it with: ${managed.remedy.join(" && ")}` : ""}`,
           );
         }
-        if (oldPid) await waitForProcessExit(oldPid, STARTUP_TIMEOUT_MS);
-        return;
+        if (oldPid) {
+          try { await waitForExit(oldPid, STARTUP_TIMEOUT_MS); } catch (err) {
+            launchdExitFailure = { pid: oldPid, exited: false };
+            throw err;
+          }
+        }
+        removeStaleSidecarIfConfirmedDead(dataDir, oldPid);
+        return { pid: oldPid ?? null, exited: true };
       } catch (err: any) {
         console.error(`launchd stop failed, falling back to port-based stop: ${err.message}`);
       }
@@ -7935,26 +8518,25 @@ async function stopFlairProcess(port: number, dataDir: string): Promise<void> {
       // blind sleep is not a guarantee — Harper may be flushing RocksDB
       // WAL/MANIFEST, and the next start fails with a locked data directory if
       // the old process hasn't released it yet.
-      try { await waitForProcessExit(pid, STARTUP_TIMEOUT_MS); } catch { /* best-effort — the next start will surface the real problem */ }
-      // flair#2055: once the process is CONFIRMED gone, drop the identity
-      // sidecar. Gated on a fresh O_NOFOLLOW read that still names the pid it
-      // named before (a sidecar another supervisor rewrote in between is left
-      // alone); a process that survived the wait (or whose liveness is unknown)
-      // removes nothing.
-      removeStaleSidecarIfConfirmedDead(dataDir);
-      return;
+      let exited = true;
+      try { await waitForExit(pid, STARTUP_TIMEOUT_MS); } catch { exited = false; /* best-effort — the restart leg refuses instead (flair#2365) */ }
+      // Use the PID the exit probe observed gone; null makes cleanup probe
+      // the sidecar's PID. A re-read naming a different PID is left alone.
+      removeStaleSidecarIfConfirmedDead(dataDir, exited ? pid : null);
+      return fallbackOutcome({ pid, exited });
     }
     case "NOT_RUNNING": {
-      // Idempotent no-op for the process — but a sidecar left naming a pid that
-      // is CONFIRMED gone is a leftover too (flair#2055), and removing it here
-      // keeps a repeat stop from carrying the refusal forward.
+      // Probe the sidecar's PID before best-effort removal.
       removeStaleSidecarIfConfirmedDead(dataDir);
-      return;
+      return fallbackOutcome({ pid: null, exited: true });
     }
     case "DISAGREEMENT":
     case "UNKNOWN":
       // Deliberately outside any catch: a refusal must reach the caller, not
       // be swallowed as "not running" and reported as a successful stop.
+      if (launchdExitFailure && !fallbackOutcome({ pid: null, exited: true }).exited) {
+        throw new StopExitWaitError(launchdExitFailure, `refusing to stop: ${state.detail}`);
+      }
       throw new Error(`refusing to stop: ${state.detail}`);
   }
 }
@@ -8045,7 +8627,9 @@ async function startFlairProcess(port: number, dataDir: string): Promise<void> {
             throw new LaunchdValidationRefusal(`${stalePlist.message} Fix it with: ${stalePlist.remedy.join(" && ")}`);
           }
           ensureLaunchdServiceLoaded(dataDir, realLaunchctlCommand);
-          await waitForHealth(port, DEFAULT_ADMIN_USER, process.env.HDB_ADMIN_PASSWORD ?? "", STARTUP_TIMEOUT_MS);
+          await recordManagedStartSidecar(dataDir, port, launchdLabel(dataDir), {
+            adminPass: process.env.HDB_ADMIN_PASSWORD ?? "",
+          });
           readyOpsSocketPosture(dataDir); // flair#763: re-assert socket posture across restart/upgrade
           stampEngineVersionIfRunning(dataDir); // flair#1047: stamp the store with the engine version
           return;
@@ -8124,6 +8708,24 @@ async function startFlairDirect(port: number, dataDir: string): Promise<number |
   return proc.pid ?? null;
 }
 
+class StopExitWaitError extends Error {
+  constructor(readonly outcome: StopExitOutcome, readonly detail?: string) {
+    super(`${detail ? `${detail}. ` : ""}Could not confirm that the old Flair process (pid ${outcome.pid ?? "unknown"}) exited within ${STARTUP_TIMEOUT_MS}ms`);
+  }
+}
+
+function refuseReplacementAfterExitTimeout(outcome: StopExitOutcome, detail?: string): void {
+  if (outcome.exited) return;
+  throw new Error(
+    `${detail ? `${detail}. ` : ""}Could not confirm that the old Flair process (pid ${outcome.pid ?? "unknown"}) exited within ${STARTUP_TIMEOUT_MS}ms; refusing to start a replacement. `
+    + `Stop it, then re-run 'flair restart'.`,
+  );
+}
+
+type RestartFlairDeps = StopFlairDeps & {
+  startReplacement?: (port: number, dataDir: string) => Promise<void>;
+};
+
 /**
  * The ONE restart mechanism for a local Flair install. Shared by `flair
  * restart` and `flair upgrade`'s post-install restart step (flair#635) so
@@ -8140,7 +8742,18 @@ async function startFlairDirect(port: number, dataDir: string): Promise<number |
  * named at the call site rather than assumed from `defaultDataDir()` two
  * frames down.
  */
-async function restartFlair(port: number, dataDir: string): Promise<void> {
+export async function restartFlair(port: number, dataDir: string, deps: RestartFlairDeps = {}): Promise<void> {
+  const startReplacement = deps.startReplacement ?? startFlairProcess;
+  const stopForRestart = async (): Promise<void> => {
+    let outcome: StopExitOutcome;
+    try {
+      outcome = await stopFlairProcess(port, dataDir, deps);
+    } catch (err) {
+      if (err instanceof StopExitWaitError) refuseReplacementAfterExitTimeout(err.outcome, err.detail);
+      throw err;
+    }
+    refuseReplacementAfterExitTimeout(outcome);
+  };
   // flair#2034 §2: on Linux, an instance proven to run under a systemd USER
   // unit (found from the serving process's cgroup; its MainPID is that
   // process) is restarted THROUGH that unit, and the unit's new main process
@@ -8176,8 +8789,8 @@ async function restartFlair(port: number, dataDir: string): Promise<void> {
         if (s.unitTree !== null && samePathCanonical(s.unitTree, flairPackageDir())) guardEngineNotBackwards(dataDir);
       },
       direct: async () => {
-        await stopFlairProcess(port, dataDir);
-        await startFlairProcess(port, dataDir);
+        await stopForRestart();
+        await startReplacement(port, dataDir);
       },
       log: (line) => console.log(line),
     });
@@ -8186,8 +8799,8 @@ async function restartFlair(port: number, dataDir: string): Promise<void> {
       stampEngineVersionIfRunning(dataDir);
     }
   } else {
-    await stopFlairProcess(port, dataDir);
-    await startFlairProcess(port, dataDir);
+    await stopForRestart();
+    await startReplacement(port, dataDir);
   }
   // Bust the version-handshake cache so the next preAction nudge re-fetches
   // the LIVE version instead of the pre-restart cached one (the false
@@ -8385,6 +8998,7 @@ bindDoctorCli({
   repairLaunchdManagement,
   repointMainServiceUnit,
   resolveHttpPort,
+  verifyDoctorRosterInstance,
   restartFlair,
   resolveOpsPort,
   verifyAuditLog,
@@ -8551,6 +9165,7 @@ bindImportCli({
   resolveHttpPort,
   resolveOpsPort,
   seedAgentViaOpsApi,
+  seedAgentWithLocalHome,
 });
 registerImport(program);
 

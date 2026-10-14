@@ -8,13 +8,17 @@
  */
 import { Command } from "commander";
 import { makeReadInstanceIds } from "./keys.js";
-import { COMPONENT_ENV_FILENAME, PUBLIC_URL_KEY, describePublicUrlFinding, readEnvValue } from "../component-env.js";
-import { AgentGateState, checkClaudeMdBootstrap, checkContinuityCaptureHooks, continuityWriteBlockers, describeAgentGateFinding, effectiveFlairUrl, embeddingsSkipRemedy, fixClaudeMdBootstrap, fixCommandAgentHint, fixContinuityCaptureHooks, fixSessionStartHook, inspectSessionStartHook, orphanInstanceSeedAdvisory, partitionKeyIds, planAgentIterations, readClientMcpBlock, resolveFixAgentId, resolveWireFlairUrl, upgradeSessionStartHookCommand } from "../doctor-client.js";
+import { COMPONENT_ENV_FILENAME, MCP_ISSUER_KEY, PUBLIC_URL_KEY, describePublicUrlFinding, readEnvValue } from "../component-env.js";
+import { readTargetMcpRedirectFinding, mcpOAuthEnabledFromComponentEnv } from "../lib/mcp-oauth-env.js";
+import { AgentGateState, checkClaudeMdBootstrap, checkContinuityCaptureHooks, continuityWriteBlockers, describeAgentGateFinding, describeAgentHomeFinding, describeAgentIdRuleFinding, effectiveFlairUrl, embeddingsSkipRemedy, fixClaudeMdBootstrap, fixCommandAgentHint, fixContinuityCaptureHooks, fixSessionStartHook, inspectSessionStartHook, orphanInstanceSeedAdvisory, partitionKeyIds, planAgentIterations, readClientMcpBlock, resolveFixAgentId, resolveWireFlairUrl, upgradeSessionStartHookCommand } from "../doctor-client.js";
 import { FleetPresenceRow, markStale, sortOldestVersionFirst } from "../fleet-presence.js";
 import { hookSettingsPath, resolveHookAgentId } from "../hook-install.js";
 import { ALL_CLIENTS, decideCodexPinOnly, decideJsonPinOnly, detectClients, type ClientId, wireAntigravity, wireClaudeCode, wireCodex, wireCursor, wireGemini } from "../install/clients.js";
 import { checkGlobalBinOnPath, resolveNpmGlobalPrefix } from "../install/global-bin-path.js";
 import { buildEd25519Auth, defaultAdminPassPath, defaultKeysDir, requestTarget, requestUrl, resolveAdminUser, resolveKeyPath, resolveLocalAdminPass } from "../lib/auth-resolve.js";
+import { AGENT_ID_RULE } from "../lib/agent-id-rule.js";
+import { agentHomeEndpoint, readAgentHomeRows, resolveTargetInstanceIdentity } from "../lib/agent-home.js";
+import { readAgentRoster } from "../lib/agent-roster.js";
 import { flairConfigYamlCandidates, readPortFromYamlFile, resolveFlairConfigYaml } from "../lib/doctor-config-path.js";
 import { collectFederationEnv, describeFederationDriverFinding, federationPeersConfigured, loadYamlDoc } from "../lib/doctor-federation-driver.js";
 import { plistCarriesInlineAdminPassword } from "../lib/launchd-management.js";
@@ -27,6 +31,7 @@ import {
   probeInstanceIdentity,
 } from "../lib/instance-identity-row.js";
 import { FLAIR_MCP_PACKAGE, flairCliVersion, mcpServerSpec, unpinnedSpecWarning } from "../lib/mcp-spec.js";
+import { discriminateMcpOAuthDiscovery, reportMcpOAuthDiscovery, type McpOAuthDiscoverySeverity } from "../lib/mcp-enable.js";
 import { mcpClientPinFindings, refreshOwnedPins, repinSessionStartHookGuarded, sessionStartHookPinFindings } from "../lib/owned-pins.js";
 import * as render from "../render.js";
 import { checkVersion, formatVersionNudge, probeInstanceVersion, FLAIR_PKG_NAME } from "../version-check.js";
@@ -38,6 +43,56 @@ import { existsSync, readFileSync, readdirSync, statSync, unlinkSync } from "nod
 
 import { dirname, join, resolve } from "node:path";
 import { resolveHome } from "../lib/home.js";
+
+export async function fetchAndRenderMigrations(healthDetailUrl: string | URL, headers: Record<string, string>, indent: string): Promise<number> {
+  let issues = 0;
+  try {
+    const migRes = await fetch(healthDetailUrl, { headers, signal: AbortSignal.timeout(5000) });
+    if (!migRes.ok) {
+      console.log(`${indent}${render.icons.warn} Could not fetch migration state (HTTP ${migRes.status})`);
+      return issues;
+    }
+    const detail = (await migRes.json()) as { migrations?: { cyclePhase?: string; lastCycleError?: string | null; migrations?: Array<{ id: string; state: string; rowsDone: number; rowsRemaining: number; reason?: string }> } };
+    const migBlock = detail?.migrations;
+    if (!migBlock || !Array.isArray(migBlock.migrations) || migBlock.migrations.length === 0) {
+      console.log(`${indent}${render.icons.info} No migrations registered on this instance`);
+      return issues;
+    }
+    if (migBlock.cyclePhase === "pre-hash") {
+      console.log(`${indent}${render.icons.info} Pre-flight integrity check in progress — migrations deferred until it completes`);
+    }
+    // flair#812: the boot trigger sets `scheduled` synchronously at
+    // module load, so `idle` means resources/migration-boot.js never
+    // loaded in the serving process — NO migration will ever run on
+    // this instance, which is precisely the failure that went unnoticed
+    // because a skipped cycle looked identical to a clean one.
+    if (migBlock.cyclePhase === "idle") {
+      console.log(`${indent}${render.icons.error} Migration boot cycle never fired on this instance — no migration will run until this is resolved. Check the instance log for [flair-migrations] and confirm the running build ships dist/resources/migration-boot.js.`);
+      issues++;
+    }
+    if (migBlock.lastCycleError) {
+      console.log(`${indent}${render.icons.error} Last migration cycle did not complete: ${migBlock.lastCycleError}`);
+      issues++;
+    }
+    for (const m of migBlock.migrations) {
+      if (m.state === "completed") {
+        // Print the state-file short-circuit qualification (flair#812).
+        const note = m.reason ? ` ${render.wrap(render.c.dim, `(${m.reason})`)}` : "";
+        console.log(`${indent}${render.icons.ok} ${m.id}: completed${note}`);
+      } else if (m.state === "halted" || m.state === "failed") {
+        console.log(`${indent}${render.icons.error} ${m.id}: ${m.state}${m.reason ? ` — ${m.reason}` : ""}`);
+        issues++;
+      } else if (m.state === "running") {
+        console.log(`${indent}${render.icons.info} ${m.id}: in progress (${m.rowsDone} done, ${m.rowsRemaining} remaining)`);
+      } else {
+        console.log(`${indent}${render.icons.info} ${m.id}: ${m.state}`);
+      }
+    }
+  } catch (err: any) {
+    console.log(`${indent}${render.icons.warn} Migration state check failed: ${err?.message ?? err}`);
+  }
+  return issues;
+}
 
 export async function readNodeSeedAdvisory(
   input: Parameters<typeof makeReadInstanceIds>[0] & { nodeKeyIds: string[]; keysDir: string },
@@ -70,11 +125,32 @@ export type DoctorCli = {
   repairLaunchdManagement: (...args: any[]) => any;
   repointMainServiceUnit: (...args: any[]) => any;
   resolveHttpPort: (...args: any[]) => any;
+  verifyDoctorRosterInstance: (...args: any[]) => any;
   restartFlair: (...args: any[]) => any;
   resolveOpsPort: (...args: any[]) => any;
   verifyAuditLog: (...args: any[]) => any;
   verifySemanticSearch: (...args: any[]) => any;
   __pkgVersion: any;
+};
+
+/**
+ * The ops endpoint the four instance reads (audit-log, instance-identity, Agent
+ * roster, Agent homes) may address, or the refusal (flair#2520), as
+ * `verifyDoctorRosterInstance` returns it.
+ */
+type DoctorProbedRead =
+  | { kind: "run"; opsPort: number }
+  | { kind: "not-run"; reason: string; remedy: string };
+
+/**
+ * The admin credential doctor resolved for those four reads, and the target it
+ * verified with that credential (flair#2520). `read` is null when there is no
+ * usable credential.
+ */
+type DoctorProbedTarget = {
+  adminPass: string | undefined;
+  credIssue: string | null;
+  read: DoctorProbedRead | null;
 };
 
 let cli: DoctorCli;
@@ -142,6 +218,10 @@ function repairLaunchdManagement(...args: any[]): any {
 
 function resolveHttpPort(...args: any[]): any {
   return cli.resolveHttpPort(...args);
+}
+
+function verifyDoctorRosterInstance(...args: any[]): any {
+  return cli.verifyDoctorRosterInstance(...args);
 }
 
 function resolveOpsPort(...args: any[]): any {
@@ -817,12 +897,12 @@ program
       // READs it for drift detection, but describePublicUrlFinding never names
       // it as the fix (flair#1313 — wiped on every upgrade).
       const componentEnvPath = join(flairPackageDir(), COMPONENT_ENV_FILENAME);
-      let componentEnvValue: string | null = null;
+      let componentEnvText: string | null = null;
       try {
-        if (existsSync(componentEnvPath)) {
-          componentEnvValue = readEnvValue(readFileSync(componentEnvPath, "utf-8"), PUBLIC_URL_KEY);
-        }
+        if (existsSync(componentEnvPath)) componentEnvText = readFileSync(componentEnvPath, "utf-8");
       } catch { /* unreadable → treat as absent */ }
+      const componentEnvValue = readEnvValue(componentEnvText, PUBLIC_URL_KEY);
+      const componentMcpIssuer = readEnvValue(componentEnvText, MCP_ISSUER_KEY);
 
       const finding = describePublicUrlFinding({
         advertisedIssuer,
@@ -839,6 +919,39 @@ program
         if (finding.fixHint) console.log(`     ${render.wrap(render.c.dim, "Fix:")} ${finding.fixHint}`);
         if (finding.isIssue) issues++;
       }
+
+      const mcpRedirectFinding = await readTargetMcpRedirectFinding(() =>
+        api("GET", "/HealthDetail", undefined, {
+          baseUrl,
+          keysDir: defaultKeysDir(),
+          ...(opts.agent ? { agentId: opts.agent, agentIdSource: "flag" } : {}),
+        }),
+      );
+      if (mcpRedirectFinding) {
+        console.log(`  ${mcpRedirectFinding.isIssue ? render.icons.error : render.icons.warn} ${mcpRedirectFinding.message}`);
+        if (mcpRedirectFinding.fixHint) console.log(`     ${render.wrap(render.c.dim, "Fix:")} ${mcpRedirectFinding.fixHint}`);
+        if (mcpRedirectFinding.isIssue) issues++;
+      }
+
+      // flair#2283: share enable's discovery discriminator and infer report severity locally.
+      const discovery = await discriminateMcpOAuthDiscovery(baseUrl, {
+        expectedIssuers: [componentMcpIssuer, componentEnvValue, process.env.FLAIR_MCP_ISSUER, process.env.FLAIR_PUBLIC_URL].filter(
+          (issuer): issuer is string => typeof issuer === "string" && issuer.trim() !== "",
+        ),
+      });
+      const discoveryReport = reportMcpOAuthDiscovery(discovery, mcpOAuthEnabledFromComponentEnv(componentEnvText, process.env));
+      const discoveryIcons: Record<McpOAuthDiscoverySeverity, string> = {
+        ok: render.icons.ok,
+        info: render.icons.info,
+        warn: render.icons.warn,
+        error: render.icons.error,
+      };
+      discoveryReport.lines.forEach((line, index) => {
+        console.log(index === 0 ? `  ${discoveryIcons[discoveryReport.severity]} ${line}` : `     ${line}`);
+      });
+      if (discoveryReport.severity === "error") issues++;
+    } else {
+      console.log(`  ${render.icons.warn} MCP OAuth redirect: cannot verify target configuration`);
     }
 
     // 4. Embeddings check — REAL semantic round-trip (only if Harper is responding).
@@ -891,6 +1004,41 @@ program
       }
     }
 
+    // flair#2520: the audit-log, instance-identity, Agent-roster and Agent-homes
+    // reads go through an ops endpoint, which must belong to the instance doctor
+    // probed. Resolve the admin credential and verify that target with it here,
+    // using the pair check flair#2483 applies. Diagnostic reads that run use
+    // the verified target; pairing refusals report NOT RUN with the shared
+    // reason and remedy, and existing UNVERIFIED/skipped outcomes remain. With
+    // no usable admin credential there is no target (`read` null) and no ops
+    // endpoint is read. `effectivePort` is final: PID discovery (step 1) and any
+    // --fix re-record have already run. This answer describes the credential
+    // and the process serving the probed port at this point, so it is shared
+    // only until a --fix step may change either: the launchd repair (7b, which
+    // can also write the admin-pass file from HDB_ADMIN_PASSWORD) and the
+    // install-tree restart (7c), both below. Those steps set
+    // `servingProcessMayHaveChanged`, and the Agent-roster and Agent-homes
+    // checks then resolve the credential again and, when one is available,
+    // verify the target with it, and use only that answer (8b).
+    async function resolveProbedTarget(): Promise<DoctorProbedTarget> {
+      let adminPass: string | undefined;
+      let credIssue: string | null = null;
+      try {
+        adminPass = resolveLocalAdminPass(undefined);
+      } catch (err: unknown) {
+        credIssue = err instanceof Error ? err.message : String(err);
+      }
+      const read: DoctorProbedRead | null = adminPass
+        ? await verifyDoctorRosterInstance(opts, effectivePort, adminPass)
+        : null;
+      return { adminPass, credIssue, read };
+    }
+    const probed: DoctorProbedTarget = harperResponding
+      ? await resolveProbedTarget()
+      : { adminPass: undefined, credIssue: null, read: null };
+    const { adminPass: probedAdminPass, credIssue: probedCredIssue, read: probedRead } = probed;
+    let servingProcessMayHaveChanged = false;
+
     // 4b. Audit-log positive control (flair#970) — REAL write→read_audit_log
     // round-trip, only if Harper is responding. `describe_table` reporting
     // `audit: true` proves nothing: a node that joined or resynced via
@@ -904,56 +1052,62 @@ program
       // agent's Ed25519 header cannot authenticate — resolve the local admin
       // credential (env or ~/.flair/admin-pass; never prompts). A file with
       // unsafe permissions throws — that is "could not probe", not "broken".
-      let auditAdminPass: string | undefined;
-      let auditCredIssue: string | null = null;
-      try {
-        auditAdminPass = resolveLocalAdminPass(undefined);
-      } catch (err: unknown) {
-        auditCredIssue = err instanceof Error ? err.message : String(err);
-      }
-      const auditStatus = auditCredIssue
-        ? ({ state: "skipped", reason: "no-admin-credentials", detail: auditCredIssue } as const)
-        : await verifyAuditLog(
-            baseUrl,
-            opts.agent,
-            defaultKeysDir(),
-            `http://127.0.0.1:${resolveOpsPort(opts)}`,
-            resolveAdminUser(undefined),
-            auditAdminPass,
-          );
-      switch (auditStatus.state) {
-        case "ok":
-          // Present-tense claim ONLY (see AuditVerifyResult): the probe
-          // proves the log records writes NOW — never that history is
-          // complete. Overclaiming here would rebuild the false trust
-          // anchor this check exists to kill, one layer up.
-          console.log(`  ${render.icons.ok} Audit log: recording (verified now) ${render.wrap(render.c.dim, "(verifies current recording, not history — a resynced node's audit has a hard start boundary at its copy time)")}`);
-          break;
-        case "degraded":
-          if (auditStatus.cause === "disabled") {
-            console.log(`  ${render.icons.error} Audit log DISABLED ${render.wrap(render.c.dim, `— ${auditStatus.detail}`)}`);
-            console.log(`     ${render.wrap(render.c.dim, "Fix: enable logging.auditLog in the ROOT harperdb-config.yaml (the Harper instance config, NOT flair's component config.yaml), then restart Harper.")}`);
-          } else {
-            console.log(`  ${render.icons.error} Audit log NOT RECORDING ${render.wrap(render.c.dim, `— ${auditStatus.detail}`)}`);
-            console.log(`     ${render.wrap(render.c.red, "Audit reports as enabled, but fresh writes produced no audit entries — do not treat the audit log as a record of what happened.")}`);
-            console.log(`     ${render.wrap(render.c.dim, "On a node that joined or resynced via cluster base copy, audit history has a hard start boundary at copy time (harper#2212) — \"no history\" does not mean \"nothing happened\".")}`);
-            console.log(`     ${render.wrap(render.c.dim, "Check logging.auditLog in the ROOT harperdb-config.yaml (not flair's component config.yaml), then restart Harper.")}`);
-          }
-          issues++;
-          break;
-        case "failed":
-          // Same loud discipline as the embeddings probe above (flair#1501).
-          console.log(`  ${render.icons.error} Audit log: probe rejected ${render.wrap(render.c.dim, `— ${auditStatus.detail}`)}`);
-          console.log(`     ${render.wrap(render.c.dim, "Fix: register this key on the instance (`flair agent add <id>`) or pass --agent <a registered agent id>.")}`);
-          issues++;
-          break;
-        case "skipped":
-          // An unrun check must not look like a pass — UNVERIFIED, visually
-          // distinct from ok, but not a hard issue (mirrors the embeddings
-          // skip: the operator may simply have no agent or no local admin
-          // credential on this box).
-          console.log(`  ${render.icons.warn} Audit log: UNVERIFIED (could not probe — ${auditStatus.detail})`);
-          break;
+      if (probedCredIssue) {
+        console.log(`  ${render.icons.warn} Audit log: UNVERIFIED (could not probe — ${probedCredIssue})`);
+      } else if (probedRead?.kind === "not-run") {
+        // flair#2520: the pair-refused target the instance-identity section
+        // also uses (and the roster and home sections, unless a --fix step
+        // makes them verify again); name why and the remedy, and count it. This
+        // section's diagnostic read does not run.
+        issues++;
+        console.log(`  ${render.icons.warn} Audit log: NOT RUN — ${probedRead.reason}`);
+        console.log(`     ${render.wrap(render.c.dim, "Fix:")} ${probedRead.remedy}`);
+      } else {
+        // A verified target, or null with no admin credential. With none,
+        // verifyAuditLog answers its no-credential/no-agent skip before it would
+        // address the ops URL, so the empty URL is never fetched.
+        const auditStatus = await verifyAuditLog(
+          baseUrl,
+          opts.agent,
+          defaultKeysDir(),
+          probedRead ? `http://127.0.0.1:${probedRead.opsPort}` : "",
+          resolveAdminUser(undefined),
+          probedAdminPass,
+        );
+        switch (auditStatus.state) {
+          case "ok":
+            // Present-tense claim ONLY (see AuditVerifyResult): the probe
+            // proves the log records writes NOW — never that history is
+            // complete. Overclaiming here would rebuild the false trust
+            // anchor this check exists to kill, one layer up.
+            console.log(`  ${render.icons.ok} Audit log: recording (verified now) ${render.wrap(render.c.dim, "(verifies current recording, not history — a resynced node's audit has a hard start boundary at its copy time)")}`);
+            break;
+          case "degraded":
+            if (auditStatus.cause === "disabled") {
+              console.log(`  ${render.icons.error} Audit log DISABLED ${render.wrap(render.c.dim, `— ${auditStatus.detail}`)}`);
+              console.log(`     ${render.wrap(render.c.dim, "Fix: enable logging.auditLog in the ROOT harperdb-config.yaml (the Harper instance config, NOT flair's component config.yaml), then restart Harper.")}`);
+            } else {
+              console.log(`  ${render.icons.error} Audit log NOT RECORDING ${render.wrap(render.c.dim, `— ${auditStatus.detail}`)}`);
+              console.log(`     ${render.wrap(render.c.red, "Audit reports as enabled, but fresh writes produced no audit entries — do not treat the audit log as a record of what happened.")}`);
+              console.log(`     ${render.wrap(render.c.dim, "On a node that joined or resynced via cluster base copy, audit history has a hard start boundary at copy time (harper#2212) — \"no history\" does not mean \"nothing happened\".")}`);
+              console.log(`     ${render.wrap(render.c.dim, "Check logging.auditLog in the ROOT harperdb-config.yaml (not flair's component config.yaml), then restart Harper.")}`);
+            }
+            issues++;
+            break;
+          case "failed":
+            // Same loud discipline as the embeddings probe above (flair#1501).
+            console.log(`  ${render.icons.error} Audit log: probe rejected ${render.wrap(render.c.dim, `— ${auditStatus.detail}`)}`);
+            console.log(`     ${render.wrap(render.c.dim, "Fix: register this key on the instance (`flair agent add <id>`) or pass --agent <a registered agent id>.")}`);
+            issues++;
+            break;
+          case "skipped":
+            // An unrun check must not look like a pass — UNVERIFIED, visually
+            // distinct from ok, but not a hard issue (mirrors the embeddings
+            // skip: the operator may simply have no agent or no local admin
+            // credential on this box).
+            console.log(`  ${render.icons.warn} Audit log: UNVERIFIED (could not probe — ${auditStatus.detail})`);
+            break;
+        }
       }
     }
 
@@ -972,19 +1126,25 @@ program
     // unreadable leaves the pairing-role check UNVERIFIED while the row facts
     // are still reported — a green line would claim a check that did not run.
     if (harperResponding) {
-      let identityAdminPass: string | undefined;
-      let identityCredIssue: string | null = null;
-      try {
-        identityAdminPass = resolveLocalAdminPass(undefined);
-      } catch (err: unknown) {
-        identityCredIssue = err instanceof Error ? err.message : String(err);
-      }
-      if (identityCredIssue) {
-        console.log(`  ${render.icons.warn} Instance identity: UNVERIFIED (could not probe — ${identityCredIssue})`);
+      if (probedCredIssue) {
+        console.log(`  ${render.icons.warn} Instance identity: UNVERIFIED (could not probe — ${probedCredIssue})`);
+      } else if (probedRead?.kind === "not-run") {
+        // flair#2520: the pair-refused target the audit-log section also uses
+        // (and the roster and home sections, unless a --fix step makes them
+        // verify again); name why and the remedy, and count it. This section's
+        // diagnostic read does not run.
+        issues++;
+        console.log(`  ${render.icons.warn} Instance identity: NOT RUN — ${probedRead.reason}`);
+        console.log(`     ${render.wrap(render.c.dim, "Fix:")} ${probedRead.remedy}`);
+      } else if (probedRead === null) {
+        // No admin credential: the Instance table cannot be read, and no ops
+        // endpoint is addressed. Same UNVERIFIED state as before the target was
+        // shared.
+        console.log(`  ${render.icons.warn} Instance identity: UNVERIFIED (could not read the Instance table via the ops API)`);
       } else {
         const probe = await probeInstanceIdentity({
-          opsUrl: `http://127.0.0.1:${resolveOpsPort(opts)}`,
-          credentials: { user: resolveAdminUser(undefined), pass: identityAdminPass ?? "" },
+          opsUrl: `http://127.0.0.1:${probedRead.opsPort}`,
+          credentials: { user: resolveAdminUser(undefined), pass: probedAdminPass ?? "" },
         });
         if (probe.rows === null) {
           console.log(`  ${render.icons.warn} Instance identity: UNVERIFIED (could not read the Instance table via the ops API)`);
@@ -1366,7 +1526,10 @@ program
           // ✓ "still runs". Check freshness first so a stale pin cannot
           // hide behind the execution probe. Catalog owns the issue count.
           const claudeStale = sessionStartHookPinFindings(resolveHome()).find((f) => f.reading.target.id === "claude-code");
-          if (claudeStale && claudeStale.direction === "unknown") {
+          if (claudeStale?.reading.held) {
+            // flair#2291: a held hook shape (see readOwnedPin).
+            console.log(`  ${render.icons.warn} SessionStart hook: ${claudeStale.reading.held}`);
+          } else if (claudeStale && claudeStale.direction === "unknown") {
             // flair#1778: a pin we cannot compare is its OWN finding — a warn,
             // never the stale "old adapter" error, and NOT re-pinned (the
             // refresh holds an unreadable pin). Needs no --fix.
@@ -1554,7 +1717,10 @@ program
         const hook = codexHook;
         if (hook.present) {
           const codexStale = sessionStartHookPinFindings(resolveHome()).find((f) => f.reading.target.id === "codex");
-          if (codexStale && codexStale.direction === "unknown") {
+          if (codexStale?.reading.held) {
+            // flair#2291: same held rule as Claude Code above.
+            console.log(`  ${render.icons.warn} SessionStart hook (codex): ${codexStale.reading.held}`);
+          } else if (codexStale && codexStale.direction === "unknown") {
             // flair#1778: same direction rule as Claude Code above.
             console.log(`  ${render.icons.warn} SessionStart hook (codex): pin is not a version I can compare: ${codexStale.reading.pin} — not re-pinned; re-run flair init or edit the hook if this is unintended`);
           } else if (codexStale && codexStale.direction === "ahead") {
@@ -1673,6 +1839,15 @@ program
       // Execute the repair directly; it re-derives the plan internally and
       // verifies via assessLaunchdManagement (fail-loud, never a silent pass).
       const repairResult = await repairLaunchdManagement(defaultDataDir(), effectivePort);
+      // flair#2520: only a no-op is certain to leave the instance and the admin
+      // credential as they were. A repair or a failure may have clean-stopped
+      // the direct process and loaded a launchd job, and any outcome but a
+      // no-op may come after the repair wrote the 0600 admin-pass file from
+      // HDB_ADMIN_PASSWORD (flair#1685; a later refusal leaves the file in
+      // place). So the credential and target resolved before the repair no
+      // longer hold: the Agent-roster and Agent-homes checks resolve the
+      // credential again and, when one is available, verify the target again.
+      if (repairResult.kind !== "no-op") servingProcessMayHaveChanged = true;
       switch (repairResult.kind) {
         case "no-op":
           console.log(`  ${render.icons.ok} ${repairResult.detail}`);
@@ -1757,7 +1932,13 @@ program
               runningVersion: effectivePort === port ? instanceVersion : null,
             }) as TreeAssessment,
           repoint: (dry) => cli.repointMainServiceUnit(defaultDataDir(), effectivePort, { dryRun: dry }),
-          restart: () => cli.restartFlair(effectivePort, defaultDataDir()),
+          // flair#2520: set before the restart runs, so a restart that fails
+          // part-way still makes the later checks resolve the credential again
+          // and, when one is available, verify the target again.
+          restart: () => {
+            servingProcessMayHaveChanged = true;
+            return cli.restartFlair(effectivePort, defaultDataDir());
+          },
           rewriteFederation: (dry) => rewriteFederationSchedulerRuntime({ dryRun: dry }),
         },
       );
@@ -1926,6 +2107,97 @@ program
       }
     }
 
+    // 8b. Agent ID rule (flair#2359) — report a stored Agent id outside
+    // the shared agent-ID rule. Read-only: nothing is rewritten.
+    if (harperResponding) {
+      console.log(`\n  ${render.wrap(render.c.bold, "Agent IDs")}`);
+      let roster: Array<{ id?: unknown }> | null = null;
+      let rosterReadAttempted = false;
+      // flair#2483/#2520: read from the verified instance target. That is the
+      // answer resolved above, unless a --fix step since then may have changed
+      // the serving process or written the admin-pass file
+      // (servingProcessMayHaveChanged): the credential is then resolved and the
+      // target verified with it again here, right before these reads, and only
+      // that answer is used. The roster read addresses the verified ops port,
+      // or both the roster and home checks report NOT RUN (counted as an issue)
+      // and no Agent row is read. No admin credential leaves the target null;
+      // the roster read is skipped and named below.
+      const rosterProbe: DoctorProbedTarget = servingProcessMayHaveChanged ? await resolveProbedTarget() : probed;
+      const rosterAdminPass = rosterProbe.adminPass;
+      const rosterNotRun = rosterProbe.read?.kind === "not-run" ? rosterProbe.read : null;
+      const rosterOpsPort = rosterProbe.read?.kind === "run" ? rosterProbe.read.opsPort : null;
+      if (rosterAdminPass && rosterOpsPort !== null) {
+        rosterReadAttempted = true;
+        const auth = Buffer.from(`${resolveAdminUser()}:${rosterAdminPass}`).toString("base64");
+        roster = await readAgentRoster({
+          opsUrl: `http://127.0.0.1:${rosterOpsPort}/`,
+          authHeader: `Basic ${auth}`,
+          timeoutMs: 5000,
+        });
+      }
+      if (rosterNotRun) {
+        // A pair-refused check is not a clean result and not a finding about
+        // another instance: count it, and name why and the remedy. (The Agent
+        // homes no-credential skip below is different: it reads nothing and
+        // counts nothing.)
+        issues++;
+        console.log(`  ${render.icons.warn} Agent IDs: NOT RUN — ${rosterNotRun.reason}`);
+        console.log(`     ${render.wrap(render.c.dim, "Fix:")} ${rosterNotRun.remedy}`);
+      } else if (roster === null) {
+        // A check that could not run is not a clean result: it counts as an
+        // issue, so the summary and exit status never report "No issues found"
+        // for an Agent-ID check that did not happen.
+        issues++;
+        console.log(
+          rosterProbe.credIssue
+            ? `  ${render.icons.warn} Skipped: the admin credential could not be resolved (${rosterProbe.credIssue}), so the agent-id check did not run.`
+            : rosterReadAttempted
+              ? `  ${render.icons.warn} Could not read the stored Agent roster, so the agent-id check did not run.`
+              : `  ${render.icons.warn} Skipped: no admin credentials to read the stored Agent roster, so the agent-id check did not run.`,
+        );
+      } else {
+        const finding = describeAgentIdRuleFinding(roster);
+        if (!finding) {
+          console.log(`  ${render.icons.ok} No stored agent id is outside ${AGENT_ID_RULE}.`);
+        } else {
+          issues++;
+          console.log(`  ${render.icons.warn} ${finding.message}`);
+          console.log(`     ${render.wrap(render.c.dim, "Fix:")} ${finding.fixHint}`);
+        }
+      }
+
+      // 8c. Agent homes (flair#2433) — report every stored Agent row with no
+      // home instance (`originatorInstanceId`) and name the remedy that
+      // back-fills it. Read-only: nothing is rewritten here.
+      console.log(`\n  ${render.wrap(render.c.bold, "Agent homes")}`);
+      if (rosterNotRun) {
+        issues++;
+        console.log(`  ${render.icons.warn} Agent homes: NOT RUN — ${rosterNotRun.reason}`);
+        console.log(`     ${render.wrap(render.c.dim, "Fix:")} ${rosterNotRun.remedy}`);
+      } else if (!rosterAdminPass) {
+        console.log(`  ${render.icons.info} Agent homes check skipped (no admin credential).`);
+      } else {
+        const homeOpsUrl = `http://127.0.0.1:${rosterOpsPort}/`;
+        const homeEndpoint = agentHomeEndpoint(homeOpsUrl, resolveAdminUser(), rosterAdminPass);
+        const homeAuth = `Basic ${Buffer.from(`${resolveAdminUser()}:${rosterAdminPass}`).toString("base64")}`;
+        const homeRows = await readAgentHomeRows({ opsUrl: homeOpsUrl, authHeader: homeAuth, timeoutMs: 5000 });
+        if (homeRows === null) {
+          issues++;
+          console.log(`  ${render.icons.warn} Could not read the stored Agent roster, so the home-instance check did not run.`);
+        } else {
+          const homeIdentity = await resolveTargetInstanceIdentity(homeEndpoint);
+          const homeFinding = describeAgentHomeFinding(homeRows, homeIdentity);
+          if (!homeFinding) {
+            console.log(`  ${render.icons.ok} Every stored agent row names a home instance.`);
+          } else {
+            console.log(`  ${homeFinding.severity === "info" ? render.icons.info : render.icons.warn} ${homeFinding.message}`);
+            if (homeFinding.fixHint) console.log(`     ${render.wrap(render.c.dim, "Fix:")} ${homeFinding.fixHint}`);
+            if (homeFinding.isIssue) issues++;
+          }
+        }
+      }
+    }
+
     // 9. Migration state (flair#695) — pending/in-progress/blocked + last
     // ledger-derived outcome per registered migration, read off the same
     // authenticated /HealthDetail the "Fleet presence" section above
@@ -1945,59 +2217,7 @@ program
     // aggregate skip line. The issue COUNT is unaffected either way — gate
     // findings are counted exactly once, at gate-resolution time (step 7a).
     const healthDetailUrl = requestUrl(baseUrl, "/HealthDetail");
-    async function fetchAndRenderMigrations(headers: Record<string, string>, indent: string): Promise<void> {
-      try {
-        const migRes = await fetch(healthDetailUrl, { headers, signal: AbortSignal.timeout(5000) });
-        if (!migRes.ok) {
-          console.log(`${indent}${render.icons.warn} Could not fetch migration state (HTTP ${migRes.status})`);
-          return;
-        }
-        const detail = (await migRes.json()) as { migrations?: { cyclePhase?: string; lastCycleError?: string | null; migrations?: Array<{ id: string; state: string; rowsDone: number; rowsRemaining: number; reason?: string }> } };
-        const migBlock = detail?.migrations;
-        if (!migBlock || !Array.isArray(migBlock.migrations) || migBlock.migrations.length === 0) {
-          console.log(`${indent}${render.icons.info} No migrations registered on this instance`);
-          return;
-        }
-        if (migBlock.cyclePhase === "pre-hash") {
-          console.log(`${indent}${render.icons.info} Pre-flight integrity check in progress — migrations deferred until it completes`);
-        }
-        // flair#812: the boot trigger sets `scheduled` synchronously at
-        // module load, so `idle` means resources/migration-boot.js never
-        // loaded in the serving process — NO migration will ever run on
-        // this instance, which is precisely the failure that went unnoticed
-        // because a skipped cycle looked identical to a clean one.
-        if (migBlock.cyclePhase === "idle") {
-          console.log(`${indent}${render.icons.error} Migration boot cycle never fired on this instance — no migration will run until this is resolved. Check the instance log for [flair-migrations] and confirm the running build ships dist/resources/migration-boot.js.`);
-          issues++;
-        }
-        // A cycle that reached a terminal phase carrying an error explains
-        // itself here rather than only in the process log — the reason
-        // string names the paths tried and the remedy.
-        if (migBlock.lastCycleError) {
-          console.log(`${indent}${render.icons.error} Last migration cycle did not complete: ${migBlock.lastCycleError}`);
-          issues++;
-        }
-        for (const m of migBlock.migrations) {
-          if (m.state === "completed") {
-            // flair#812: a `reason` on a COMPLETED migration means the
-            // runner short-circuited it from the (hand-editable) state file
-            // rather than verifying the corpus this boot. Print it, so an
-            // unverified claim is never rendered as a verified one.
-            const note = m.reason ? ` ${render.wrap(render.c.dim, `(${m.reason})`)}` : "";
-            console.log(`${indent}${render.icons.ok} ${m.id}: completed${note}`);
-          } else if (m.state === "halted" || m.state === "failed") {
-            console.log(`${indent}${render.icons.error} ${m.id}: ${m.state}${m.reason ? ` — ${m.reason}` : ""}`);
-            issues++;
-          } else if (m.state === "running") {
-            console.log(`${indent}${render.icons.info} ${m.id}: in progress (${m.rowsDone} done, ${m.rowsRemaining} remaining)`);
-          } else {
-            console.log(`${indent}${render.icons.info} ${m.id}: ${m.state}`);
-          }
-        }
-      } catch (err: any) {
-        console.log(`${indent}${render.icons.warn} Migration state check failed: ${err?.message ?? err}`);
-      }
-    }
+
 
     if (harperResponding) {
       console.log(`\n  ${render.wrap(render.c.bold, "Migrations")}`);
@@ -2009,7 +2229,7 @@ program
           renderAgentGateHeader(gate);
           const keyPath = resolveKeyPath(gate.id) ?? join(defaultKeysDir(), `${gate.id}.key`);
           const headers: Record<string, string> = { Authorization: buildEd25519Auth(gate.id, "GET", requestTarget(healthDetailUrl), keyPath) };
-          await fetchAndRenderMigrations(headers, "      ");
+          issues += await fetchAndRenderMigrations(healthDetailUrl, headers, "      ");
         }
         const skipped = agentGates.length - passedGates.length;
         if (skipped > 0) {

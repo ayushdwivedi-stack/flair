@@ -1,7 +1,7 @@
 // ─── flair#2139 S1 — the shared InstructionVersion append helper ─────────────
 //
 import { describe, expect, test, beforeEach } from "bun:test";
-import { mock } from "bun:test";
+import { mock, spyOn } from "bun:test";
 
 type Row = Record<string, any>;
 const store = new Map<string, Row>();
@@ -10,6 +10,7 @@ const locks = new Set<string>();
 let onBlocked: (() => void) | undefined;
 let pausePatch: (() => Promise<void>) | undefined;
 let soulReads = 0;
+let forceCommitChange: Row | undefined;
 let hideHead = false;
 let failNextAppend = false;
 let failNextCommit = false;
@@ -58,9 +59,22 @@ class BaseSoul {
   getId() { return this.id; }
   static async get(id: string, ctx: any) {
     expect(locks.size).toBeGreaterThan(0);
+    if (ctx?.transaction) {
+      // The in-transaction read: this transaction's snapshot.
+      expect(ctx.transaction.open).toBe(1);
+      soulReads++;
+      return (ctx.transaction.souls ?? soulStore).get(id) ?? null;
+    }
+    // The committed confirmation read: an explicit fresh context, no transaction.
+    if (forceCommitChange) return { ...(soulStore.get(id) ?? {}), ...forceCommitChange };
+    return soulStore.get(id) ?? null;
+  }
+  static async *search(query: any, ctx: any): AsyncGenerator<Row> {
+    expect(locks.size).toBeGreaterThan(0);
     expect(ctx?.transaction?.open).toBe(1);
-    soulReads++;
-    return (ctx?.transaction?.souls ?? soulStore).get(id) ?? null;
+    for (const row of (ctx.transaction.souls as Map<string, Row>).values()) {
+      if (query.conditions.every((c: any) => row[c.attribute] === c.value)) yield row;
+    }
   }
   async get(id = this.id) { return BaseSoul.get(id!, this.ctx); }
   async post(content: Row) { this.ctx.transaction.souls.set(content.id, { ...content }); return content; }
@@ -71,15 +85,21 @@ class BaseSoul {
     if (pausePatch) await pausePatch();
     return rows.get(this.id);
   }
+  static async put(row: Row, ctx: any): Promise<void> {
+    const rows = ctx?.transaction?.souls ?? soulStore;
+    rows.set(row.id, { ...row });
+    if (pausePatch) await pausePatch();
+  }
   async delete(target?: any) {
     if (target?.isCollection) this.ctx.transaction.souls.clear();
     else this.ctx.transaction.souls.delete(this.id);
   }
 }
 const empty = { async *search() {} };
+const flairTables = { InstructionVersion: InstructionVersionTable, Soul: BaseSoul as any, Memory: empty, MemoryCandidate: empty, Instance: empty };
 mock.module("harper", () => ({
   Resource: class {}, server: { http() {} },
-  databases: { flair: { InstructionVersion: InstructionVersionTable, Soul: BaseSoul, Memory: empty, MemoryCandidate: empty, Instance: empty } },
+  databases: { flair: flairTables },
 }));
 
 function mockTransaction(ctx: any, cb: (txn: any) => any): any {
@@ -132,12 +152,14 @@ function input(overrides: Row = {}): any {
 }
 
 beforeEach(() => {
+  flairTables.Soul = BaseSoul;
   store.clear();
   soulStore.clear();
   locks.clear();
   pausePatch = undefined;
   onBlocked = undefined;
   soulReads = 0;
+  forceCommitChange = undefined;
   hideHead = false;
   failNextAppend = false;
   failNextCommit = false;
@@ -403,11 +425,17 @@ describe("Soul resource version snapshots", () => {
       expect(version.createdAt).not.toBe(NOW);
       expect(Date.parse(version.createdAt)).toBeGreaterThanOrEqual(before);
       expect(Date.parse(version.createdAt)).toBeLessThanOrEqual(Date.now());
-      await new Promise((resolve) => setTimeout(resolve, 2));
+      // The resource stamps each version from the wall clock and accepts no injected
+      // clock, so two writes can share a millisecond. Advance the clock past this
+      // version's time before the next write.
+      const writtenMs = Date.parse(version.createdAt);
+      for (let i = 0; i < 100 && Date.now() <= writtenMs; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
     }
     const versions = [...store.values()];
     expect(Date.parse(versions[1].createdAt)).toBeGreaterThan(Date.parse(versions[0].createdAt));
-  });
+  }, 3000);
 
   test("PATCH strips client server fields before snapshotting the stored row", async () => {
     const id = "agent-a:role";
@@ -451,6 +479,65 @@ describe("Soul resource version snapshots", () => {
     expect(JSON.parse(versions[1].soulSnapshot).originatorInstanceId).toBeUndefined();
   }, 3000);
 
+  for (const missing of ["get", "put", "table"]) {
+    test(`a Soul PATCH without the static ${missing} capability is refused before writing`, async () => {
+      const id = "agent-a:role";
+      const stored = { id, agentId: "agent-a", key: "role", value: "before", createdAt: NOW };
+      soulStore.set(id, stored);
+      const staticWrite = spyOn(BaseSoul, "put");
+      const resourceWrite = spyOn(BaseSoul.prototype, "put");
+      flairTables.Soul = missing === "table" ? null : {
+        get: missing === "get" ? undefined : BaseSoul.get,
+        put: missing === "put" ? undefined : BaseSoul.put,
+      };
+      try {
+        const result = await soul(id).patch({ value: "after" });
+        expect(result).toBeInstanceOf(Response);
+        expect(result.status).toBe(503);
+        expect(await result.json()).toEqual({ error: "soul_patch_table_unavailable" });
+        expect(staticWrite).not.toHaveBeenCalled();
+        expect(resourceWrite).not.toHaveBeenCalled();
+        expect(soulStore.get(id)).toEqual(stored);
+        expect(store.size).toBe(0);
+      } finally {
+        flairTables.Soul = BaseSoul;
+        staticWrite.mockRestore();
+        resourceWrite.mockRestore();
+      }
+    });
+  }
+
+  test("a Soul PATCH whose committed row keeps changing exhausts its attempts with a named conflict", async () => {
+    const id = "agent-a:role";
+    const stored = { id, agentId: "agent-a", key: "role", value: "before", durability: "permanent", createdAt: NOW };
+    soulStore.set(id, stored);
+    // Every confirmation read sees a committed row that differs from the
+    // attempt's read, so the PATCH never confirms and runs out of attempts.
+    forceCommitChange = { updatedAt: "2026-01-01T00:00:00.000Z" };
+    const result = await soul(id).patch({ value: "after" });
+    expect(result instanceof Response).toBe(true);
+    expect(result.status).toBe(409);
+    expect(await result.clone().json()).toEqual({ error: "soul_patch_conflict" });
+    // Every attempt aborted: the row and the history are unchanged.
+    expect(soulStore.get(id)).toEqual(stored);
+    expect(store.size).toBe(0);
+  }, 3000);
+
+  test("a Soul PATCH whose committed row is replaced by a different subject is refused", async () => {
+    const id = "agent-a:role";
+    const stored = { id, agentId: "agent-a", key: "role", value: "before", createdAt: NOW };
+    soulStore.set(id, stored);
+    // The committed row now belongs to a different subject (agentId + key).
+    forceCommitChange = { agentId: "agent-b", key: "role", value: "replaced" };
+    const result = await soul(id).patch({ value: "after" });
+    expect(result instanceof Response).toBe(true);
+    expect(result.status).toBe(409);
+    expect(await result.clone().json()).toEqual({ error: "soul_patch_row_changed" });
+    // The PATCH wrote nothing: the stored row and the history are unchanged.
+    expect(soulStore.get(id)).toEqual(stored);
+    expect(store.size).toBe(0);
+  }, 3000);
+
   test("snapshot serialization failure aborts the staged Soul write and append", async () => {
     soulStore.set("row", { value: "before" });
     const res = await recordVersion(context(), input({ snapshot: () => { throw new Error("snapshot unavailable"); } }), async (shared) => {
@@ -475,5 +562,121 @@ describe("Soul resource version snapshots", () => {
       expect(soulStore.get(id)).toEqual(before);
       expect([...store.values()]).toEqual([occupied]);
     }
+  });
+
+  test("an agentId-only PUT to an unoccupied destination closes the old window", async () => {
+    const id = "agent-a:role";
+    soulStore.set(id, { id, agentId: "agent-a", key: "role", value: "before", createdAt: NOW });
+    const result = await soul(id).put({ agentId: "agent-b", key: "role", value: "after" });
+    expect(result instanceof Response).toBe(false);
+    const oldVersions = [...store.values()].filter((v) => v.subjectId === "agent-a:role");
+    const newVersions = [...store.values()].filter((v) => v.subjectId === "agent-b:role");
+    expect(oldVersions.map((v) => v.kind)).toEqual(["delete"]);
+    expect(oldVersions[0].agentId).toBe("agent-a");
+    expect(newVersions.map((v) => v.kind)).toEqual(["update"]);
+    expect(newVersions[0].agentId).toBe("agent-b");
+    expect(newVersions[0].previousVersionHash).toBeNull();
+  });
+
+  test("an agentId-only PATCH to an unoccupied destination closes the old window", async () => {
+    const id = "agent-a:role";
+    soulStore.set(id, { id, agentId: "agent-a", key: "role", value: "before", createdAt: NOW });
+    const result = await soul(id).patch({ agentId: "agent-b" });
+    expect(result instanceof Response).toBe(false);
+    const oldVersions = [...store.values()].filter((v) => v.subjectId === "agent-a:role");
+    const newVersions = [...store.values()].filter((v) => v.subjectId === "agent-b:role");
+    expect(oldVersions.map((v) => v.kind)).toEqual(["delete"]);
+    expect(newVersions.map((v) => v.kind)).toEqual(["update"]);
+    expect(newVersions[0].agentId).toBe("agent-b");
+  });
+
+  for (const method of ["put", "patch"] as const) {
+    test(`${method} closes the old window for colon-colliding identity pairs`, async () => {
+      const id = "physical";
+      await soul(id).post({ id, agentId: "a", key: "b:c", value: "before" });
+      const created = [...store.values()][0];
+      const result = await soul(id)[method]({ agentId: "a:b", key: "c", value: "after" });
+      expect(result instanceof Response).toBe(false);
+      const oldVersions = [...store.values()].filter((v) => v.agentId === "a" && v.key === "b:c");
+      const newVersions = [...store.values()].filter((v) => v.agentId === "a:b" && v.key === "c");
+      expect(oldVersions.map((v) => v.kind)).toEqual(["create", "delete"]);
+      expect(oldVersions[1].previousVersionHash).toBe(created.recordHash);
+      expect(newVersions.map((v) => v.kind)).toEqual(["update"]);
+      expect(newVersions[0].previousVersionHash).toBeNull();
+      expect(newVersions[0].subjectId).not.toBe(oldVersions[0].subjectId);
+      expect(soulStore.get(id)?.agentId).toBe("a:b");
+    });
+
+    test(`${method} refuses an occupied destination without changing either row or history`, async () => {
+      for (const field of ["agentId", "key"] as const) {
+        store.clear(); soulStore.clear();
+        const destination = field === "agentId" ? { agentId: "b", key: "role" } : { agentId: "a", key: "other" };
+        await soul("source").post({ id: "source", agentId: "a", key: "role", value: "before" });
+        await soul("destination").post({ id: "destination", ...destination, value: "occupied" });
+        const rows = structuredClone([...soulStore.values()]);
+        const versions = structuredClone([...store.values()]);
+        const result = await soul("source")[method]({ ...destination, value: "after" });
+        expect(result.status).toBe(409);
+        expect(await result.json()).toEqual({ error: "soul_subject_occupied" });
+        expect([...soulStore.values()]).toEqual(rows);
+        expect([...store.values()]).toEqual(versions);
+      }
+    });
+  }
+
+  test("the previous pair closes even when supplied subject strings match", async () => {
+    await soul("source").post({ id: "source", agentId: "a", key: "b:c", value: "before" });
+    const nextSubject = soulSubjectId("a:b", "c");
+    const result = await recordVersion(context(), input({
+      subjectId: nextSubject, agentId: "a:b", key: "c", kind: "update", rowId: "source",
+      previousSubjectId: nextSubject, previousAgentId: "a", previousKey: "b:c", previousRowId: "source",
+    }), async () => okRow());
+    expect(result.ok).toBe(true);
+    expect([...store.values()].filter((v) => v.agentId === "a").map((v) => v.kind)).toEqual(["create", "delete"]);
+  });
+
+  test("legacy colon history continues by pair without taking a colliding pair's head", async () => {
+    const subjectId = "a:b:c";
+    const legacy = { id: `soul:${subjectId}:1`, subjectType: "soul", subjectId, agentId: "a", key: "b:c", version: 1n, kind: "create", recordHash: "legacy" };
+    store.set(legacy.id, legacy);
+    store.set(`soul:${subjectId}:2`, { ...legacy, id: `soul:${subjectId}:2`, agentId: "a:b", key: "c", version: 2n, recordHash: "other-pair" });
+    soulStore.set("source", { id: "source", agentId: "a", key: "b:c", value: "before" });
+    const result = await soul("source").patch({ value: "after" });
+    expect(result instanceof Response).toBe(false);
+    const latest = [...store.values()].at(-1)!;
+    expect(latest.subjectId).toBe(soulSubjectId("a", "b:c"));
+    expect(latest.previousVersionHash).toBe("legacy");
+    expect(latest.version).toBe(2n);
+    expect(store.get(legacy.id)).toEqual(legacy);
+  });
+
+  test("a legacy version ID collision rolls back instead of merging pairs", async () => {
+    const subjectId = soulSubjectId("a", "b:c");
+    const legacy = { id: versionId("soul", subjectId, 1n), subjectType: "soul", subjectId,
+      agentId: "", key: '["a","b:c"]', version: 1n, kind: "create", recordHash: "other-pair" };
+    store.set(legacy.id, legacy);
+    const before = { id: "source", agentId: "a", key: "b:c", value: "before" };
+    soulStore.set(before.id, before);
+    const result = await soul(before.id).patch({ value: "after" });
+    expect(result.status).toBe(500);
+    expect(soulStore.get(before.id)).toEqual(before);
+    expect([...store.values()]).toEqual([legacy]);
+  });
+
+  test("new Soul subject IDs distinguish colon pairs and the encoded namespace", () => {
+    expect(soulSubjectId("a", "b:c")).not.toBe(soulSubjectId("a:b", "c"));
+    expect(soulSubjectId("", '["a","b:c"]')).not.toBe(soulSubjectId("a", "b:c"));
+  });
+
+  test("an identity no-op update continues the same window and opens no new one", async () => {
+    const id = "agent-a:role";
+    soulStore.set(id, { id, agentId: "agent-a", key: "role", value: "before", createdAt: NOW });
+    expect((await soul(id).put({ agentId: "agent-a", key: "role", value: "v1" })) instanceof Response).toBe(false);
+    expect((await soul(id).patch({ value: "v2" })) instanceof Response).toBe(false);
+    const versions = [...store.values()];
+    expect(new Set(versions.map((v) => v.subjectId))).toEqual(new Set(["agent-a:role"]));
+    expect(versions.map((v) => v.kind)).toEqual(["update", "update"]);
+    expect(versions.some((v) => v.kind === "delete")).toBe(false);
+    expect(versions.map((v) => Number(v.version))).toEqual([1, 2]);
   });
 });

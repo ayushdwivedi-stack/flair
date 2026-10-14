@@ -150,9 +150,19 @@ export const HARPER_SYSTEM_DB_REL = join("database", "system");
 export const HDB_USER_PRIMARY_CF = "hdb_user/";
 
 /**
- * Count the rows in the `hdb_user/` primary store of a Harper 5 system
+ * Match `hdb_user/` or the `hdb_user/@` prefix.
+ */
+export function isHdbUserPrimaryColumn(column: string): boolean {
+  return column === HDB_USER_PRIMARY_CF || column.startsWith(`${HDB_USER_PRIMARY_CF}@`);
+}
+
+/**
+ * Count the rows in the `hdb_user` primary store of a Harper 5 system
  * database, opened READ-ONLY (RocksDB read-only needs no lock, so this works
  * while the instance is running, and writes nothing).
+ *
+ * Both physical layouts are accepted (see `isHdbUserPrimaryColumn`); every
+ * matching family is counted.
  *
  * `@harperfast/rocksdb-js` is resolved through the installed `harper`
  * package: flair does not depend on it directly, and the reader must be the
@@ -174,26 +184,30 @@ export function countRocksAdminUsers(systemDbDir: string): number {
     };
   };
   const probe = RocksDatabase.open(systemDbDir, { readOnly: true });
-  let hasUserStore: boolean;
+  let userStores: string[];
   try {
     if (!Array.isArray(probe.columns) || !probe.columns.every(column => typeof column === "string")) {
       throw new Error(`Invalid RocksDB columns metadata at ${systemDbDir}`);
     }
-    hasUserStore = probe.columns.includes(HDB_USER_PRIMARY_CF);
+    userStores = probe.columns.filter(isHdbUserPrimaryColumn);
   } finally {
     probe.close?.();
   }
-  if (!hasUserStore) {
+  if (userStores.length === 0) {
     throw new Error(
       `MISSING_HDB_USER_COLUMN: existing system store at ${systemDbDir} lacks ${HDB_USER_PRIMARY_CF}. Repair the system store or select the correct --data-dir.`,
     );
   }
-  const users = RocksDatabase.open(systemDbDir, { name: HDB_USER_PRIMARY_CF, readOnly: true });
-  try {
-    return users.getKeysCount();
-  } finally {
-    users.close?.();
+  let total = 0;
+  for (const name of userStores) {
+    const users = RocksDatabase.open(systemDbDir, { name, readOnly: true });
+    try {
+      total += users.getKeysCount();
+    } finally {
+      users.close?.();
+    }
   }
+  return total;
 }
 
 /** A populated user store is evidence that the install is not fresh. */
@@ -222,6 +236,7 @@ export function initAdminPassRefusalMessage(
   opts: {
     dataDir?: string;
     httpPort?: number;
+    pid?: number;
     adminPassPath?: string;
     socketPath?: string;
     /**
@@ -235,8 +250,9 @@ export function initAdminPassRefusalMessage(
 ): string {
   if (reason === "foreign-instance") {
     const port = opts.httpPort ?? 19926;
+    const pid = opts.pid === undefined ? "" : `, pid ${opts.pid}`;
     const head =
-      `A Harper instance is already answering on port ${port} and this data directory has no persisted admin user.`;
+      `Refusing init: port ${port}${pid}: persisted admin user was not detected in this data directory.`;
     if (opts.offerFlairStop === false) return head;
     return (
       `${head} Stop that process before initializing a new instance:\n  ${INIT_STOP_FOREIGN_COMMAND}`

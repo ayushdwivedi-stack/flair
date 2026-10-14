@@ -20,7 +20,7 @@
  */
 import { Command } from "commander";
 import nacl from "tweetnacl";
-import { existsSync, mkdirSync, writeFileSync, readFileSync, chmodSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, readFileSync, chmodSync, unlinkSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import * as render from "../render.js";
 import {
@@ -33,6 +33,14 @@ import {
 } from "../lib/auth-resolve.js";
 import { encodeRecordId } from "../lib/record-id-path.js";
 import { resolveLocalDeleteInstance } from "../lib/local-delete-instance.js";
+import { invalidAgentIdMessage, isValidAgentId } from "../lib/agent-id-rule.js";
+import {
+  agentHomeEndpoint,
+  resolveTargetInstanceId,
+  runAgentHomeStamp,
+  stampLeftoverLines,
+} from "../lib/agent-home.js";
+import { confirmedPurgeIds } from "../lib/memory-purge-response.js";
 
 export type AgentCli = {
   api: (method: string, path: string, body?: any, options?: any) => Promise<any>;
@@ -47,8 +55,16 @@ export type AgentCli = {
   ) => boolean;
   resolveHttpPort: (opts: { port?: string | number; dataDir?: string }, mode?: "address" | "create") => number;
   resolveOpsPort: (opts: { opsPort?: string | number; port?: string | number }) => number;
+  resolveAgentHomeTarget: (opts: { port?: string | number; opsPort?: string | number; dataDir?: string }) => { httpPort: number; opsPort: number };
   resolveEffectiveOpsUrl: (opts: { target?: string; opsTarget?: string }) => string | undefined;
   seedAgentViaOpsApi: (
+    opsPortOrUrl: number | string,
+    agentId: string,
+    pubKeyB64url: string,
+    adminUser: string,
+    adminPass?: string,
+  ) => Promise<void>;
+  seedAgentWithLocalHome: (
     opsPortOrUrl: number | string,
     agentId: string,
     pubKeyB64url: string,
@@ -70,6 +86,32 @@ const api = (method: string, path: string, body?: any, options?: any): Promise<a
 const b64url = (bytes: Uint8Array): string => cli.b64url(bytes);
 const privKeyPath = (agentId: string, keysDir: string): string => cli.privKeyPath(agentId, keysDir);
 const pubKeyPath = (agentId: string, keysDir: string): string => cli.pubKeyPath(agentId, keysDir);
+
+/**
+ * flair#2479 — check each key's canonical target before unlinking.
+ * Return successful unlinks; invalid ids require manual cleanup.
+ */
+export function removeAgentKeyFiles(agentId: string, keysDir: string): { removed: string[]; manual: boolean } {
+  if (!isValidAgentId(agentId)) return { removed: [], manual: true };
+  let root: string;
+  try {
+    root = realpathSync(keysDir);
+  } catch {
+    return { removed: [], manual: false }; // directory resolution failed
+  }
+  const removed: string[] = [];
+  for (const name of [`${agentId}.key`, `${agentId}.pub`, `${agentId}.key.bak`]) {
+    let real: string;
+    try {
+      real = realpathSync(join(keysDir, name));
+    } catch {
+      continue; // candidate resolution failed
+    }
+    if (real !== join(root, name)) continue; // unexpected canonical target; skip
+    try { unlinkSync(real); removed.push(real); } catch { /* best effort */ }
+  }
+  return { removed, manual: false };
+}
 const shouldShowInlineSecretWarning = (
   optValue: string | undefined,
   fromEnv: boolean,
@@ -80,15 +122,18 @@ const resolveHttpPort = (opts: { port?: string | number; dataDir?: string }, mod
   cli.resolveHttpPort(opts, mode);
 const resolveOpsPort = (opts: { opsPort?: string | number; port?: string | number }): number =>
   cli.resolveOpsPort(opts);
+const resolveAgentHomeTarget = (opts: { port?: string | number; opsPort?: string | number; dataDir?: string }): { httpPort: number; opsPort: number } =>
+  cli.resolveAgentHomeTarget(opts);
 const resolveEffectiveOpsUrl = (opts: { target?: string; opsTarget?: string }): string | undefined =>
   cli.resolveEffectiveOpsUrl(opts);
-const seedAgentViaOpsApi = (
+const seedAgentWithLocalHome = (
   opsPortOrUrl: number | string,
   agentId: string,
   pubKeyB64url: string,
   adminUser: string,
   adminPass?: string,
-): Promise<void> => cli.seedAgentViaOpsApi(opsPortOrUrl, agentId, pubKeyB64url, adminUser, adminPass);
+): Promise<void> =>
+  cli.seedAgentWithLocalHome(opsPortOrUrl, agentId, pubKeyB64url, adminUser, adminPass);
 const agentRecordIsAdmin = (record: any): boolean => cli.agentRecordIsAdmin(record);
 
 const INLINE_ADMIN_PASS_WARNING =
@@ -275,6 +320,12 @@ export function register(program: Command): void {
     .option("--target <url>", "Remote Flair REST URL; derives ops URL (HTTPS no port/:443 → Fabric ops :9925; HTTP no port/:80 → :19925; other ports 2–65535 → port-1; port 1 refused; env: FLAIR_TARGET)")
     .option("--ops-target <url>", "Explicit ops API URL to seed the Agent on (env: FLAIR_OPS_TARGET; bypasses port derivation)")
     .action(async (id: string, opts) => {
+      // flair#2359 — the ONE agent-ID rule, before any key file is written or
+      // any insert is attempted. Refuse a non-matching id by name.
+      if (!isValidAgentId(id)) {
+        console.error(`Error: ${invalidAgentIdMessage(id)}`);
+        process.exit(1);
+      }
       const httpPort = resolveHttpPort(opts);
       const opsPort = resolveOpsPort(opts);
       const keysDir: string = opts.keysDir ?? defaultKeysDir();
@@ -369,7 +420,7 @@ export function register(program: Command): void {
         console.log(`Keypair written: ${privPath}`);
       }
 
-      await seedAgentViaOpsApi(seedOpsTarget, id, pubKeyB64url, adminUser, adminPass);
+      await seedAgentWithLocalHome(seedOpsTarget, id, pubKeyB64url, adminUser, adminPass);
       const stored = await readStoredAgent(seedOpsTarget, id, adminUser, adminPass);
       if (!stored || stored.publicKey !== pubKeyB64url) {
         console.error(agentKeyNotStoredMessage(id, stored));
@@ -652,9 +703,39 @@ export function register(program: Command): void {
       const agentData = agentRes.ok ? await agentRes.json().catch(() => null) : null;
       const agentName = agentData?.[0]?.name ?? id;
 
-      const memRes = await opsPost({ operation: "search_by_value", database: "flair", table: "Memory", search_attribute: "agentId", search_value: id, get_attributes: ["id"] });
-      const memories = memRes.ok ? await memRes.json().catch(() => []) : [];
-      const memoryCount = Array.isArray(memories) ? memories.length : 0;
+      async function scanOwnedIds(table: "Memory" | "Soul"): Promise<string[]> {
+        const res = await opsPost({
+          operation: "search_by_conditions", database: "flair", table, operator: "and",
+          conditions: [{ search_attribute: "agentId", search_type: "equals", search_value: id }],
+          get_attributes: ["id", "agentId"],
+        });
+        if (!res.ok) throw new Error(`operations API returned ${res.status}`);
+        const rows: unknown = await res.json();
+        if (!Array.isArray(rows) || !rows.every((row: any) => typeof row?.id === "string" && row.id.length > 0)) {
+          throw new Error("returned an unexpected response");
+        }
+        for (const row of rows) {
+          if (row.agentId !== id) {
+            const error = new Error(`${table} row '${row.id}' does not belong to agent '${id}'`);
+            error.name = "AgentRemoveOwnerMismatchError";
+            throw error;
+          }
+        }
+        return rows.map((row: { id: string }) => row.id);
+      }
+
+      async function initialScan(table: "Memory" | "Soul"): Promise<string[]> {
+        try {
+          return await scanOwnedIds(table);
+        } catch (error) {
+          const failure = new Error(`The ${table} scan for agent '${id}' failed: ${error instanceof Error ? error.message : String(error)}; nothing was removed.`, { cause: error });
+          if (error instanceof Error) failure.name = error.name;
+          throw failure;
+        }
+      }
+      const memoryIds = await initialScan("Memory");
+      const memoryCount = memoryIds.length;
+      const soulIds = await initialScan("Soul");
 
       // Confirmation
       const isInteractive = process.stdin.isTTY;
@@ -683,27 +764,51 @@ export function register(program: Command): void {
         console.log(`Removing agent '${agentName}' (${id}) with ${memoryCount} memories...`);
       }
 
-      // Delete all memories
+      // Delete the scanned memories through the server's physical-removal
+      // path. A skill-tagged row expands to its whole lineage there, so
+      // superseded version rows go too. An accepted DELETE of a non-reserved
+      // skill closes its head; the reserved `using-flair` seed is physically
+      // deleted. A response that does not list every scanned id as
+      // removed stops the command before the Agent record is deleted.
       if (memoryCount > 0) {
         console.log(`Deleting ${memoryCount} memories...`);
-        for (const mem of (Array.isArray(memories) ? memories : [])) {
-          if (!mem?.id) continue;
-          await api("DELETE", `/Memory/${encodeRecordId(mem.id)}`, undefined, {
-            baseUrl: instance.baseUrl,
-            explicitAdminPass: adminPass, adminUser, agentId: null,
-          });
-        }
+        const purge = await api("POST", "/MemoryPurge", { ids: memoryIds }, {
+          baseUrl: instance.baseUrl,
+          explicitAdminPass: adminPass, adminUser, agentId: null,
+        });
+        confirmedPurgeIds(purge, memoryIds);
       }
 
-      // Delete all souls
-      const soulRes = await opsPost({ operation: "search_by_value", database: "flair", table: "Soul", search_attribute: "agentId", search_value: id, get_attributes: ["id"] });
-      const souls = soulRes.ok ? await soulRes.json().catch(() => []) : [];
-      if (Array.isArray(souls) && souls.length > 0) {
-        console.log(`Deleting ${souls.length} soul entries...`);
-        for (const soul of souls) {
-          if (!soul?.id) continue;
-          await opsPost({ operation: "delete", database: "flair", table: "Soul", ids: [soul.id] }).catch(() => {});
+      if (soulIds.length > 0) {
+        console.log(`Deleting ${soulIds.length} soul entries...`);
+        for (const soulId of soulIds) {
+          try {
+            const soulDel = await opsPost({ operation: "delete", database: "flair", table: "Soul", ids: [soulId] });
+            if (!soulDel.ok) {
+              const text = await soulDel.text().catch(() => "");
+              throw new Error(`operations API returned ${soulDel.status}: ${text}`);
+            }
+          } catch (error) {
+            throw new Error(`Failed to delete Soul '${soulId}': ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+          }
         }
+      }
+      let remainingIds: string[];
+      try {
+        remainingIds = await scanOwnedIds("Soul");
+      } catch (error) {
+        const failure = new Error(
+          `The Soul deletion for agent '${id}' could not be confirmed: ${error instanceof Error ? error.message : String(error)}; ` +
+          `these scanned Soul rows may remain and the Agent record was not deleted: ${soulIds.join(", ") || "(none scanned)"}.`,
+          { cause: error },
+        );
+        if (error instanceof Error) failure.name = error.name;
+        throw failure;
+      }
+      if (remainingIds.length > 0) {
+        throw new Error(
+          `The Soul deletion for agent '${id}' was not confirmed; these Soul rows remain and the Agent record was not deleted: ${remainingIds.join(", ")}.`,
+        );
       }
 
       // Delete agent record
@@ -715,19 +820,111 @@ export function register(program: Command): void {
 
       // Delete key files (unless --keep-keys)
       if (!opts.keepKeys) {
-        const privPath = privKeyPath(id, keysDir);
-        const pubPath = pubKeyPath(id, keysDir);
-        const backupPath = privPath + ".bak";
-        for (const p of [privPath, pubPath, backupPath]) {
-          if (existsSync(p)) {
-            try { const { unlinkSync: ul } = await import("node:fs"); ul(p); } catch { /* best effort */ }
-          }
-        }
-        console.log("Key files deleted.");
+        const keys = removeAgentKeyFiles(id, keysDir);
+        console.log(
+          keys.manual
+            ? `Key files for '${id}' are not deleted by this command (the id is outside the agent-ID rule); clean them up manually.`
+            : `Removed ${keys.removed.length} key file(s).`,
+        );
       } else {
         console.log("Key files preserved (--keep-keys).");
       }
 
       console.log(`\n✅ Agent '${id}' removed successfully`);
+    });
+
+  agent
+    .command("stamp-home")
+    .description("Back-fill the home instance (originatorInstanceId) on home-less Agent rows with no federation-sync provenance")
+    .option("--port <port>", "Harper HTTP port")
+    .option("--ops-port <port>", "Harper operations API port")
+    .option("--admin-pass <pass>", "Admin password (or set FLAIR_ADMIN_PASS)")
+    .option("--admin-pass-file <path>", "Read the admin password from a file (chmod 600 enforced)")
+    .option("--admin-user <name>", "Admin username for Basic auth (env: FLAIR_ADMIN_USER; default: admin)")
+    .option("--apply", "Write the home; without it the command is a dry run and writes nothing")
+    .action(async (opts) => {
+      let target: { httpPort: number; opsPort: number };
+      try {
+        // flair#2474 — pair the ops port (the roster read) with the HTTP port (the
+        // guarded PATCH). A target the configured pair contradicts, or one with a
+        // single port named and no complete configured pair, is refused by name
+        // (see resolveAgentHomeTarget).
+        target = resolveAgentHomeTarget(opts);
+      } catch (err: any) {
+        console.error(`Error: ${err.message}`);
+        process.exit(1);
+      }
+      const opsPort = target.opsPort;
+      const adminUser = resolveAdminUser(opts.adminUser);
+      let explicitPass: string | undefined;
+      try {
+        explicitPass =
+          resolveAdminPassFromSources({
+            adminPassFile: opts.adminPassFile,
+            adminPass: opts.adminPass,
+            envPass: undefined,
+          }) || undefined;
+      } catch (err: any) {
+        console.error(`Error: ${err.message}`);
+        process.exit(1);
+      }
+      let adminPass: string | undefined;
+      try {
+        adminPass = resolveLocalAdminPass(explicitPass);
+      } catch (err: any) {
+        console.error(`Error: ${err.message}`);
+        process.exit(1);
+      }
+      if (!adminPass) {
+        console.error(
+          "Error: --admin-pass or FLAIR_ADMIN_PASS required (or ensure ~/.flair/admin-pass exists, created by `flair init`)",
+        );
+        process.exit(1);
+      }
+      const opsUrl = `http://127.0.0.1:${opsPort}/`;
+      const httpUrl = `http://127.0.0.1:${target.httpPort}/`;
+      const auth = `Basic ${Buffer.from(`${adminUser}:${adminPass}`).toString("base64")}`;
+
+      const localInstanceId = await resolveTargetInstanceId(agentHomeEndpoint(opsUrl, adminUser, adminPass));
+      const result = await runAgentHomeStamp({
+        opsUrl,
+        httpUrl,
+        authHeader: auth,
+        localInstanceId,
+        apply: Boolean(opts.apply),
+      });
+      if (result.reason === "roster-unreadable") {
+        console.error("Error: could not read the stored Agent roster; nothing was changed.");
+        process.exit(1);
+      }
+      const plan = result.plan;
+      if (plan.homeLess.length === 0) {
+        console.log(`${render.icons.ok} Every stored agent row names a home instance.`);
+        return;
+      }
+      console.log(
+        `${plan.homeLess.length} agent row(s) have no home instance` +
+          (localInstanceId ? ` (this instance is ${localInstanceId})` : ""),
+      );
+      for (const id of plan.homeLess) {
+        const inSync = plan.sync.includes(id);
+        console.log(`     ${inSync ? "list only (sync-originated):" : "stamp:"} ${id}`);
+      }
+      if (result.reason === "no-canonical-id") {
+        console.error(
+          "Error: could not confirm a single canonical Instance row to stamp as the home; nothing was written.",
+        );
+        process.exitCode = 1;
+        return;
+      }
+      if (!opts.apply) {
+        console.log(
+          `Dry run — nothing written. Re-run with --apply to stamp ${plan.stampable.length} row(s); ` +
+            `${plan.sync.length} sync-originated row(s) are never stamped.`,
+        );
+        return;
+      }
+      for (const line of stampLeftoverLines(result)) console.log(line);
+      console.log(`${render.icons.ok} Stamped the home instance on ${result.stamped.length} row(s).`);
     });
 }

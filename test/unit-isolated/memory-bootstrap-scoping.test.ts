@@ -78,6 +78,10 @@ let failSkillRowRead: false | "call" | "iterate" = false;
 let memoryGrants: any[];
 let soulStore: Map<string, any> = new Map();
 let orgEventStore: any[] = [];
+// flair#2448 item 3 — the MemoryHostSource pointer rows the gated bootstrap join
+// reads. Empty in every pre-#2448 test, so loadPointerRows finds no row (the
+// same result as the table being absent) and no other test's bytes change.
+let pointerStore: Map<string, any> = new Map();
 // flair#2141 S1 — Agent records by id (the org-skill eligibility read) and the
 // OrgSkillAssignment rows; `failOrgRead` makes the org-assignment read throw.
 let agentStore: Map<string, any> = new Map();
@@ -102,7 +106,7 @@ function memorySearchGen(query: any) {
   return gen();
 }
 
-function emptyGen() {
+function emptyGen(): AsyncGenerator<any, void, unknown> {
   async function* gen() {}
   return gen();
 }
@@ -160,6 +164,21 @@ const databasesMock = {
       },
     },
     Relationship: { search: () => emptyGen() },
+    // flair#2448 item 3 — the pointer table the gated bootstrap join reads. Only
+    // `search` is reached (loadPointerRows); a row is matched by `memoryId` for
+    // both the single-id equals query and the set `or` query.
+    MemoryHostSource: {
+      search: (query: any) => {
+        const conditions = Array.isArray(query?.conditions) ? query.conditions : [];
+        const wanted = conditions.filter((c: any) => c?.attribute === "memoryId").map((c: any) => c.value);
+        async function* gen() {
+          for (const row of pointerStore.values()) {
+            if (wanted.length === 0 || wanted.includes(row.memoryId)) yield row;
+          }
+        }
+        return gen();
+      },
+    },
     OrgEvent: {
       search: (query?: any) => {
         const cond = query?.conditions?.find((c: any) => c.attribute === "createdAt");
@@ -186,7 +205,7 @@ class ResourceBase {}
 
 mock.module("harper", () => ({ databases: databasesMock, Resource: ResourceBase }));
 
-const { BootstrapMemories } = await import("../../resources/MemoryBootstrap.ts");
+const { BootstrapMemories, formatMemory } = await import("../../resources/MemoryBootstrap.ts");
 const { _resetLocalInstanceIdCacheForTests } = await import("../../resources/instance-identity.ts");
 const { estimateTokens } = await import("../../resources/token-estimate.ts");
 
@@ -203,6 +222,7 @@ function reset() {
   memoryGrants = [];
   soulStore = new Map();
   orgEventStore = [];
+  pointerStore = new Map();
   agentStore = new Map();
   orgSkillStore = [];
   failOrgRead = false;
@@ -1388,5 +1408,168 @@ describe("MemoryBootstrap.post() — org-scope skills (flair#2141 S1)", () => {
     agentStore.set("agent-a", { id: "agent-a" });
     failOrgRead = true;
     await expect(makeBootstrap(agentCtx("agent-a")).post({ agentId: "agent-a" })).rejects.toThrow("org assignment read failed");
+  });
+});
+
+describe("MemoryBootstrap.post() directory hint", () => {
+  for (const roster of [true, false]) {
+    for (const includeContext of [true, false]) {
+      for (const includeSoul of [true, false]) {
+        it(`ships the hint with roster=${roster}, context=${includeContext}, soul=${includeSoul}`, async () => {
+          reset();
+          soulStore.set("role", { agentId: "reader", key: "role", value: "reviewer" });
+          const previousSearch = databasesMock.flair.Agent.search;
+          databasesMock.flair.Agent.search = () => (async function* () {
+            yield { id: "reader", kind: "agent", status: "active" };
+            if (roster) yield { id: "teammate", kind: "agent", status: "active" };
+          })();
+          try {
+            const body: any = await makeBootstrap(agentCtx("reader")).post({ includeContext, includeSoul });
+            expect(body.directoryHint).toBe("Need a teammate? Call the `team_directory` tool (MCP) or `GET /TeamDirectory` for this office's active agents with published tps-mail addresses.");
+            expect(body.sections.team).toBe(roster ? 1 : 0);
+            expect(body.context.includes("## Team")).toBe(roster && includeContext);
+            if (roster && includeContext) expect(body.context).toContain(body.directoryHint);
+            expect(body.soul.role).toBe(includeSoul ? "reviewer" : undefined);
+          } finally {
+            databasesMock.flair.Agent.search = previousSearch;
+          }
+        });
+      }
+    }
+  }
+});
+
+describe("org skillRef to a later physical version", () => {
+  it("follows root -> s1 -> s2 and still checks the current head's read scope", async () => {
+    reset();
+    agentStore.set("agent-a", { id: "agent-a" });
+    seedSkillRow({ id: "root", agentId: "agent-ops", name: "using-flair" });
+    seedSkillRow({ id: "s1", agentId: "agent-ops", name: "using-flair" });
+    Object.assign(memoryStore.get("root"), { skillSubjectId: "root", validTo: "2020-01-01T00:00:00.000Z" });
+    Object.assign(memoryStore.get("s1"), { skillSubjectId: "root" });
+    orgSkillStore.push({ skillName: "using-flair", skillRef: "s1", priority: "standard" });
+    const bootstrap = () => makeBootstrap(agentCtx("agent-a")).post({ agentId: "agent-a", includeSoul: false });
+    expect((await bootstrap() as any).skills.map((s: any) => s.skillId)).toEqual(["s1"]);
+    memoryStore.get("s1").validTo = "2020-01-01T00:00:00.000Z";
+    seedSkillRow({ id: "s2", agentId: "agent-ops", name: "using-flair" });
+    Object.assign(memoryStore.get("s2"), { skillSubjectId: "root", supersedes: "s1" });
+    expect((await bootstrap() as any).skills.map((s: any) => s.skillId)).toEqual(["s2"]);
+    memoryStore.get("s2").visibility = "private";
+    const denied: any = await bootstrap();
+    expect(denied.skills).toEqual([]);
+    expect(denied.skillDiagnostics.map((d: any) => d.decision)).toEqual(["unresolved"]);
+  });
+});
+
+describe("formatMemory bytes", () => {
+  it("an unsourced item with no createdAt or supersedes keeps trailing content whitespace", () => {
+    // Literal copied from origin/main formatMemory output for this input.
+    expect(formatMemory({ content: "body  \n\t " })).toBe("\u{1F4DD} body  \n\t ");
+  });
+
+  it("a sourced item appends one space and the citation", () => {
+    const hostSource = { v: 1, host: "openclaw", kind: "run", id: "run-123456789abc" };
+    expect(formatMemory({ content: "body", hostSource })).toBe("\u{1F4DD} body [via openclaw/run run-1234 (unverified)]");
+  });
+});
+
+// flair#2448 item 2 — bootstrap's `?? m` fallback. The gated pointer join maps
+// each input row through the pointer projection (it does not drop rows), so the
+// reachable trigger for the fallback is a caller the join does not run for:
+// pointerRenders() then returns an empty map and the lookup is undefined. This
+// drives the REAL BootstrapMemories.post() for such a caller and asserts the
+// memory still renders, uncited, byte-identical to the unsourced format
+// (formatMemory with no hostSource).
+describe("flair#2448 — bootstrap renders a memory the pointer join yields no row for, uncited", () => {
+  it("post() renders the row as read (`?? m`) when the join does not run", async () => {
+    reset();
+    const createdAt = new Date().toISOString();
+    const day = createdAt.slice(0, 10);
+    memoryStore.set("m-fallback", {
+      id: "m-fallback",
+      agentId: "agent-fb",
+      content: "FALLBACK-VALUE-MEMORY",
+      durability: "standard",
+      createdAt,
+    });
+    // An admin/operator context is a caller the gated join does not run for
+    // (MemoryBootstrap: `hostSourceReader = authenticatedAgent && !callerIsAdmin
+    // ? authenticatedAgent : undefined`); pointerRenders() then returns an empty
+    // map, so the lookup falls through to `?? m`.
+    const b = makeBootstrap(agentCtx("agent-fb", true));
+    const res: any = await b.post({ agentId: "agent-fb", includeSoul: false });
+    const line = String(res.context ?? "")
+      .split("\n")
+      .find((l) => l.includes("FALLBACK-VALUE-MEMORY")) ?? "";
+    expect(line, "the memory the join yields no row for still renders").not.toBe("");
+    // Byte-for-byte the unsourced format: no citation appended.
+    expect(line).toBe(`\u{1F4DD} FALLBACK-VALUE-MEMORY (${day})`);
+  });
+
+  it("the `?? m` fallback value formats to the unsourced bytes (real formatMemory)", () => {
+    expect(formatMemory({ content: "FALLBACK-VALUE-MEMORY", durability: "standard", createdAt: "2026-01-01T00:00:00.000Z" })).toBe(
+      "\u{1F4DD} FALLBACK-VALUE-MEMORY (2026-01-01)",
+    );
+  });
+});
+
+// flair#2448 item 3 (decision) — the structured MCP bootstrap containers
+// (`leanMemory`) and the admin bootstrap carry NO host-source pointer. The
+// pointer is a citation aid for the agent-facing RENDERED bootstrap. This
+// pins that shape through the REAL BootstrapMemories.post(): a sourced memory
+// whose pointer the caller may see cites in the prose line, while its structured
+// `memories` container entry omits `hostSource`/`hostSourceScope`/
+// `hostSourceVisibility` — so a future change that put the pointer on the
+// container fails here rather than passing as a silent shape change.
+const SOURCED_CANONICAL = JSON.stringify({ v: 1, host: "openclaw", kind: "run", id: "run-123456789abc" });
+
+describe("flair#2448 — structured bootstrap containers carry no host-source pointer", () => {
+  const seedSourced = (createdAt: string) => {
+    memoryStore.set("m-src", {
+      id: "m-src",
+      agentId: "agent-a",
+      content: "SOURCED-CONTAINER-MEMORY",
+      durability: "standard",
+      createdAt,
+      instanceToken: "tok-1",
+    });
+    pointerStore.set("m-src", {
+      memoryId: "m-src",
+      hostSource: SOURCED_CANONICAL,
+      scopeAtWrite: null, // author-only
+      authorId: "agent-a",
+      memoryInstanceToken: "tok-1",
+      receivedAt: createdAt,
+    });
+  };
+
+  it("a non-admin owner's sourced memory cites in prose but its container entry omits the pointer", async () => {
+    reset();
+    const createdAt = new Date().toISOString();
+    seedSourced(createdAt);
+    const b = makeBootstrap(agentCtx("agent-a", false));
+    const res: any = await b.post({ agentId: "agent-a", includeSoul: false });
+    const line = String(res.context ?? "")
+      .split("\n")
+      .find((l) => l.includes("SOURCED-CONTAINER-MEMORY")) ?? "";
+    expect(line, "the rendered prose cites the pointer the caller may see").toContain("[via openclaw/run");
+    const struct = ((res.memories as any[]) ?? []).find((m) => m.id === "m-src");
+    expect(struct, "the sourced memory is in the structured container").toBeDefined();
+    expect(struct, "the container omits hostSource").not.toHaveProperty("hostSource");
+    expect(struct, "the container omits hostSourceScope").not.toHaveProperty("hostSourceScope");
+    expect(struct, "the container omits hostSourceVisibility").not.toHaveProperty("hostSourceVisibility");
+  });
+
+  it("the admin bootstrap's container entry omits the pointer as well", async () => {
+    reset();
+    const createdAt = new Date().toISOString();
+    seedSourced(createdAt);
+    const b = makeBootstrap(agentCtx("agent-a", true));
+    const res: any = await b.post({ agentId: "agent-a", includeSoul: false });
+    const struct = ((res.memories as any[]) ?? []).find((m) => m.id === "m-src");
+    expect(struct, "the sourced memory is in the structured container").toBeDefined();
+    expect(struct, "the admin container omits hostSource").not.toHaveProperty("hostSource");
+    expect(struct, "the admin container omits hostSourceScope").not.toHaveProperty("hostSourceScope");
+    expect(struct, "the admin container omits hostSourceVisibility").not.toHaveProperty("hostSourceVisibility");
   });
 });

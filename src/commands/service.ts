@@ -11,17 +11,19 @@ import { DEFAULT_ADMIN_USER, defaultAdminPassPath, readAdminPassFileSecure } fro
 import { seedUsingFlairSkill } from "../lib/skill-seed.js";
 import { reconcilePendingSkillSeed, skillSeedPendingPath } from "../lib/skill-seed-pending.js";
 import { classifyDaemonState } from "../lib/daemon-liveness.js";
-import { diagnoseLaunchdPlistPaths, isDetached, renderDetachedWarning, verifyLaunchdManagement } from "../lib/launchd-management.js";
+import { decideStartOnUnknown, probePortListening } from "../lib/stop-start-recovery.js";
+import { diagnoseLaunchdPlistPaths, isDetached, renderDetachedWarning, renderManagedStartUnconfirmed, type ManagedStartConfirmation } from "../lib/launchd-management.js";
 import {
   LaunchdValidationRefusal,
   loadabilityAllowsAttempt,
   renderDirectRunNotice,
   renderStartLaunchdUnavailable,
 } from "../lib/launchd-domain-preflight.js";
+import { mapRepairThrow } from "../lib/launchd-repair.js";
 import { opsSocketPathRefusal } from "../lib/socket-path-limit.js";
 import { formatServingTreeLine, formatTreeAssessmentLines, type TreeAssessment } from "../lib/tree-divergence.js";
 import { execSync, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 export type ServiceCli = {
@@ -33,6 +35,7 @@ export type ServiceCli = {
   ensureLaunchdServiceLoaded: (...args: any[]) => any;
   flairPackageDir: (...args: any[]) => any;
   gatherDaemonEvidence: (...args: any[]) => any;
+  gatherDaemonOwnerEvidence: (...args: any[]) => any;
   guardEngineNotBackwards: (...args: any[]) => any;
   harperBinNotFoundMessage: (...args: any[]) => any;
   harperSearchRoots: (...args: any[]) => any;
@@ -41,6 +44,7 @@ export type ServiceCli = {
   observeLaunchdManagement: (...args: any[]) => any;
   probeHealth: (...args: any[]) => any;
   readyOpsSocketPosture: (...args: any[]) => any;
+  recordManagedStartSidecar: (...args: any[]) => any;
   resolveHarperBin: (...args: any[]) => any;
   resolveHttpBindHost: (...args: any[]) => any;
   resolveHttpPort: (...args: any[]) => any;
@@ -92,6 +96,27 @@ export function restartTreeReport(a: TreeAssessment | null): { ok: boolean; line
     };
   }
   return { ok: true, lines: [`   ${formatServingTreeLine(a)}`] };
+}
+
+/**
+ * flair#2422: the warning lines `flair start` prints for an unconfirmed
+ * launchd-managed start. Forwards the sidecar outcome's confirmation and
+ * detail, and the launchd observer's detail and remedy, to the renderer.
+ */
+export function managedStartUnconfirmedLines(input: {
+  port: number;
+  recorded: { confirmation: ManagedStartConfirmation; detail: string };
+  managed: { detail: string; remedy?: string[] };
+  moved?: string;
+}): string[] {
+  return renderManagedStartUnconfirmed({
+    port: input.port,
+    confirmation: input.recorded.confirmation,
+    detail: input.recorded.detail,
+    moved: input.moved,
+    launchdDetail: input.managed.detail,
+    remedy: input.managed.remedy,
+  });
 }
 
 function closedDirectSpawnEnv(...args: any[]): any {
@@ -186,6 +211,10 @@ function waitForHealth(...args: any[]): any {
   return cli.waitForHealth(...args);
 }
 
+function recordManagedStartSidecar(...args: any[]): any {
+  return cli.recordManagedStartSidecar(...args);
+}
+
 function waitForProcessExit(...args: any[]): any {
   return cli.waitForProcessExit(...args);
 }
@@ -252,13 +281,26 @@ program
       // the new instance-scoped one, or a pre-flair#693 legacy install.
       const { plistPath } = resolveLaunchdLabel(defaultDataDir());
       if (existsSync(plistPath)) {
+        const dataDir = defaultDataDir();
+        let pid: number | null = null;
         try {
+          const n = Number(readFileSync(join(dataDir, "hdb.pid"), "utf-8").trim());
+          if (!Number.isSafeInteger(n) || n <= 0) throw new Error("recorded pid is invalid");
+          pid = n;
           const { execSync } = await import("node:child_process");
           execSync(`launchctl unload "${plistPath}"`, { stdio: "pipe" });
+          // Verify the captured pid exited before attempting confirmed-dead cleanup.
+          await waitForProcessExit(pid, STARTUP_TIMEOUT_MS);
+          removeStaleSidecarIfConfirmedDead(dataDir, pid);
           console.log("✅ Flair stopped (launchd service unloaded)");
           return;
-        } catch {
-          // launchd unload failed, try PID fallback
+        } catch (err) {
+          const failure = mapRepairThrow(err);
+          console.error(`❌ flair stop: launchd stop failed for ${dataDir} (pid ${pid ?? "unknown"}): ${failure.detail}`);
+          if (failure.kind === "failed") {
+            for (const remedy of failure.remedy ?? []) console.error(`   Fix: ${remedy}`);
+          }
+          process.exit(1);
         }
       }
     }
@@ -289,12 +331,8 @@ program
           }
         }
         await waitForProcessExit(pid, STARTUP_TIMEOUT_MS);
-        // flair#2055: once the process is CONFIRMED gone, drop the identity
-        // sidecar — a leftover naming the stopped pid is what makes a later
-        // instance under another supervisor refuse. Gated on a fresh
-        // O_NOFOLLOW read that still names the pid it named before; unknown
-        // liveness removes nothing.
-        removeStaleSidecarIfConfirmedDead(dataDir);
+        // Use the PID the exit probe observed gone for best-effort cleanup.
+        removeStaleSidecarIfConfirmedDead(dataDir, pid);
         const after = await probeHealth(port);
         if (after.kind === "refused") {
           console.log(`✅ Flair stopped (${label}, pid ${pid})`);
@@ -304,9 +342,6 @@ program
         return;
       }
       case "NOT_RUNNING":
-        // A sidecar left naming a pid that is CONFIRMED gone is a leftover too
-        // (flair#2055); clearing it here keeps a repeat stop from carrying the
-        // refusal forward.
         removeStaleSidecarIfConfirmedDead(dataDir);
         console.log("Flair is not running.");
         return;
@@ -348,12 +383,10 @@ program
         }
 
      // Already-running check via the five-state liveness machine (flair#1454).
-    // The old check was a bare `fetch /Health` that treated "got a response"
-    // as "already running" and exited 0 — half of #1454. Now the machine
-    // classifies, and every non-NOT_RUNNING state refuses with a non-zero exit.
     const evidence = await gatherDaemonEvidence(port, dataDir);
     const state = classifyDaemonState(evidence, { port, dataDir });
 
+    let recoveryPid: number | undefined;
     switch (state.state) {
       case "NOT_RUNNING":
         break; // proceed to boot
@@ -371,11 +404,34 @@ program
         console.error(`   port: ${port}`);
         console.error(`   To inspect: flair doctor`);
         process.exit(1);
-      case "UNKNOWN":
-        console.error(`⚠️  ${state.detail}`);
-        console.error(`   Refusing to start — could not determine whether Flair is running.`);
+      case "UNKNOWN": {
+        const probe = await probePortListening(port);
+        const decision = decideStartOnUnknown({ evidence, detail: state.detail, port, probe });
+        for (const line of decision.lines) console.error(line);
+        if (decision.proceed) {
+          recoveryPid = evidence.pidfile.kind === "present" ? evidence.pidfile.pid : evidence.lastKnownPid;
+          break;
+        }
         process.exit(1);
+      }
     }
+
+    const recheckRecovery = async (): Promise<void> => {
+      if (recoveryPid === undefined) return;
+      const observed = await gatherDaemonEvidence(port, dataDir);
+      const probe = await probePortListening(port);
+      const fresh = { ...observed, ...cli.gatherDaemonOwnerEvidence(dataDir) };
+      const pid = fresh.pidfile.kind === "present" ? fresh.pidfile.pid : fresh.lastKnownPid;
+      const decision = decideStartOnUnknown({
+        evidence: pid === recoveryPid ? fresh : { ...fresh, pidLiveness: { kind: "unknown", reason: "recorded owner changed" } },
+        detail: "Rechecking the recorded owner before start.", port,
+        probe,
+      });
+      if (pid !== recoveryPid || !decision.proceed) {
+        for (const line of decision.lines) console.error(line);
+        process.exit(1);
+      }
+    };
 
     if (!existsSync(dataDir)) {
       console.error("❌ No Flair data directory found. Run 'flair init' first.");
@@ -426,29 +482,41 @@ program
             }
             const { execSync } = await import("node:child_process");
             // Targeted at gui/<uid> — the domain the preflight probed (flair#2040).
+            await recheckRecovery();
             const { label, migrated } = ensureLaunchdServiceLoaded(dataDir, (cmd: string) => execSync(cmd, { stdio: "pipe" }));
-            await waitForHealth(port, DEFAULT_ADMIN_USER, process.env.HDB_ADMIN_PASSWORD ?? "", STARTUP_TIMEOUT_MS);
+            // flair#2411: wait for health and record the identity sidecar naming
+            // the pid launchd reports, only once that pid is confirmed to be the
+            // one serving this instance. An unconfirmed pid writes nothing and
+            // names the check that failed.
+            const recorded = await recordManagedStartSidecar(dataDir, port, label, {
+              adminPass: process.env.HDB_ADMIN_PASSWORD ?? "",
+            });
             readyOpsSocketPosture(dataDir); // flair#763: re-assert socket posture on the freshly-created socket
             stampEngineVersionIfRunning(dataDir); // flair#1047: stamp the store with the engine version
-            // flair#2040: the launchd check mark only after VERIFYING that
-            // launchd's pid IS the identified serving pid — a healthy port is
-            // not proof that launchd started what answers it, and an
-            // unidentified serving process is not proof either.
-            const managed = observeLaunchdManagement(dataDir, port);
-            const verdict = verifyLaunchdManagement(managed);
-            if (verdict.verified) {
+            if (recorded.recorded) {
               await seedAfterStart(dataDir, port);
-              // The migration's check mark too only after the strict verifier
-              // passed: moving a plist is not launchd running this instance.
+              // The migration's check mark too only after the identity was confirmed:
+              // moving a plist is not launchd running this instance.
               if (migrated) console.log(`Migrated launchd service off the legacy label (${LEGACY_LAUNCHD_LABEL}) → ${label} ✓`);
-              console.log(`✅ Flair started (launchd-managed: ${verdict.detail})`);
+              console.log(`✅ Flair started (launchd-managed: ${recorded.detail})`);
               return;
             }
-            // Healthy, but not proven to be launchd's process: no launchd check
-            // mark, and no claim about what happens at the next reboot either.
-            console.error(`⚠️  Flair is running on port ${port}, but it is NOT verified as launchd-managed: ${managed.detail}`);
-            if (migrated) console.error(`   The launchd service was moved off the legacy label (${LEGACY_LAUNCHD_LABEL}) → ${label}.`);
-            if (managed.remedy?.length) console.error(`   Fix: ${managed.remedy.join(" && ")}`);
+            // flair#2040/#2422: the managed process was not confirmed. No launchd
+            // check mark, and no claim about what happens at the next reboot. The
+            // warning reports what the confirmation probe saw on the port; it says
+            // Flair is running for the Flair-shaped answer, and names the probe's
+            // other results instead.
+            const managed = observeLaunchdManagement(dataDir, port);
+            for (const line of managedStartUnconfirmedLines({
+              port,
+              recorded,
+              managed,
+              moved: migrated
+                ? `The launchd service was moved off the legacy label (${LEGACY_LAUNCHD_LABEL}) → ${label}.`
+                : undefined,
+            })) {
+              console.error(line);
+            }
             if (existsSync(skillSeedPendingPath(dataDir))) {
               console.error("❌ Flair started, but its identity is unverified; the using-flair skill seed remains pending. Run 'flair doctor' before retrying.");
               process.exit(1);
@@ -494,6 +562,7 @@ program
       adminPass,
     }));
 
+    await recheckRecovery();
     const proc = spawn(process.execPath, [bin, "run", "."], {
       cwd: flairPackageDir(), env, detached: true, stdio: "ignore",
     });

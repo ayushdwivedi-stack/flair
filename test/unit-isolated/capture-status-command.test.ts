@@ -1,0 +1,148 @@
+import { beforeAll, beforeEach, expect, it } from "bun:test";
+import { execFileSync, spawnSync } from "node:child_process";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { tempDir } from "../helpers/temp-dir.ts";
+import {
+  captureHookStatus,
+  hookSettingsPath,
+  installCaptureHooks,
+  installHook,
+} from "../../src/hook-install.ts";
+import { isFlairCaptureCommand, parseCaptureCommand } from "../../src/doctor-client.ts";
+import { createCaptureRuntime } from "../helpers/capture-runtime.ts";
+import { FLAIR_MCP_PACKAGE, flairCliVersion } from "../../src/lib/mcp-spec.ts";
+
+const root = resolve(import.meta.dir, "../..");
+let home: string;
+let stubBin: string;
+let runtime: ReturnType<typeof createCaptureRuntime>;
+const events = ["PostToolUseFailure", "PostToolUse", "Stop"] as const;
+
+beforeAll(() => {
+  execFileSync(process.execPath, ["run", "build:cli"], { cwd: root, timeout: 30_000, stdio: "pipe" });
+}, 40_000);
+beforeEach(() => {
+  home = tempDir("flair-capture-status-");
+  // `hook status` probes SessionStart delivery by running the wired command,
+  // which shells out to `npx`. A stub keeps that probe from starting a package
+  // download that can outlive the probe's SIGTERM timeout and keep writing into
+  // this scratch HOME after it is removed (flair#2379).
+  stubBin = join(home, "stub-bin");
+  mkdirSync(stubBin, { recursive: true });
+  writeFileSync(join(stubBin, "npx"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+  runtime = createCaptureRuntime(home);
+  expect(installHook({ homeDir: home, harness: "claude-code", agentId: "me", flairUrl: "http://localhost:19926" }).ok).toBe(true);
+});
+
+function install() {
+  return installCaptureHooks({ homeDir: home, harness: "claude-code", agentId: "me", flairUrl: "http://localhost:19926", runtime });
+}
+function settings(): any {
+  return JSON.parse(readFileSync(hookSettingsPath(home, "claude-code"), "utf8"));
+}
+function save(config: any) {
+  writeFileSync(hookSettingsPath(home, "claude-code"), JSON.stringify(config));
+}
+function status() {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("FLAIR_")));
+  const result = spawnSync("node", ["dist/cli.js", "hook", "status", "--capture", "--harness", "claude-code"], {
+    cwd: root, env: { ...env, HOME: home, USERPROFILE: home, PATH: `${stubBin}:${env.PATH ?? ""}` }, encoding: "utf8", timeout: 10_000,
+  });
+  expect(result.error).toBeUndefined();
+  expect(result.signal).toBeNull();
+  return result;
+}
+
+it("capture status names an edited entry when SessionStart has an older pin", () => {
+  expect(install().ok).toBe(true);
+  const config = settings();
+  const currentVersion = flairCliVersion();
+  const [major, minor, patch] = currentVersion.split(".").map(Number);
+  const olderVersion = patch > 0 ? `${major}.${minor}.${patch - 1}` : `${major}.${minor - 1}.0`;
+  const sessionStart = config.hooks.SessionStart[0].hooks[0];
+  expect(sessionStart.command).toContain(`${FLAIR_MCP_PACKAGE}@${currentVersion}`);
+  sessionStart.command = sessionStart.command.replace(`${FLAIR_MCP_PACKAGE}@${currentVersion}`, `${FLAIR_MCP_PACKAGE}@${olderVersion}`);
+  config.hooks.PostToolUse[0].hooks[0].command += " ";
+  save(config);
+
+  const result = status();
+  expect(result.status).toBe(1);
+  expect(result.stdout).toContain(`command names older pin flair-mcp@${olderVersion}`);
+  expect(result.stdout).toContain("capture: stale");
+  expect(result.stdout).toContain("PostToolUse[0].hooks[0]");
+}, 30_000);
+
+for (const variant of ["group", "nested", "drifted", "drifted first"] as const) {
+  it(`install normalizes ${variant} duplicates in settings`, () => {
+    expect(install().ok).toBe(true);
+    const config = settings();
+    for (const event of events) {
+      const duplicate = JSON.parse(JSON.stringify(config.hooks[event][0]));
+      if (variant === "drifted first") {
+        config.hooks[event][0].matcher = "Read";
+        config.hooks[event][0].hooks[0].command = config.hooks[event][0].hooks[0].command.replace("FLAIR_AGENT_ID=me", "FLAIR_AGENT_ID=other");
+      }
+      if (variant === "drifted") {
+        duplicate.matcher = "Read";
+        duplicate.hooks[0].command = duplicate.hooks[0].command.replace("FLAIR_AGENT_ID=me", "FLAIR_AGENT_ID=other");
+      }
+      if (variant === "nested") config.hooks[event][0].hooks.push(duplicate.hooks[0]);
+      else config.hooks[event].push(duplicate);
+      config.hooks[event].push({ matcher: "Read", hooks: [{ type: "command", command: "echo unrelated" }] });
+    }
+    save(config);
+    const preview = installCaptureHooks({ homeDir: home, harness: "claude-code", agentId: "me", flairUrl: "http://localhost:19926", runtime, dryRun: true });
+    for (const event of events) expect(preview.actions?.[event]).toBe("update");
+    expect(install().ok).toBe(true);
+    const after = settings();
+    for (const event of events) {
+      expect(after.hooks[event].flatMap((group: any) => group.hooks).filter((hook: any) => isFlairCaptureCommand(hook.command))).toHaveLength(1);
+      expect(after.hooks[event].some((group: any) => group.hooks.some((hook: any) => hook.command === "echo unrelated"))).toBe(true);
+    }
+    expect(captureHookStatus(home, "claude-code").state).toBe("installed");
+    const result = status();
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("capture: PostToolUseFailure + PostToolUse + Stop wired");
+  }, 30_000);
+}
+
+for (const event of events) {
+  it(`capture status rejects a non-command ${event} entry in settings`, () => {
+    expect(install().ok).toBe(true);
+    const config = settings();
+    config.hooks[event][0].hooks[0].type = "prompt";
+    save(config);
+    const observed = captureHookStatus(home, "claude-code");
+    expect(observed.state).toBe("stale");
+    expect(observed.problems).toContain(`${event} carries an unexpected type`);
+    const result = status();
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain(`capture: stale (${event} carries an unexpected type)`);
+  }, 30_000);
+}
+
+for (const state of ["stale", "partial", "absent", "runtime failure"] as const) {
+  it(`capture CLI exit code for ${state} settings`, () => {
+    if (state !== "absent") {
+      expect(install().ok).toBe(true);
+      const config = settings();
+      if (state === "stale") config.hooks.PostToolUseFailure[0].matcher = "Write";
+      if (state === "partial") delete config.hooks.Stop;
+      if (state === "runtime failure") {
+        const artifact = parseCaptureCommand(config.hooks.PostToolUse[0].hooks[0].command)!.artifactPath;
+        writeFileSync(artifact, "process.exit(0);\n");
+      }
+      save(config);
+    }
+    const observed = captureHookStatus(home, "claude-code");
+    if (state === "runtime failure") expect(observed.runtimeFailure).toBeTruthy();
+    else {
+      expect(observed.state).toBe(state);
+      expect(observed.runtimeFailure).toBeUndefined();
+    }
+    const result = status();
+    expect(result.status).toBe(state === "absent" ? 0 : 1);
+    expect(result.stdout).toContain(state === "absent" ? "capture: not enabled" : `capture: ${observed.state}`);
+  }, 30_000);
+}

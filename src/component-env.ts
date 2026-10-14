@@ -40,11 +40,17 @@
 // Hence: the file this module generates carries `FLAIR_PUBLIC_URL` and nothing
 // else, and `assertNoSecretKeys` is a runtime guard, not a comment.
 
+import { parseMcpComponentEnv } from "./lib/mcp-oauth-env-core.js";
+
 /** The file Harper's `loadEnv` plugin is pointed at by flair's config.yaml. */
 export const COMPONENT_ENV_FILENAME = ".env";
 
 /** The one key `flair deploy` supplies. */
 export const PUBLIC_URL_KEY = "FLAIR_PUBLIC_URL";
+
+/** The component's MCP issuer origin, when the operator set one — the issuer the
+ *  `@harperfast/oauth` authorization server advertises. */
+export const MCP_ISSUER_KEY = "FLAIR_MCP_ISSUER";
 
 /**
  * Key names that must never appear in a `.env` flair GENERATES.
@@ -131,23 +137,12 @@ export function envKeyNames(text: string | null | undefined): string[] {
   return names;
 }
 
-/**
- * The value assigned to `key`, or null. The single value this module reads is
- * `FLAIR_PUBLIC_URL`, which is not a secret; nothing here reads any other value.
- */
+/** Return the named file value using the shared parser; the last assignment wins.
+ *  This does not overlay the process environment. */
 export function readEnvValue(text: string | null | undefined, key: string): string | null {
   if (!text) return null;
-  for (const line of text.split(/\r?\n/)) {
-    const m = ASSIGNMENT_RE.exec(line);
-    if (!m || m[1] !== key) continue;
-    let v = line.slice(line.indexOf("=") + 1).trim();
-    if ((v.startsWith('"') && v.endsWith('"') && v.length >= 2) ||
-        (v.startsWith("'") && v.endsWith("'") && v.length >= 2)) {
-      v = v.slice(1, -1);
-    }
-    return v;
-  }
-  return null;
+  const values = parseMcpComponentEnv(text);
+  return Object.prototype.hasOwnProperty.call(values, key) ? values[key]! : null;
 }
 
 /**

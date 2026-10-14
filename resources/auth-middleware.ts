@@ -1,13 +1,16 @@
-import { patchRecord } from "./table-helpers.js";
+import { WRITE_BACK_ATTEMPTS, WriteBackConflictError, writeBackCommittedRow } from "./write-back.js";
+import { txnPausePoint } from "./txn-pause-point.js";
 import { server, databases } from "harper";
 import { getEmbedding } from "./embeddings-provider.js";
-import { isAdmin, isPrincipalDeactivated, FLAIR_AGENT_USERNAME } from "./agent-auth.js";
+import { isAdmin, isPrincipalDeactivated, FLAIR_AGENT_USERNAME, readCredentialedPrincipal, AGENT_LOOKUP_FAILED } from "./agent-auth.js";
 import { WINDOW_MS, importEd25519Key, b64ToArrayBuffer, parseTpsEd25519Header } from "./ed25519-auth.js";
 import { isKnownAgentReplay, claimAgentNonce } from "./replay-store.js";
 import { isForbiddenOwnerMutation, ownerMutationRefusal, resolveGuardedRecord } from "./record-owner-guard.js";
 import { checkHttpRateLimit } from "./rate-limit.js";
 import { FLAIR_AUTH_MIDDLEWARE_HTTP_NAME } from "./multi-worker-guard.js";
-import { stripUndeclaredMemoryAttributes, DECLARED_MEMORY_ATTRIBUTES } from "./memory-declared-attributes.js";
+import { DECLARED_MEMORY_ATTRIBUTES } from "./memory-declared-attributes.js";
+import { idSegmentHasEncodedSlash, decodeMemoryIdSegment, MEMORY_CONTENT_SELECTOR_SUFFIX } from "../src/lib/memory-id-policy.js";
+import { contentSuffixIdDenial } from "./memory-id-guard.js";
 
 // --- Non-admin Memory read: ignore the caller's selection --------------------
 //
@@ -23,6 +26,16 @@ const DECLARED_MEMORY_ATTRIBUTE_SET = new Set<string>(
 
 function isMemoryReadPath(pathname: string): boolean {
   return pathname === "/Memory" || pathname === "/Memory/" || pathname.startsWith("/Memory/");
+}
+
+/** True when a path segment is valid percent-encoding. */
+function isValidPercentEncoding(segment: string): boolean {
+  try {
+    decodeURIComponent(segment);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // Drop a caller's `select(...)` and `property` from a Memory read URL, keeping
@@ -44,9 +57,13 @@ function stripMemorySelection(rawUrl: string): string {
   // attribute, so it is left for Harper to read as a content type).
   const slash = pathPart.lastIndexOf("/");
   const seg = pathPart.slice(slash + 1);
-  const decodedSeg = decodePathSegment(seg);
+  const decodedSeg = decodeMemoryIdSegment(seg);
   const dot = decodedSeg.indexOf(".");
-  if (dot > -1 && DECLARED_MEMORY_ATTRIBUTE_SET.has(decodedSeg.slice(dot + 1))) {
+  // An encoded `/` in the id segment makes the segment ambiguous: the trailing
+  // `.<declared attribute>` could be part of the id, or a selector on a
+  // slash-containing id.
+  if (!idSegmentHasEncodedSlash(seg) &&
+      dot > -1 && DECLARED_MEMORY_ATTRIBUTE_SET.has(decodedSeg.slice(dot + 1))) {
     // Rebuild the id from its decoded form. Harper decodes the path it is handed,
     // so this re-encoded segment addresses the SAME id, without the property.
     pathPart = `${pathPart.slice(0, slash + 1)}${encodeURIComponent(decodedSeg.slice(0, dot))}`;
@@ -67,15 +84,22 @@ function stripMemorySelection(rawUrl: string): string {
   return query === "" ? pathPart : `${pathPart}?${query}`;
 }
 
-/** Decode a path segment the way Harper does before its property parse; fall
- *  back to the raw segment when it is not valid percent-encoding (Harper rejects
- *  the malformed request; the middleware must not crash on it). */
-function decodePathSegment(raw: string): string {
-  try {
-    return decodeURIComponent(raw);
-  } catch {
-    return raw;
-  }
+/**
+ * True when a Memory by-id read path names an id segment that carries an encoded
+ * `/` (`%2F`/`%2f`) AND would otherwise be given the property-suffix rewrite in
+ * stripMemorySelection. Such a segment is ambiguous — the trailing
+ * `.<declared attribute>` could be part of the id or a selector on an id that
+ * contains a slash (flair#2199).
+ */
+function isAmbiguousEncodedSlashSelector(rawUrl: string): boolean {
+  const q = rawUrl.indexOf("?");
+  const pathPart = q === -1 ? rawUrl : rawUrl.slice(0, q);
+  const slash = pathPart.lastIndexOf("/");
+  const seg = pathPart.slice(slash + 1);
+  if (!idSegmentHasEncodedSlash(seg)) return false;
+  const decodedSeg = decodeMemoryIdSegment(seg);
+  const dot = decodedSeg.indexOf(".");
+  return dot > -1 && DECLARED_MEMORY_ATTRIBUTE_SET.has(decodedSeg.slice(dot + 1));
 }
 
 // [start, end) ranges of every `select(...)` call in a query string, accounting
@@ -154,23 +178,71 @@ function getAdminPass(): string | null {
 
 async function backfillEmbedding(memoryId: string): Promise<void> {
   try {
-    const record = await (databases as any).flair.Memory.get(memoryId);
-    if (!record?.content) return;
-    if (record.embedding?.length > 100) return;
-    // flair#504 Phase 2: 'document' — a backfilled embedding IS a stored
-    // document vector, same as the three Memory.ts sites; must match.
-    const embedding = await getEmbedding(record.content, "document");
-    if (!embedding) return;
-    const embedPatch = { embedding };
-    stripUndeclaredMemoryAttributes(embedPatch);
-    await patchRecord((databases as any).flair.Memory, memoryId, embedPatch);
-    console.log(`[auto-embed] ${memoryId}: ${embedding.length}d`);
+    const table = (databases as any).flair.Memory;
+    // flair#2484: compute the vector before the owned write transaction opens.
+    // Rows without content or with an embedding longer than 100 entries skip
+    // before content comparison. For eligible rows, `matchFields` compares
+    // content before staging; the helper confirms the committed row afterward.
+    // Drift observed by either check aborts the attempt; remaining outer
+    // attempts re-read and may recompute. Changes after confirmation and before
+    // commit are not detected by these checks.
+    for (let attempt = 1; attempt <= WRITE_BACK_ATTEMPTS; attempt++) {
+      const record = await table.get(memoryId, {});
+      if (!record?.content) return;
+      if (record.embedding?.length > 100) return;
+      const text = record.content;
+      const embedding = await getEmbedding(text, "document");
+      if (!embedding) return;
+      try {
+        const outcome = await writeBackCommittedRow(
+          table,
+          memoryId,
+          (row: any) => {
+            if (!row?.content) return { skip: true };
+            if (row.embedding?.length > 100) return { skip: true };
+            // Only `embedding`: an incremental update, never a
+            // full-row put of the row read above (flair#2470).
+            return { update: { embedding } };
+          },
+          {
+            label: "backfillEmbedding",
+            expectedRow: record,
+            // Compare content before staging, after the plan's skip checks.
+            matchFields: ["content"],
+            pausePre: () => txnPausePoint("backfill-embedding-pre"),
+            pausePoint: () => txnPausePoint("backfill-embedding"),
+          },
+        );
+        if ("update" in outcome) console.log(`[auto-embed] ${memoryId}: ${(outcome.update.embedding as number[]).length}d`);
+        return;
+      } catch (err) {
+        if (err instanceof WriteBackConflictError && attempt < WRITE_BACK_ATTEMPTS) continue;
+        throw err;
+      }
+    }
   } catch (err: any) {
     console.error(`[auto-embed] Failed for ${memoryId}: ${err.message}`);
   }
 }
 
 // ─── HTTP middleware ──────────────────────────────────────────────────────────
+
+/**
+ * Refuse a credentialed Basic-auth request whose Agent row could not be READ:
+ * log the named error and return it. A read that FAILED is never an absent
+ * principal (flair#2403); the same rule resources/AgentSeed.ts applies as
+ * `agent_lookup_failed`.
+ */
+function credentialedLookupRefusal(username: string, error: unknown): Response {
+  console.error(
+    "auth-middleware: the credentialed principal lookup failed, so the request was refused",
+    { username, error },
+  );
+  return new Response(JSON.stringify({
+    error: AGENT_LOOKUP_FAILED,
+    message: "the principal record could not be read, so the request was refused",
+  }), { status: 500, headers: { "content-type": "application/json" } });
+}
 
 // Flair's clients use exactly these HTTP methods. Harper routes other methods
 // to resource handlers as well; refusing them here, before any other branch of
@@ -223,6 +295,21 @@ server.http(async (request: any, nextLayer: any) => {
   const limited = checkHttpRateLimit(request, url.pathname);
   if (limited) return limited;
 
+  // ── Malformed `.content` Memory path: the named 400, for every caller ────────
+  // flair#2307 item 2: Harper's OWN path decode answers a 500 for invalid
+  // percent-encoding, before any resource by-id guard can run. A Memory path
+  // whose last segment is invalid percent-encoding AND ends in the `.content`
+  // property suffix is refused here with the guard's named 400 instead. Placed
+  // before every auth branch (the public-path passthrough, the Basic-admin and
+  // anonymous early returns, the signed-agent path), so the refusal does not
+  // depend on the request's credential, and no row is read or written for it.
+  if (isMemoryReadPath(url.pathname)) {
+    const seg = url.pathname.slice(url.pathname.lastIndexOf("/") + 1);
+    if (seg.endsWith(MEMORY_CONTENT_SELECTOR_SUFFIX) && !isValidPercentEncoding(seg)) {
+      return contentSuffixIdDenial(seg);
+    }
+  }
+
   // A2A discovery endpoints: GET returns public agent-card metadata (per
   // A2A spec, cards are intentionally public). POST invokes JSON-RPC
   // actions (message/send writes OrgEvents on behalf of agents,
@@ -230,8 +317,14 @@ server.http(async (request: any, nextLayer: any) => {
   // OrgEvents) — those must be authenticated. Narrowing to GET-only
   // closes the P0 where any caller could forge OrgEvents as any agent
   // and read all internal Beads issues unauthenticated.
+  const header = request.headers.get("authorization") || request.headers?.asObject?.authorization || "";
+  const isTpsEd25519 = /^TPS-Ed25519(?:\s|$)/i.test(header);
+  // Scheme names are case-insensitive (RFC 9110): "basic"/"BASIC"/"Basic" all
+  // select the Basic branch below, exactly as "Basic" does. Used for both the
+  // /FederationPair public-bypass test and the Basic branch itself.
+  const isBasic = /^Basic /i.test(header);
   const isA2APath = url.pathname === "/a2a" || url.pathname === "/A2AAdapter" || url.pathname.startsWith("/A2AAdapter/");
-  if (
+  if (!isTpsEd25519 && (
     url.pathname === "/health" ||
     url.pathname === "/Health" ||
     (request.method === "GET" && isA2APath) ||
@@ -244,7 +337,15 @@ server.http(async (request: any, nextLayer: any) => {
     // by the resource itself (allowCreate=true on the Resource lets anonymous
     // POST through Harper's role gate). Bearer can't be used here because
     // Harper's auth layer claims any "Bearer X" Authorization header for itself.
-    url.pathname === "/FederationPair" ||
+    //
+    // A Basic-credentialled pair request is NOT passed through here. The Basic
+    // block below is what authenticates the token's bootstrap user
+    // (pair-bootstrap-<id>, Path 3) and annotates `tpsAgent`; passing straight
+    // through skipped that annotation, so the resource's bootstrap-user binding
+    // (PR-4, resources/Federation.ts) could never see a caller and never
+    // refused a mismatch. An anonymous pair request (no Authorization header)
+    // still passes through.
+    (url.pathname === "/FederationPair" && !isBasic) ||
     // OAuth 2.1 public endpoints (spec requires no pre-auth)
     url.pathname === "/OAuthRegister" ||
     url.pathname === "/OAuthAuthorize" ||
@@ -256,36 +357,8 @@ server.http(async (request: any, nextLayer: any) => {
     // The entry stays so the path is still public if that mount ever moves back
     // onto the default chain.
     url.pathname === "/.well-known/oauth-authorization-server" ||
-    url.pathname === "/OAuthMetadata" ||
-    // Presence roster is public-safe (field-allowlisted); GET serves the
-    // Office Space renderer without auth. Scoped to GET only (#604): the
-    // exact-path match used to match ANY method, so a bare `PUT /Presence`
-    // (collection-level, no id — Harper routes it to the same .put() as
-    // by-id PUT) early-returned here too, skipping this middleware entirely.
-    // A credential-less loopback PUT then reached Presence.put()'s
-    // resolveAgentAuth() call with NO tpsAnonymous/tpsAgent annotation, which
-    // fell through to raw `context.user` — populated by Harper's
-    // `authorizeLocal` (config true) ambient super_user injection for ANY
-    // credential-less loopback request — so the ownership check saw an
-    // "admin" caller (isAdmin=true) and let the write through unauthenticated
-    // (`super.put()`, no signature, no password). Mirrors the A2A GET-only
-    // pattern above: POST/PUT/DELETE now always transit the general
-    // middleware path below, which marks a genuinely headerless request
-    // tpsAnonymous BEFORE Harper's ambient elevation lands (resolveAgentAuth
-    // checks tpsAnonymous first — see agent-auth.ts's resolution order), so
-    // the ownership check in Presence.put()/delete() correctly denies it.
-    // POST (the heartbeat) is unaffected in practice: it already prefers
-    // request.tpsAgent when the middleware set it, and falls back to its own
-    // Ed25519 header parse otherwise — transiting the general path now just
-    // means a genuinely headerless POST gets marked anonymous (still 401)
-    // instead of skipping straight to that fallback parse.
-    (request.method === "GET" && url.pathname === "/Presence")
-  ) return nextLayer(request);
-
-  // Read the Authorization header ONCE, up front — the super_user branch below
-  // needs it too (hoisted from its former position just after the branch as part
-  // of the flair#610 belt-and-suspenders check).
-  const header = request.headers.get("authorization") || request.headers?.asObject?.authorization || "";
+    url.pathname === "/OAuthMetadata"
+  )) return nextLayer(request);
 
   // If Harper has already authorized this request (e.g. Basic admin, or
   // authorizeLocal=true on localhost), trust Harper's auth decision and pass
@@ -302,13 +375,14 @@ server.http(async (request: any, nextLayer: any) => {
   // live vector today — but it keeps the trust decision from ever hinging on
   // ambient elevation alone. (The root-cause gate lives in resolveAgentAuth; see
   // agent-auth.ts hasCredentialEvidence.)
-  if (header && request.user?.role?.permission?.super_user === true) {
+  if (!isTpsEd25519 && header && request.user?.role?.permission?.super_user === true) {
     const username = request.user.username ?? "admin";
     // Deactivation guard — same predicate as the Ed25519 path.
     // A deactivated principal must not receive a tpsAgent annotation, even
     // when Harper's ambient auth already verified the credential.
-    const agentRecord = await (databases as any).flair.Agent.get(username).catch(() => null);
-    if (!isPrincipalDeactivated(agentRecord)) {
+    const read = await readCredentialedPrincipal(username);
+    if (!read.ok) return credentialedLookupRefusal(username, read.error);
+    if (!isPrincipalDeactivated(read.agent)) {
       request.tpsAgent = username;
       request.tpsAgentIsAdmin = true;
       try {
@@ -329,7 +403,7 @@ server.http(async (request: any, nextLayer: any) => {
   // 1. HDB_ADMIN_PASSWORD env-var fast-path (user must be "admin" with exact pass)
   // 2. Harper super_user check — any user with super_user:true permission accepted
   // Checked BEFORE Ed25519 so admin tools can use simple auth.
-  if (header.startsWith("Basic ")) {
+  if (isBasic) {
     try {
       const decoded = Buffer.from(header.slice(6), "base64").toString("utf-8");
       const colonIdx = decoded.indexOf(":");
@@ -341,8 +415,9 @@ server.http(async (request: any, nextLayer: any) => {
       const adminPass = getAdminPass();
       if (adminPass !== null && user === "admin" && pass === adminPass) {
         // Deactivation guard — same predicate, called before tpsAgent is stamped.
-        const agentRecord = await (databases as any).flair.Agent.get("admin").catch(() => null);
-        if (!isPrincipalDeactivated(agentRecord)) {
+        const read = await readCredentialedPrincipal("admin");
+        if (!read.ok) return credentialedLookupRefusal("admin", read.error);
+        if (!isPrincipalDeactivated(read.agent)) {
           // Mark as verified and set Harper user directly
           (request as any)._tpsAuthVerified = true;
           try {
@@ -365,8 +440,9 @@ server.http(async (request: any, nextLayer: any) => {
 
       if (harperUser?.role?.permission?.super_user === true) {
         // Deactivation guard — same predicate, called before tpsAgent is stamped.
-        const agentRecord = await (databases as any).flair.Agent.get(user).catch(() => null);
-        if (!isPrincipalDeactivated(agentRecord)) {
+        const read = await readCredentialedPrincipal(user);
+        if (!read.ok) return credentialedLookupRefusal(user, read.error);
+        if (!isPrincipalDeactivated(read.agent)) {
           (request as any)._tpsAuthVerified = true;
           request.user = harperUser;
           request.headers.set("x-tps-agent", user);
@@ -392,8 +468,9 @@ server.http(async (request: any, nextLayer: any) => {
           pairUser?.active === true
         ) {
           // Deactivation guard — same predicate, called before tpsAgent is stamped.
-          const agentRecord = await (databases as any).flair.Agent.get(user).catch(() => null);
-          if (!isPrincipalDeactivated(agentRecord)) {
+          const read = await readCredentialedPrincipal(user);
+          if (!read.ok) return credentialedLookupRefusal(user, read.error);
+          if (!isPrincipalDeactivated(read.agent)) {
             (request as any)._tpsAuthVerified = true;
             request.user = pairUser;
             request.headers.set("x-tps-agent", user);
@@ -422,6 +499,7 @@ server.http(async (request: any, nextLayer: any) => {
   const parsed = parseTpsEd25519Header(header);
 
   if (!parsed) {
+    if (isTpsEd25519) return new Response(JSON.stringify({ error: "invalid_authorization_header" }), { status: 401 });
     // For browser-accessible admin pages, emit `WWW-Authenticate: Basic` so
     // the browser shows a native auth dialog instead of a bare 401 page.
     // JSON API endpoints don't get this — they should keep the structured
@@ -495,15 +573,6 @@ server.http(async (request: any, nextLayer: any) => {
   (request as any)._tpsAuthVerified = true;
   request.tpsAgentIsAdmin = await isAdmin(agentId);
 
-  // Grant Harper-level permissions for the cryptographically-verified agent by
-  // setting request.user directly. Setting request.user is the supported
-  // extension path (and the only one that works post-5.0.9: Harper resolves
-  // request.user from the Authorization header BEFORE this middleware runs, and
-  // a TPS-Ed25519 header matches no Basic/Bearer strategy, so request.user
-  // arrives null — see #456). getUser(name, null) looks up the record WITHOUT
-  // password validation, safe here because the Ed25519 signature already proved
-  // identity cryptographically.
-  //
   // RESHAPE (auth-rbac) — THE FLIP: per-agent DE-ELEVATION. A cryptographically-
   // verified NON-admin agent resolves to the least-privilege `flair-agent` user,
   // NOT admin super_user. The flair_agent role grants exactly the table CRUD agents
@@ -770,7 +839,19 @@ server.http(async (request: any, nextLayer: any) => {
   // contract, applied in `Memory.get`/`Memory.search`). The by-id
   // read-scope denial is enforced by the resource layer (memoryByIdReadGate),
   // which returns the same 404 this middleware used to return.
-  if (!request.tpsAgentIsAdmin && method === "GET" && isMemoryReadPath(url.pathname)) {
+  // (A malformed `.content` segment was refused before any auth branch, above.)
+  if (!request.tpsAgentIsAdmin && (method === "GET" || method === "HEAD") && isMemoryReadPath(url.pathname)) {
+    // flair#2199: an id segment carrying an encoded `/` before a declared
+    // property suffix is ambiguous — the suffix could be part of the id or a
+    // selector on a slash-containing id. This branch runs for a signed
+    // non-admin agent: Basic-admin and anonymous requests returned to the next
+    // layer before it.
+    if (isAmbiguousEncodedSlashSelector(request.url)) {
+      return new Response(method === "HEAD" ? null : JSON.stringify({
+        error: "ambiguous_memory_id",
+        message: `a Memory request whose id segment contains an encoded '/' before a "${MEMORY_CONTENT_SELECTOR_SUFFIX}" (or other property) suffix is refused: the suffix cannot be told from part of the id`,
+      }), { status: 400, headers: { "content-type": "application/json" } });
+    }
     const stripped = stripMemorySelection(request.url);
     if (stripped !== request.url) request.url = stripped;
   }
@@ -781,7 +862,7 @@ server.http(async (request: any, nextLayer: any) => {
   let memoryId: string | null = null;
   if (isMemoryWrite) {
     const pathParts = url.pathname.split("/").filter(Boolean);
-    memoryId = pathParts.length >= 2 ? decodeURIComponent(pathParts[1]) : (request.headers.get("x-memory-id") ?? null);
+    memoryId = pathParts.length >= 2 ? decodeMemoryIdSegment(pathParts[1]) : (request.headers.get("x-memory-id") ?? null);
   }
 
   const response = await nextLayer(request);

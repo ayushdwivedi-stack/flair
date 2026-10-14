@@ -57,8 +57,8 @@ export type SkipReason =
   // "unknown_table").
   | "pointer_not_federated"
   // ─── flair#2108 (an inbound Agent `status` that differs from the stored one) ──
-  // Emitted by FederationSync.post before the raw put, for a record that passed
-  // the earlier sync checks: an inbound Agent record
+  // Emitted by FederationSync.post's merge plan for a record that passed the
+  // earlier sync checks: an inbound Agent record
   // whose effective status (a missing `status` counts as "active") differs from
   // an existing local Agent's effective stored status, also when the record is older than the stored row and would
   // lose the last-write-wins merge. The federation path carries no verified
@@ -67,7 +67,15 @@ export type SkipReason =
   | "agent_status_not_federated"
   // Emitted by FederationSync.post before the row is read: the payload's id is
   // missing or is not the envelope's id, so the record is not applied.
-  | "id_mismatch";
+  | "id_mismatch"
+  | "invalid_expiry"
+  // Emitted by FederationSync.post when row confirmation fails for a planned
+  // merge write.
+  // The initial check compares the whole stored row for every synced table;
+  // the final check compares the committed row with the in-transaction read. A
+  // change committed after that final check is not seen. Nothing was written on
+  // a refusal (flair#2441, flair#2450, flair#2475).
+  | "merge_target_changed";
 
 /**
  * Static policy for every table FederationSync will merge.

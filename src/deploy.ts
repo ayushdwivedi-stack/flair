@@ -6,10 +6,12 @@ import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import {
   COMPONENT_ENV_FILENAME,
+  MCP_ISSUER_KEY,
   PUBLIC_URL_KEY,
   isLoopbackUrl,
   planComponentEnv,
   publicUrlRemedy,
+  readEnvValue,
   type ComponentEnvPlan,
 } from "./component-env.js";
 import {
@@ -23,6 +25,8 @@ import {
 } from "./replication-convergence.js";
 import { DEFAULT_STAMP_VERIFY_TIMEOUT_MS, verifyStampMigrationConverged } from "./stamp-migration-verify.js";
 import { FABRIC_NPM_INSTALL_COMMAND } from "./fabric-npm-install.js";
+import { discriminateMcpOAuthDiscovery, reportMcpOAuthDiscovery } from "./lib/mcp-enable.js";
+import { mcpOAuthEnabledFromComponentEnv } from "./lib/mcp-oauth-env.js";
 
 export interface DeployOptions {
   fabricOrg?: string;
@@ -1162,6 +1166,62 @@ export async function verifyDeployServing(o: VerifyDeployOptions): Promise<void>
   onProgress?.(`served API verified non-404 for ${resources.length} resource(s)`);
 }
 
+/**
+ * flair#2283 — post-deploy verification that the target's OAuth discovery
+ * advertises the MCP token endpoint of an issuer the deploy knows.
+ *
+ * Runs the SAME discriminator `flair mcp enable` runs (src/lib/mcp-enable.ts),
+ * imported rather than re-derived. The discriminator binds a positive
+ * classification to a CALLER-KNOWN issuer: the document's own `issuer` must
+ * EQUAL one of the candidates this deploy knows independently of the document —
+ * the configured `FLAIR_PUBLIC_URL` / `FLAIR_MCP_ISSUER` read from the shipped
+ * component `.env`, plus the origin shipped to — and its `token_endpoint` must be
+ * that issuer's endpoint. A document advertising flair's own `<issuer>/OAuthToken`
+ * is a named failure when the shipped component `.env` implies MCP OAuth is enabled
+ * and the document's issuer is one of those candidates. An unreadable, non-JSON, or
+ * unrecognized document — including one whose issuer is not a candidate — is
+ * reported as unverified, never as a pass.
+ *
+ * The deploy cannot read the TARGET's environment; `mcpOAuthConfigured` and the
+ * `FLAIR_PUBLIC_URL` / `FLAIR_MCP_ISSUER` candidates are read from the `.env` it
+ * shipped.
+ *
+ * A staged `.env` read failure is reported by name before discovery is probed.
+ */
+export async function verifyDeployedMcpDiscovery(o: {
+  url: string;
+  mcpOAuthConfigured: boolean;
+  /** Issuers the deploy knows INDEPENDENTLY of the target's document: the
+   *  configured `FLAIR_PUBLIC_URL` / `FLAIR_MCP_ISSUER` read from the shipped
+   *  component `.env`. The origin shipped to is always added. A document whose
+   *  `issuer` is none of these is `unrecognized`, never a failure. */
+  knownIssuers?: string[];
+  /** Why the staged component `.env` could not be read, when it could not. Set
+   *  by `deploy()` from the staging cleanup. */
+  stagedEnvReadError?: string | null;
+  onProgress?: (msg: string) => void;
+  fetchImpl?: typeof fetch;
+}): Promise<void> {
+  if (o.stagedEnvReadError) {
+    throw new Error(
+      `deploy verification: could not read the staged .env; discovery not verified — ${o.stagedEnvReadError}`,
+    );
+  }
+  const discovery = await discriminateMcpOAuthDiscovery(o.url, {
+    fetchImpl: o.fetchImpl,
+    expectedIssuers: [o.url, ...(o.knownIssuers ?? [])],
+  });
+  const report = reportMcpOAuthDiscovery(discovery, o.mcpOAuthConfigured);
+  if (report.severity === "error") {
+    throw new Error(`deploy verification: ${report.lines.join(" ")}`);
+  }
+  if (report.severity === "warn") {
+    for (const line of report.lines) console.warn(`⚠ flair deploy: ${line}`);
+  } else {
+    for (const line of report.lines) o.onProgress?.(line);
+  }
+}
+
 export async function deploy(opts: DeployOptions): Promise<DeployResult> {
   const errors = validateOptions(opts);
   if (errors.length) {
@@ -1218,6 +1278,16 @@ export async function deploy(opts: DeployOptions): Promise<DeployResult> {
 
   let replicationWarning: boolean;
   let convergedAfterReplicationError: boolean;
+  // flair#2283: infer MCP OAuth enablement AND read the caller-known issuers from
+  // the shipped component `.env` before cleaning up the staged tree. This does not
+  // read target environment. Staging keeps an operator's FLAIR_PUBLIC_URL when it
+  // differs from the deploy target (component-env.ts planComponentEnv), so the
+  // shipped value — not the target URL alone — is the caller-known issuer the
+  // discovery check binds against.
+  let mcpOAuthConfigured = false;
+  let deployedKnownIssuers: string[] = [];
+  // Carry a staged `.env` read failure to discovery verification.
+  let stagedEnvReadError: string | null = null;
   try {
     ({ replicationWarning, convergedAfterReplicationError } = await runHarperDeploy(
       harperBin,
@@ -1229,6 +1299,18 @@ export async function deploy(opts: DeployOptions): Promise<DeployResult> {
       project,
     ));
   } finally {
+    try {
+      const envPath = join(staged.dir, COMPONENT_ENV_FILENAME);
+      const shippedEnvText = existsSync(envPath) ? readFileSync(envPath, "utf8") : null;
+      mcpOAuthConfigured = mcpOAuthEnabledFromComponentEnv(shippedEnvText);
+      deployedKnownIssuers = [readEnvValue(shippedEnvText, PUBLIC_URL_KEY), readEnvValue(shippedEnvText, MCP_ISSUER_KEY)].filter(
+        (issuer): issuer is string => typeof issuer === "string" && issuer.trim() !== "",
+      );
+    } catch (err: any) {
+      mcpOAuthConfigured = false;
+      deployedKnownIssuers = [];
+      stagedEnvReadError = String(err?.message ?? err);
+    }
     staged.cleanup();
   }
 
@@ -1280,6 +1362,17 @@ export async function deploy(opts: DeployOptions): Promise<DeployResult> {
         opts.onProgress?.(`issuer check did not run — ${issuerCheck.detail}`);
       }
     }
+
+    // flair#2283: the SAME discovery discriminator `flair mcp enable` runs — does
+    // the target's OAuth discovery advertise the expected MCP token endpoint?
+    // See verifyDeployedMcpDiscovery.
+    await verifyDeployedMcpDiscovery({
+      url,
+      mcpOAuthConfigured,
+      knownIssuers: deployedKnownIssuers,
+      stagedEnvReadError,
+      onProgress: opts.onProgress,
+    });
   }
 
   return {

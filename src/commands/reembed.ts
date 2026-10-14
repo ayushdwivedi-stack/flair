@@ -1,7 +1,6 @@
 /**
  * reembed.ts — extracted from src/cli.ts (flair#1636, epic #1618).
  *
- * Pure move, ZERO behavior change: `flair reembed`.
  * Shared cli-locals stay in cli.ts and are injected via bindCli() before
  * register(); this module never imports src/cli.ts. Top-level imports only
  * (no require(), #1653). Compiled strictly via tsconfig.check.src.json.
@@ -9,6 +8,13 @@
 import { Command } from "commander";
 import { authFetch, defaultKeysDir, resolveAdminUser } from "../lib/auth-resolve.js";
 import { encodeRecordId } from "../lib/record-id-path.js";
+import {
+  MEMORY_REEMBED_PATCH_CAPABILITY,
+  healthVersion,
+  parseHealthCapabilities,
+  reembedUnsupportedMessage,
+  reembedUnverifiedMessage,
+} from "../lib/reembed-server-support.js";
 import { existsSync } from "node:fs";
 
 export type ReembedCli = {
@@ -36,14 +42,66 @@ function resolveOpsPort(...args: any[]): any {
   return cli.resolveOpsPort(...args);
 }
 
+/**
+ * flair#2296: re-embed one stored row. The PATCH body names only the two
+ * embedding fields; the server embeds the stored row and writes embedding,
+ * embeddingModel and updatedAt.
+ */
+export async function reembedRow(baseUrl: string, agentId: string, keyPath: string, id: string, intendedModel: string): Promise<boolean> {
+  const res = await authFetch(baseUrl, agentId, keyPath, "PATCH", `/Memory/${encodeRecordId(id)}`, {
+    embedding: null, embeddingModel: null,
+  });
+  if (!res.ok) return false;
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    return false;
+  }
+  const model = (body as { embeddingModel?: unknown } | null)?.embeddingModel;
+  return model === intendedModel;
+}
+
+/**
+ * flair#2337: refuse before the first write when the running server does not
+ * advertise the re-embed PATCH (#2298). Returns null when the token is present,
+ * else the refusal message to print. Reads the public `GET /Health` — no auth,
+ * so it works before any agent key is used and before the all-agents loop.
+ *
+ * Unreachable, non-200, non-JSON, or unparseable capability responses are refused.
+ */
+export async function reembedServerSupportError(baseUrl: string): Promise<string | null> {
+  let res: Response;
+  try {
+    res = await fetch(`${baseUrl}/Health`, { signal: AbortSignal.timeout(5000) });
+  } catch (err) {
+    return reembedUnverifiedMessage(`GET /Health failed (${(err as Error)?.message ?? String(err)})`);
+  }
+  if (res.status !== 200) {
+    return reembedUnverifiedMessage(`GET /Health returned HTTP ${res.status}`);
+  }
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    return reembedUnverifiedMessage("GET /Health did not return JSON");
+  }
+  const caps = parseHealthCapabilities(body);
+  if (caps === null) {
+    return reembedUnverifiedMessage("GET /Health reported capabilities in an unrecognized shape");
+  }
+  if (caps.includes(MEMORY_REEMBED_PATCH_CAPABILITY)) return null;
+  return reembedUnsupportedMessage(healthVersion(body));
+}
+
 export function register(program: Command): void {
 // ─── flair reembed ────────────────────────────────────────────────────────────
 //
 // ROOT-CAUSE GUARD — recall graph correctness (recall-hnsw-graph-heal).
-// `flair reembed` replaces the stored embedding of many rows IN PLACE (it
-// clears embedding/embeddingModel, then re-PUTs through Memory.put()'s regen
-// branch — the same bulk in-place re-embed path resources/migrations/
-// embedding-stamp.ts uses). Historically, an OLDER (pre-fix) Harper's
+// `flair reembed` replaces the stored embedding of many rows IN PLACE (one
+// PATCH per row, which Memory.patch() completes from the stored row; a bulk
+// in-place re-embed like resources/migrations/embedding-stamp.ts's).
+// Historically, an OLDER (pre-fix) Harper's
 // INCREMENTAL HNSW update left stale/asymmetric reverse edges under bulk
 // re-embed, which collapsed prod recall in July. That engine bug is FIXED in
 // the Harper this ships against (5.1.22) — its update path reconstructs the
@@ -79,6 +137,21 @@ program
     const dryRun = opts.dryRun ?? false;
     const batchSize = Number(opts.batchSize);
     const delayMs = Number(opts.delayMs);
+
+    // A call with neither --agent nor an admin password is a usage error; report
+    // it before the server check below so the existing message is not masked.
+    const adminPassEnv = process.env.FLAIR_ADMIN_PASS ?? process.env.HDB_ADMIN_PASSWORD;
+    if (!agentId && !adminPassEnv) {
+      console.error("❌ Admin password required when --agent is not specified (set FLAIR_ADMIN_PASS or HDB_ADMIN_PASSWORD)");
+      process.exit(1);
+    }
+
+    // flair#2337: require the advertised token before either PATCH loop.
+    const supportError = await reembedServerSupportError(baseUrl);
+    if (supportError) {
+      console.error(supportError);
+      process.exit(1);
+    }
 
     // flair#504 Phase 2: MUST match resources/embeddings-provider.ts's
     // getModelId() — including THE GATE (EMBEDDING_PREFIXES_ENABLED), not
@@ -129,11 +202,7 @@ program
 
     // When no agent specified, use admin auth to fetch all memories
     if (!agentId) {
-      const adminPass = process.env.FLAIR_ADMIN_PASS ?? process.env.HDB_ADMIN_PASSWORD;
-      if (!adminPass) {
-        console.error("❌ Admin password required when --agent is not specified (set FLAIR_ADMIN_PASS or HDB_ADMIN_PASSWORD)");
-        process.exit(1);
-      }
+      const adminPass = adminPassEnv!;
 
       // Fetch every memory via the Harper ops API (search_by_conditions on the
       // Memory table) rather than POST /SemanticSearch. SemanticSearch goes
@@ -206,10 +275,7 @@ program
           const batch = memories.slice(i, i + batchSize);
           for (const memory of batch) {
             try {
-              const updateRes = await authFetch(baseUrl, agent, privPath, "PUT", `/Memory/${encodeRecordId(memory.id)}`, {
-                id: memory.id, content: memory.content, embedding: undefined, embeddingModel: undefined, agentId: memory.agentId || agent,
-              });
-              if (updateRes.ok) processed++;
+              if (await reembedRow(baseUrl, agent, privPath, memory.id, currentModel)) processed++;
               else errors++;
             } catch { errors++; }
           }
@@ -300,10 +366,7 @@ program
       const batch = candidates.slice(i, i + batchSize);
       for (const memory of batch) {
         try {
-          const updateRes = await authFetch(baseUrl, agentId, privPath, "PUT", `/Memory/${encodeRecordId(memory.id)}`, {
-            id: memory.id, content: memory.content, embedding: undefined, embeddingModel: undefined, agentId: memory.agentId || opts.agent,
-          });
-          if (updateRes.ok) processed++;
+          if (await reembedRow(baseUrl, agentId, privPath, memory.id, currentModel)) processed++;
           else errors++;
         } catch { errors++; }
       }

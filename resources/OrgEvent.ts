@@ -11,6 +11,7 @@
  * distinguishes internal/agent/anonymous explicitly.
  */
 
+import { randomUUID } from "node:crypto";
 import { databases } from "harper";
 import { resolveAgentAuth } from "./agent-auth.js";
 import { guardOwnerFieldImmutable } from "./owner-field-guard.js";
@@ -56,7 +57,8 @@ export class OrgEvent extends (databases as any).flair.OrgEvent {
     // completeness only.
     stampAttribution(auth, content, RECORD_TYPES.OrgEvent.ownerField, RECORD_TYPES.OrgEvent.attribution.post, "forbidden: unreachable for stamp-default");
 
-    if (!content.id) content.id = `${content.authorId}-${new Date().toISOString()}`;
+    // flair#2333 (H9): avoids deterministic same-millisecond collisions (random UUID).
+    if (!content.id) content.id = `${content.authorId}-${new Date().toISOString()}-${randomUUID()}`;
     content.createdAt = new Date().toISOString();
 
     // attention-plane vocabulary gate (flair#675): `entities`, if present,
@@ -64,6 +66,17 @@ export class OrgEvent extends (databases as any).flair.OrgEvent {
     // Field is additive/optional; absent entities is not an error.
     const entitiesError = invalidEntitiesResponse(content.entities);
     if (entitiesError) return entitiesError;
+
+    // flair#2333 (N2): refuses a non-admin POST naming a row observed at the
+    // guard's lookup as owned by another agent. This read-then-write check is
+    // not atomic; a row appearing after the lookup is not covered.
+    const ownerDenial = await guardOwnerFieldImmutable(
+      this,
+      () => (databases as any).flair.OrgEvent.get(content.id, {}),
+      content,
+      RECORD_TYPES.OrgEvent.ownerField,
+    );
+    if (ownerDenial) return ownerDenial;
 
     // Harper 5: table resources use put() for create/upsert (post() removed).
     return (databases as any).flair.OrgEvent.put(content);

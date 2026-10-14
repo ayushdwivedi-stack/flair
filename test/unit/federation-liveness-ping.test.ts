@@ -1,4 +1,4 @@
-import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test";
+import { describe, it, expect, mock, beforeEach, afterEach, setSystemTime } from "bun:test";
 import nacl from "tweetnacl";
 
 /**
@@ -14,7 +14,7 @@ import nacl from "tweetnacl";
  * from dead.
  *
  * flair#1146: the spoke's own lastSyncAt must not advance unless that ping
- * (or a sendBatch) returned 200. A failed ping leaves the stamp untouched.
+ * (or a sendBatch) got a successful response. A failed ping leaves the stamp untouched.
  */
 
 const origFetch = globalThis.fetch;
@@ -35,6 +35,12 @@ function res(ok: boolean, status: number, body: any) {
 
 const testKp = nacl.sign.keyPair();
 
+// flair#2514 — the spoke cursor must carry the timestamp captured BEFORE the
+// table queries, not the time the write lands. The mock advances a frozen
+// clock once the queries begin, so a write-time stamp is observably later.
+const PRE_QUERY_STAMP = "2026-10-12T12:00:00.000Z";
+const POST_QUERY_STAMP = "2026-10-12T12:00:05.000Z";
+
 describe("federation liveness ping on no-change sync", () => {
   let capturedCalls: Array<{ url: string; body?: any; method?: string }> = [];
 
@@ -44,9 +50,11 @@ describe("federation liveness ping on no-change sync", () => {
 
   afterEach(() => {
     globalThis.fetch = origFetch;
+    setSystemTime();
   });
 
-  function installNoChangeMock(pingStatus: number = 200) {
+  function installNoChangeMock(pingStatus: number = 200, onFirstTableQuery?: () => void) {
+    let advanced = false;
     globalThis.fetch = mock(async (urlInput: string | URL | Request, init?: RequestInit) => {
       const url = typeof urlInput === "string" ? urlInput : urlInput.toString();
       const method = init?.method ?? "GET";
@@ -60,6 +68,7 @@ describe("federation liveness ping on no-change sync", () => {
         return res(true, 200, { id: "spoke-alpha", publicKey: Buffer.from(testKp.publicKey).toString("base64url"), role: "spoke" });
       }
       if (body?.operation === "search_by_conditions") {
+        if (!advanced) { advanced = true; onFirstTableQuery?.(); }
         return res(true, 200, []);
       }
       if (body?.operation === "search_by_value" && body.table === "Peer") {
@@ -159,9 +168,9 @@ describe("federation liveness ping on no-change sync", () => {
     expect(peerUpserts()).toHaveLength(0);
   });
 
-  it("ping ok → lastSyncAt is written AFTER the ping, at completion time", async () => {
-    const t0 = Date.now();
-    installNoChangeMock(200);
+  it("ping ok → lastSyncAt is stamped after the ping with the pre-query timestamp (flair#2514)", async () => {
+    setSystemTime(new Date(PRE_QUERY_STAMP));
+    installNoChangeMock(200, () => setSystemTime(new Date(POST_QUERY_STAMP)));
 
     const { runFederationSyncOnce } = await import("../../src/cli");
     await runFederationSyncOnce({
@@ -174,8 +183,7 @@ describe("federation liveness ping on no-change sync", () => {
     expect(pingIdx).toBeGreaterThan(-1);
     expect(cursorIdx).toBeGreaterThan(pingIdx);
     const stamp = capturedCalls[cursorIdx]?.body?.records?.[0]?.lastSyncAt;
-    expect(typeof stamp).toBe("string");
-    expect(Date.parse(stamp)).toBeGreaterThanOrEqual(t0);
+    expect(stamp).toBe(PRE_QUERY_STAMP);
   });
 });
 
@@ -204,5 +212,106 @@ describe("hub-side FederationSync with empty records", () => {
     expect(peerUpdate.lastSyncAt).toBe(nowIso);
     expect(peerUpdate.lastSyncAt).not.toBe(peer.lastSyncAt);
     expect(peerUpdate.lastMergeAt).toBeUndefined();
+  });
+});
+
+/**
+ * flair#2450 — the spoke-side cursor update request after a batch.
+ *
+ * The item-3 real-Harper case drives a single instance that is both the
+ * client's hub and the receiver, so FederationSync.post's own contact write and
+ * runFederationSyncOnce's stampLocalContact both touch the SAME Peer row the
+ * client re-reads as `since` — the advance cannot be attributed. These unit
+ * cases isolate stampLocalContact with a mocked wire: one successful batch
+ * produces one field-only Peer update request; a later failed batch produces none.
+ */
+describe("flair#2450 — spoke cursor update requests after successful and failed batches", () => {
+  const origFetch = globalThis.fetch;
+  let calls: Array<{ url: string; method?: string; body?: any }> = [];
+  const INSTANCE = "spoke-batch-2450";
+  const HUB = "hub-batch-2450";
+  const CURSOR = "2025-01-01T00:00:00.000Z";
+  const kp = nacl.sign.keyPair();
+
+  beforeEach(() => { calls = []; });
+  afterEach(() => { globalThis.fetch = origFetch; setSystemTime(); });
+
+  function installBatchMock(batchStatuses: number[], rowCount = 1, onFirstTableQuery?: () => void) {
+    let post = 0;
+    let advanced = false;
+    globalThis.fetch = mock(async (urlInput: string | URL | Request, init?: RequestInit) => {
+      const url = typeof urlInput === "string" ? urlInput : urlInput.toString();
+      const method = init?.method ?? "GET";
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      calls.push({ url, method, body });
+
+      if (method === "GET" && url.includes("/FederationPeers")) {
+        return res(true, 200, { peers: [{ id: HUB, role: "hub", status: "connected", endpoint: "http://hub:9926", lastSyncAt: CURSOR }] });
+      }
+      if (method === "GET" && url.includes("/FederationInstance")) {
+        return res(true, 200, { id: INSTANCE, publicKey: Buffer.from(kp.publicKey).toString("base64url"), role: "spoke" });
+      }
+      if (body?.operation === "search_by_conditions") {
+        if (!advanced) { advanced = true; onFirstTableQuery?.(); }
+        if (body.table !== "Memory") return res(true, 200, []);
+        // Only the `updatedAt > cursor` query yields rows; the `updatedAt == null`
+        // query yields none, so the row count is exactly `rowCount`.
+        if (body.conditions?.[0]?.search_value === null) return res(true, 200, []);
+        return res(true, 200, Array.from({ length: rowCount }, (_, i) => ({
+          id: `mem-batch-${i}`, agentId: "agent-1", content: `hello ${i}`, contentHash: `hash-${i}`,
+          instanceToken: `tok-${i}`, durability: "persistent", visibility: "shared", archived: false,
+          createdAt: new Date(Date.now() - 60_000).toISOString(), updatedAt: new Date().toISOString(),
+        })));
+      }
+      if (body?.operation === "search_by_value" && body.table === "Instance") {
+        return res(true, 200, [{ id: INSTANCE, _keySeed: Buffer.from(kp.secretKey.slice(0, 32)).toString("base64url") }]);
+      }
+      if (method === "POST" && url.includes("/FederationSync")) {
+        const status = batchStatuses[Math.min(post, batchStatuses.length - 1)] ?? 200;
+        post++;
+        const sent = (body?.records ?? []).length;
+        return res(status === 200, status,
+          status === 200 ? { merged: sent, skipped: 0, skippedReasons: {}, total: sent, durationMs: 1 } : { error: "service unavailable" });
+      }
+      if (body?.operation === "update" && body?.table === "Peer") {
+        return res(true, 200, { update_hashes: [HUB], skipped_hashes: [] });
+      }
+      throw new Error(`Unexpected fetch call: ${method} ${url} body=${JSON.stringify(body)}`);
+    }) as any;
+  }
+
+  const cursorWrites = () => calls.filter((c) => c.body?.operation === "update" && c.body?.table === "Peer");
+
+  it("one batch, 200 → the cursor is stamped once, after the batch, at the pre-query timestamp", async () => {
+    setSystemTime(new Date(PRE_QUERY_STAMP));
+    installBatchMock([200], 1, () => setSystemTime(new Date(POST_QUERY_STAMP)));
+    const { runFederationSyncOnce } = await import("../../src/cli");
+    const result = await runFederationSyncOnce({ adminPass: "test-admin-pass", opsPort: "9925" });
+
+    expect(result.error, String(result.error)).toBeUndefined();
+    expect(result.pushed).toBe(1);
+
+    const batchIdx = calls.findIndex((c) => c.url.includes("/FederationSync") && c.method === "POST");
+    const writes = cursorWrites();
+    expect(batchIdx, "no batch POST was sent").toBeGreaterThan(-1);
+    expect(writes.length, "the spoke cursor was not stamped exactly once").toBe(1);
+    const writeIdx = calls.findIndex((c) => c.body?.operation === "update" && c.body?.table === "Peer");
+    expect(writeIdx, "the cursor was stamped before the batch").toBeGreaterThan(batchIdx);
+    const stamp = writes[0]?.body?.records?.[0]?.lastSyncAt;
+    expect(stamp, "the cursor was not the pre-query timestamp").toBe(PRE_QUERY_STAMP);
+    expect(writes[0]?.body?.records?.[0]?.id).toBe(HUB);
+  });
+
+  it("a LATER batch that fails does not stamp: an earlier 200 does not advance the cursor (no per-batch stamp)", async () => {
+    // The fixture produces a successful batch followed by a failed batch.
+    // Assert no cursor update request, including after the earlier success.
+    installBatchMock([200, 503], 51);
+    const { runFederationSyncOnce } = await import("../../src/cli");
+    const result = await runFederationSyncOnce({ adminPass: "test-admin-pass", opsPort: "9925" });
+
+    expect(result.error, "a failed batch must surface").toBeDefined();
+    const posts = calls.filter((c) => c.url.includes("/FederationSync") && c.method === "POST");
+    expect(posts.length, "expected two batches (50 then 1)").toBeGreaterThan(1);
+    expect(cursorWrites().length, "the cursor advanced after the first batch despite a later failure").toBe(0);
   });
 });

@@ -39,6 +39,7 @@ import {
 } from "../mcp-client-assertion.js";
 import {
   enableMcp,
+  refreshMcpOAuthFlag,
   disableMcp,
   mcpStatus,
   checkLocalOriginRefusal,
@@ -48,9 +49,12 @@ import {
   cimdAllowedHostsFromFlag,
   claudeAiExcludedNote,
   type EnableMcpResult,
+  type RefreshMcpFlagResult,
   type SecretsMechanism,
 } from "../lib/mcp-enable.js";
 import { resolveHome } from "../lib/home.js";
+import { invalidAgentIdMessage, isValidAgentId } from "../lib/agent-id-rule.js";
+import { agentHomeEndpoint, resolveTargetInstanceId } from "../lib/agent-home.js";
 
 export type McpCli = {
   resolveOpsPort: (opts: { opsPort?: string | number; port?: string | number }) => number;
@@ -229,8 +233,6 @@ export class McpClientNotFoundError extends Error {
   }
 }
 
-const MCP_CLIENT_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
-
 export interface McpGrantParams {
   name: string;
   keysDir: string;
@@ -265,10 +267,13 @@ export async function grantMcpClient(params: McpGrantParams, deps: McpGrantDeps 
   const now = deps.now ?? (() => new Date().toISOString());
   const generateKeyPair = deps.generateKeyPair ?? (() => nacl.sign.keyPair());
 
-  if (!MCP_CLIENT_NAME_PATTERN.test(name)) {
+  if (!isValidAgentId(name)) {
+    throw new Error(`Invalid machine client name '${name}' — ${invalidAgentIdMessage(name)}.`);
+  }
+  // MCP client naming policy also requires a leading letter or digit.
+  if (!/^[a-zA-Z0-9]/.test(name)) {
     throw new Error(
-      `Invalid machine client name '${name}' — must be 1-64 chars, start alphanumeric, ` +
-        `and contain only letters, digits, '_', '-' (it becomes an Agent id, a key filename, and a URL path segment).`,
+      `Invalid machine client name '${name}' — MCP client naming policy: must start with a letter or digit.`,
     );
   }
 
@@ -312,6 +317,9 @@ export async function grantMcpClient(params: McpGrantParams, deps: McpGrantDeps 
   writeFileSync(pubPath, Buffer.from(kp.publicKey));
 
   const nowIso = now();
+  // flair#2433 — the new Agent row's home is THIS instance's federation id,
+  // resolved through the one shared rule; a create stamps it.
+  const home = await resolveTargetInstanceId(agentHomeEndpoint(opsUrl, adminUser, adminPass, fetchImpl));
   const insertRes = await fetchImpl(opsUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: authHeader },
@@ -330,6 +338,7 @@ export async function grantMcpClient(params: McpGrantParams, deps: McpGrantDeps 
         defaultTrustTier: "unverified",
         runtime: "headless",
         publicKey: pubKeyB64url,
+        originatorInstanceId: home,
         createdAt: nowIso,
         updatedAt: nowIso,
       }],
@@ -486,6 +495,19 @@ function printEnableSteps(result: EnableMcpResult): void {
     console.log(`     ${s.detail}`);
   }
   console.log("");
+}
+
+function printRefreshFlagSteps(result: RefreshMcpFlagResult): void {
+  console.log(`\n${render.wrap(render.c.bold, "flair mcp enable --refresh-flag")}${result.dryRun ? render.wrap(render.c.dim, " (dry run)") : ""}\n`);
+  for (const s of result.steps) {
+    console.log(`  ${s.ok ? render.icons.ok : render.icons.error} ${render.wrap(render.c.dim, s.step)}`);
+    console.log(`     ${s.detail}`);
+  }
+  console.log("");
+  if (result.ok && !result.dryRun) {
+    console.log(`${render.icons.ok} ${render.wrap(render.c.bold, "Encrypted FLAIR_MCP_OAUTH=true update accepted; secret processEnv marker, restart and discovery metadata checks passed.")} Confirm with \`flair mcp status\`.`);
+    console.log("");
+  }
 }
 
 export function register(program: Command): void {
@@ -822,7 +844,8 @@ export function register(program: Command): void {
     .option("--admin-user <name>", "Admin username for Basic auth (env: FLAIR_ADMIN_USER; default: admin)")
     .option("--confirm-secrets-applied", "Confirm the staged secrets are already live on the target instance's environment (skips the interactive confirm)")
     .option("--fabric", "Use the Fabric branch and default to Fabric secrets staging; refused for a localhost, *.localhost, 127/8, ::1, ::ffff:127/8, 0.0.0.0 or :: target host")
-    .option("--dry-run", "Check target syntax, issuer hostname/IP literal, IdP credential presence and any CIMD list/local config. Write no file and make no remote call. Skip process/config matching and live checks; a custom remote target can pass dry run and be refused without --dry-run")
+    .option("--dry-run", "Preview enable or refresh without writing files or making remote calls. Skip live checks; refresh refuses an occupied explicit --secrets-path")
+    .option("--refresh-flag", "One-shot migration (flair#2283): attempt the encrypted FLAIR_MCP_OAUTH=true push, check the secret row's processEnv marker, restart and check discovery metadata; when the update could not be pushed or confirmed, attempt a 0600 fallback file and exit non-zero. An occupied explicit path is refused before probing, including in dry run; an occupied default path is refused when fallback is needed. Uses a separate default filename; --secrets-path can select mcp enable's path. Does not re-run IdP intake or apply identity mapping or CIMD changes. Use it to correct FLAIR_MCP_OAUTH=1, which does not enable the component's MCP AS")
     .option("--json", "Print machine-readable JSON instead of a human summary")
     .action(async (opts) => {
       const instance: string | undefined = opts.instance ?? process.env.FLAIR_URL;
@@ -863,6 +886,30 @@ export function register(program: Command): void {
             "else's Harper. Pass the target's own admin password explicitly.",
         );
         process.exit(1);
+      }
+
+      // flair#2283: refresh failures exit non-zero in both output modes.
+      if (opts.refreshFlag) {
+        const refreshed = await refreshMcpOAuthFlag(
+          {
+            instance,
+            issuer: opts.issuer,
+            adminUser: resolveAdminUser(opts.adminUser),
+            adminPass,
+            fabric: Boolean(opts.fabric),
+            dryRun,
+            secretsStagingPath: opts.secretsPath,
+          },
+          {},
+        );
+        if (opts.json) {
+          console.log(render.asJSON(refreshed));
+          if (!refreshed.ok) process.exit(1);
+          return;
+        }
+        printRefreshFlagSteps(refreshed);
+        if (!refreshed.ok) process.exit(1);
+        return;
       }
 
       let idpClientId: string | undefined = opts.idpClientId;

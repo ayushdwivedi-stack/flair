@@ -1,17 +1,18 @@
 /**
  * init.ts — extracted from src/cli.ts (flair#1636, epic #1618).
  *
- * Pure move, ZERO behavior change: `flair init` (first-run provisioning: config, admin pass, launchd service, soul wizard).
  * Shared cli-locals stay in cli.ts and are injected via bindCli() before
  * register(); this module never imports src/cli.ts. Top-level imports only
  * (no require(), #1653). Compiled strictly via tsconfig.check.src.json.
  */
 import { Command } from "commander";
-import { applyOrReportClaudeMdBootstrap, applyOrReportSessionStartHook } from "../doctor-client.js";
+import { applyOrReportClaudeMdBootstrap } from "../doctor-client.js";
+import { applyOrRepinSessionStartHook } from "../lib/owned-pins.js";
 import { hookSettingsPath } from "../hook-install.js";
 import { ClientId, claudeCodeMcpEntry, detectClients, renderWiringSummary, wireAntigravity, wireClaudeCodeJson, wireCodex, wireCursor, wireGemini, wirePi } from "../install/clients.js";
 import { DEFAULT_ADMIN_USER, authFetch, defaultAdminPassPath, defaultKeysDir, readAdminPassFileSecure, resolveAdminUser } from "../lib/auth-resolve.js";
 import {
+  INIT_RESET_ADMIN_PASS_COMMAND,
   detectPersistedAdminUser,
   executeAdminPasswordRotate,
   initAdminPassRefusalMessage,
@@ -21,6 +22,7 @@ import {
 import { canonicalLexicalPath } from "../lib/daemon-liveness.js";
 import { encodeRecordId } from "../lib/record-id-path.js";
 import { mcpServerSpec, unpinnedSpecWarning } from "../lib/mcp-spec.js";
+import { planRedirectMigration, renderRedirectMigration } from "../lib/mcp-oauth-env.js";
 import { seedUsingFlairSkill } from "../lib/skill-seed.js";
 import { clearSkillSeedPending, markSkillSeedPending } from "../lib/skill-seed-pending.js";
 import { opsSocketPathRefusal } from "../lib/socket-path-limit.js";
@@ -29,18 +31,16 @@ import { rewriteFederationSchedulerRuntime } from "../federation/scheduler.js";
 import { preferVersionManagerAlias } from "../lib/node-alias-path.js";
 import { spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
 
 import { join, resolve } from "node:path";
-import { createConnection } from "node:net";
+import { localPortState } from "../lib/init-tcp-probe.js";
+import { trackInitChild } from "../lib/init-spawn-attribution.js";
 import nacl from "tweetnacl";
 import { httpCorsAccessList } from "../lib/http-bind.js";
 import { resolveHome } from "../lib/home.js";
 import {
-  commandArg,
   foreignOccupiedListenerDetail,
-  describeOccupiedListener,
-  staleHarperBeforeAuthNotice,
   type OccupiedHarperListener,
   type OperationsPortAttribution,
 } from "../lib/init-occupied-listener.js";
@@ -69,6 +69,7 @@ export type InitCli = {
   repointMainServiceUnit: (...args: any[]) => any;
   resolveHttpPort: (...args: any[]) => any;
   writeAdminPassFile: (...args: any[]) => any;
+  proveAdminPassAgainstInstance: (port: number, adminPass: string) => Promise<string | null>;
   resolveOpsBindHost: (...args: any[]) => any;
   resolveHttpBindFor: (...args: any[]) => any;
   resolveOpsPort: (...args: any[]) => any;
@@ -77,6 +78,7 @@ export type InitCli = {
   resolveTarget: (...args: any[]) => any;
   runSoulWizard: (...args: any[]) => any;
   seedAgentViaOpsApi: (...args: any[]) => any;
+  seedAgentWithLocalHome: (...args: any[]) => any;
   seedFederationInstanceViaOpsApi: (...args: any[]) => any;
   readOccupiedListener: (port: number) => OccupiedHarperListener;
   resolveInstanceServingPid: (dataDir: string, port: number, deps: { findListeningPids: (port: number) => number[] }) => number | null;
@@ -91,21 +93,29 @@ export type InitCli = {
   STARTUP_TIMEOUT_MS: any;
 };
 
-async function localPortAcceptsTcp(port: number): Promise<boolean> {
-  return new Promise((resolveConnected) => {
-    const socket = createConnection({ host: "127.0.0.1", port });
-    const finish = (connected: boolean): void => {
-      socket.destroy();
-      resolveConnected(connected);
-    };
-    socket.setTimeout(1000);
-    socket.once("connect", () => finish(true));
-    socket.once("error", () => finish(false));
-    socket.once("timeout", () => finish(false));
-  });
-}
 
 let cli: InitCli;
+
+function ownedInitPidfilePid(dataDir: string): number | null {
+  let fd: number | undefined;
+  try {
+    const uid = process.getuid?.();
+    if (uid === undefined) return null;
+    const dir = lstatSync(dataDir);
+    if (!dir.isDirectory() || dir.uid !== uid || (dir.mode & 0o022)) return null;
+    fd = openSync(join(dataDir, "hdb.pid"), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const file = fstatSync(fd);
+    if (!file.isFile() || file.nlink !== 1 || file.size > 32 || file.uid !== uid || (file.mode & 0o022)) return null;
+    const value = readFileSync(fd, "utf8").trim();
+    if (!/^[1-9]\d*$/.test(value)) return null;
+    const pid = Number(value);
+    return Number.isSafeInteger(pid) ? pid : null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
 
 /** Bind the cli-locals this module depends on. */
 export function bindCli(fns: InitCli): void {
@@ -196,6 +206,10 @@ function writeAdminPassFile(...args: any[]): any {
   return cli.writeAdminPassFile(...args);
 }
 
+function proveAdminPassAgainstInstance(port: number, adminPass: string): Promise<string | null> {
+  return cli.proveAdminPassAgainstInstance(port, adminPass);
+}
+
 function resolveOpsBindHost(...args: any[]): any {
   return cli.resolveOpsBindHost(...args);
 }
@@ -230,6 +244,10 @@ function reconcileFederationInstanceViaOpsApi(...args: any[]): any {
 
 function seedAgentViaOpsApi(...args: any[]): any {
   return cli.seedAgentViaOpsApi(...args);
+}
+
+function seedAgentWithLocalHome(...args: any[]): any {
+  return cli.seedAgentWithLocalHome(...args);
 }
 
 function seedFederationInstanceViaOpsApi(...args: any[]): any {
@@ -439,6 +457,39 @@ program
       let privPath: string | undefined;
       let instanceId: string | undefined;
 
+      // Reconcile the federation Instance identity row if --remote (hub role).
+      // flair#1883: this used to INSERT a row with a fresh random id on every
+      // run, so a hub that had already answered a `GET /FederationInstance`
+      // (which find-or-creates a `spoke` row) ended up with TWO rows and no
+      // canonical identity. Reconciling keeps the row peers already know.
+      // It runs before the agent seed so the agent's home is the hub's id.
+      const reconcileHubInstance = async (publicKey: string): Promise<void> => {
+        instanceId = randomUUID();
+        console.log(`Reconciling federation Instance (role=${role}) via ops API...`);
+        let reconciled: { action: string; id: string };
+        try {
+          reconciled = await reconcileFederationInstanceViaOpsApi(
+            opsUrl,
+            { instanceId, publicKey },
+            adminUser,
+            flairAdminPass,
+          );
+        } catch (err: any) {
+          // A refusal (two rows) or an unreachable ops API — both are this
+          // command failing, and both already name what to do.
+          console.error(`Error: ${err?.message ?? err}`);
+          process.exit(1);
+        }
+        instanceId = reconciled.id;
+        if (reconciled.action === "created") {
+          console.log(`Federation Instance created: ${reconciled.id} (role=${role}) ✓`);
+        } else if (reconciled.action === "updated") {
+          console.log(`Federation Instance reconciled: ${reconciled.id} is now role=${role} (id and key kept) ✓`);
+        } else {
+          console.log(`Federation Instance already role=${role}: ${reconciled.id} — no change ✓`);
+        }
+      };
+
       if (agentId || role) {
         const keysDir: string = opts.keysDir ?? defaultKeysDir();
         mkdirSync(keysDir, { recursive: true });
@@ -463,15 +514,18 @@ program
             console.log(`Keypair written: ${privPath} ✓`);
           }
 
+          if (role) await reconcileHubInstance(pubKeyB64url!);
+
           // Seed agent via remote ops API
           console.log(`Seeding agent '${agentId}' on ${baseUrl}...`);
-          await seedAgentViaOpsApi(opsUrl, agentId, pubKeyB64url, adminUser, flairAdminPass);
+          await seedAgentWithLocalHome(opsUrl, agentId, pubKeyB64url, adminUser, flairAdminPass);
           console.log(`Agent '${agentId}' registered on remote instance ✓`);
         } else {
           // No agentId -- generate throwaway keypair for FederationInstance row
           console.log("Generating federation instance keypair...");
           const kp = nacl.sign.keyPair();
           pubKeyB64url = b64url(kp.publicKey);
+          if (role) await reconcileHubInstance(pubKeyB64url!);
         }
       } else {
         console.log("No --agent-id provided -- skipping agent registration");
@@ -480,42 +534,6 @@ program
       // flair#2141 S2 — seed the org-wide using-flair skill on the remote
       // instance, as the operator. Idempotent; a refusal fails this run.
       await seedUsingFlairSkillViaRest(baseUrl, adminUser, flairAdminPass);
-
-      // Reconcile the federation Instance identity row if --remote (hub role).
-      // flair#1883: this used to INSERT a row with a fresh random id on every
-      // run, so a hub that had already answered a `GET /FederationInstance`
-      // (which find-or-creates a `spoke` row) ended up with TWO rows and no
-      // canonical identity. Reconciling keeps the row peers already know.
-      if (role) {
-        if (!pubKeyB64url) {
-          const kp = nacl.sign.keyPair();
-          pubKeyB64url = b64url(kp.publicKey);
-        }
-        instanceId = randomUUID();
-        console.log(`Reconciling federation Instance (role=${role}) via ops API...`);
-        let reconciled: { action: string; id: string };
-        try {
-          reconciled = await reconcileFederationInstanceViaOpsApi(
-            opsUrl,
-            { instanceId, publicKey: pubKeyB64url },
-            adminUser,
-            flairAdminPass,
-          );
-        } catch (err: any) {
-          // A refusal (two rows) or an unreachable ops API — both are this
-          // command failing, and both already name what to do.
-          console.error(`Error: ${err?.message ?? err}`);
-          process.exit(1);
-        }
-        instanceId = reconciled.id;
-        if (reconciled.action === "created") {
-          console.log(`Federation Instance created: ${reconciled.id} (role=${role}) ✓`);
-        } else if (reconciled.action === "updated") {
-          console.log(`Federation Instance reconciled: ${reconciled.id} is now role=${role} (id and key kept) ✓`);
-        } else {
-          console.log(`Federation Instance already role=${role}: ${reconciled.id} — no change ✓`);
-        }
-      }
 
       // Verify connectivity
       if (didProvision) {
@@ -572,6 +590,17 @@ program
     // preflight measured. Every downstream use (preflight, config/plist,
     // ROOTPATH / HARPER_SET_CONFIG, messages) takes this resolved value.
     const dataDir: string = opts.dataDir ? resolve(opts.dataDir) : defaultDataDir();
+
+    try {
+      const migration = planRedirectMigration({
+        env: process.env as Record<string, string | undefined>,
+        configPath: join(flairPackageDir(), "config.yaml"),
+      });
+      const migrationLine = renderRedirectMigration(migration);
+      if (migrationLine) console.log(`  ${migrationLine}`);
+    } catch (err: any) {
+      console.error(`warning: MCP OAuth redirect migration could not run (${err?.message ?? String(err)}).`);
+    }
 
     // flair#916: the Harper operations API is a Unix domain socket at
     // `<data-dir>/operations-server`, and Unix socket paths are capped by
@@ -657,32 +686,63 @@ program
       process.exit(1);
     }
     let alreadyRunning = false;
+    let ownChild: ReturnType<typeof trackInitChild> | undefined;
+    const freeBeforeSpawn = new Set<number>();
+    const refuseUnattributedListener = (listener: OccupiedHarperListener): void => {
+      const installedAttributed = harperConfigPath(dataDir) !== null &&
+        listener.pids.length === 1 &&
+        ownedInitPidfilePid(dataDir) === listener.pids[0] &&
+        listener.dataDirs.every(dir => canonicalLexicalPath(dir) === canonicalLexicalPath(dataDir)) &&
+        cli.resolveInstanceServingPid(dataDir, listener.port, { findListeningPids: () => [] }) === listener.pids[0];
+      const attributed = ownChild ? ownChild.attributes(listener, dataDir, freeBeforeSpawn) : installedAttributed;
+      if (attributed) return;
+      const pid = listener.pids.length === 1 ? `, pid ${listener.pids[0]}` : "";
+      console.error(`Refusing init: port ${listener.port}${pid}: attribution to this data directory was not confirmed.`);
+      console.error(foreignOccupiedListenerDetail(listener));
+      process.exit(1);
+    };
+    const refuseFreePort = (listener: OccupiedHarperListener): void => {
+      const pid = listener.pids.length === 1 ? `, pid ${listener.pids[0]}` : "";
+      console.error(`Refusing init: port ${listener.port}${pid}: TCP readiness check failed.`);
+      console.error("Remedy: start the instance, then rerun init.");
+      process.exit(1);
+    };
+    const attributeBeforeCredential = async (port: number, host: string): Promise<void> => {
+      const deadline = Date.now() + STARTUP_TIMEOUT_MS;
+      let listener = readOccupiedListener(port);
+      let state = await localPortState(port, host);
+      while (ownChild && state === "free" && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        listener = readOccupiedListener(port);
+        state = await localPortState(port, host);
+      }
+      if (state === "free") refuseFreePort(listener);
+      if (state === "listening") listener = readOccupiedListener(port);
+      if (state === "unknown") refuseUnknownListener(listener);
+      refuseUnattributedListener(listener);
+    };
+    const refuseUnknownListener = (listener: OccupiedHarperListener): void => {
+      const pid = listener.pids.length === 1 ? `, pid ${listener.pids[0]}` : "";
+      console.error(`Refusing init: port ${listener.port}${pid}: TCP probe was inconclusive.`);
+      console.error("Remedy: check TCP connectivity, then rerun init.");
+      process.exit(1);
+    };
     if (opts.skipStart && !agentId) {
-      let healthStatus: number | undefined;
       try {
         const res = await fetch(`http://127.0.0.1:${httpPort}/health`, { signal: AbortSignal.timeout(1000) });
         if (res.status > 0) {
           alreadyRunning = true;
-          healthStatus = res.status;
         }
       } catch {}
-      const refuseUnattributedListener = (listener: OccupiedHarperListener, answered: string): void => {
-        const attributed = harperConfigPath(dataDir) !== null &&
-          listener.pids.length === 1 &&
-          listener.dataDirs.every(dir => canonicalLexicalPath(dir) === canonicalLexicalPath(dataDir)) &&
-          (listener.dataDirs.length === 1 ||
-            cli.resolveInstanceServingPid(dataDir, listener.port, { findListeningPids: () => [] }) === listener.pids[0]);
-        if (attributed) return;
-        console.error(`Refusing init: port ${listener.port} ${answered}; listener ${describeOccupiedListener(listener)} is not attributed to an installed Harper in ${dataDir}.`);
-        console.error(foreignOccupiedListenerDetail(listener, dataDir));
-        console.error("Remedy: free that port or choose --port and --ops-port for this data directory, then rerun init.");
-        process.exit(1);
-      };
       const httpListener = readOccupiedListener(httpPort);
-      alreadyRunning ||= httpListener.pids.length > 0 || await localPortAcceptsTcp(httpPort);
+      const httpState = await localPortState(httpPort, httpBind.host);
+      alreadyRunning ||= httpListener.pids.length > 0 || httpState === "listening";
       if (alreadyRunning) {
-        refuseUnattributedListener(httpListener, healthStatus === undefined ? "has a listener without a /health response" : `answered /health with HTTP ${healthStatus}`);
+        if (httpState === "free") refuseFreePort(httpListener);
+        refuseUnattributedListener(httpListener);
         console.log(`Harper already running on port ${httpPort} — skipping start`);
+      } else if (httpState === "unknown") {
+        refuseUnknownListener(httpListener);
       }
       const opsListener = readOccupiedListener(opsPort);
       let opsAnswer: number | undefined;
@@ -690,14 +750,42 @@ program
         const res = await fetch(`http://127.0.0.1:${opsPort}/`, { signal: AbortSignal.timeout(1000) });
         if (res.status > 0) opsAnswer = res.status;
       } catch {}
-      if (opsAnswer !== undefined || opsListener.pids.length > 0 || await localPortAcceptsTcp(opsPort)) {
-        refuseUnattributedListener(opsListener, opsAnswer === undefined ? "has a listener" : `answered with HTTP ${opsAnswer}`);
+      const opsState = await localPortState(opsPort, opsBindHost);
+      if (opsAnswer !== undefined || opsListener.pids.length > 0 || opsState === "listening") {
+        if (opsState === "free") refuseFreePort(opsListener);
+        refuseUnattributedListener(opsListener);
+      } else if (opsState === "unknown") {
+        refuseUnknownListener(opsListener);
       }
     } else if (!opts.skipStart) {
       try {
         const res = await fetch(`http://127.0.0.1:${httpPort}/health`, { signal: AbortSignal.timeout(1000) });
-        if (res.status > 0) alreadyRunning = true;
-      } catch { /* not running */ }
+        if (res.status > 0) {
+          alreadyRunning = true;
+        }
+      } catch {}
+      const httpListener = readOccupiedListener(httpPort);
+      const httpState = await localPortState(httpPort, httpBind.host);
+      if (alreadyRunning || httpListener.pids.length > 0 || httpState === "listening") {
+        if (httpState === "free") refuseFreePort(httpListener);
+        refuseUnattributedListener(httpListener);
+        alreadyRunning = true;
+      } else if (httpState === "unknown") {
+        refuseUnknownListener(httpListener);
+      }
+      const opsListener = readOccupiedListener(opsPort);
+      let opsAnswer: number | undefined;
+      try {
+        const res = await fetch(`http://127.0.0.1:${opsPort}/`, { signal: AbortSignal.timeout(1000) });
+        if (res.status > 0) opsAnswer = res.status;
+      } catch {}
+      const opsState = await localPortState(opsPort, opsBindHost);
+      if (opsAnswer !== undefined || opsListener.pids.length > 0 || opsState === "listening") {
+        if (opsState === "free") refuseFreePort(opsListener);
+        refuseUnattributedListener(opsListener);
+      } else if (opsState === "unknown") {
+        refuseUnknownListener(opsListener);
+      }
     }
     const explicitCredential = !!(
       opts.adminPassFile || process.env.FLAIR_ADMIN_PASS || process.env.HDB_ADMIN_PASSWORD || opts.adminPass
@@ -726,12 +814,6 @@ program
         httpPort,
         adminPassPath,
       });
-      // The port is already taken and this data dir has no admin user.
-      // The unauthenticated /health probe already ran. This is one read of
-      // that port's listener — not the before-and-after 401 attribution.
-      // Name it and exit before any Authorization header is sent. Do not
-      // signal it. `flair stop` cannot be promised to act on this listener
-      // (flair#1749).
       if (reason === "foreign-instance") {
         const listener = readOccupiedListener(httpPort);
         const head = initAdminPassRefusalMessage(reason, {
@@ -739,12 +821,54 @@ program
           httpPort,
           adminPassPath,
           offerFlairStop: false,
+          pid: listener.pids.length === 1 ? listener.pids[0] : undefined,
         });
-        console.error(`${head}\n${foreignOccupiedListenerDetail(listener, dataDir)}`);
+        console.error(`${head}\n${foreignOccupiedListenerDetail(listener)}`);
       } else {
         console.error(message);
       }
       process.exit(1);
+    };
+
+    const persistSuppliedAdminPass = async (): Promise<void> => {
+      if (resolveInitAdminPasswordSource(false, passwordCtx) !== "re-persist") return;
+      if (opts.skipStart && !alreadyRunning && existsSync(adminPassPath)) {
+        try {
+          const saved = lstatSync(adminPassPath);
+          if (saved.isFile() && (typeof process.getuid !== "function" || saved.uid === process.getuid()) &&
+              readAdminPassFileSecure(adminPassPath) === adminPass) return;
+        } catch (err: unknown) {
+          console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+          process.exit(1);
+        }
+      }
+      if (!alreadyRunning && (existsSync(adminPassPath) || persistedAdminUser)) {
+        const verificationDeferred = opts.skipStart && !!agentId;
+        console.error(
+          `Refusing to write ${adminPassPath}: ` +
+            (verificationDeferred
+              ? `credential verification is deferred by --skip-start. `
+              : `no running instance; a saved admin-pass file or persisted admin user exists. `) +
+            `No pass file was written; any existing file is unchanged. ` +
+            (verificationDeferred
+              ? `Re-run init without --skip-start to verify a different supplied credential.`
+              : harperConfigPath(dataDir) !== null
+              ? `Start the instance and re-run init with the supplied credential, or run:\n  ${INIT_RESET_ADMIN_PASS_COMMAND}`
+              : `Run:\n  ${INIT_RESET_ADMIN_PASS_COMMAND}`)
+        );
+        process.exit(1);
+      }
+      if (alreadyRunning) {
+        const failure = await proveAdminPassAgainstInstance(httpPort, adminPass);
+        if (failure) {
+          console.error(
+            `Refusing to write ${adminPassPath}: ${failure} on port ${httpPort}. No pass file was written; any existing file is unchanged. ` +
+              `To rotate the instance's admin password instead, run:\n  ${INIT_RESET_ADMIN_PASS_COMMAND}`
+          );
+          process.exit(1);
+        }
+      }
+      writeAdminPassFile(adminPassPath, adminPass + "\n");
     };
 
     // Read from file if provided
@@ -759,8 +883,8 @@ program
       if (opts.resetAdminPass) {
         refuseIfNeeded(false);
         pendingAdminPassRotate = resolveInitAdminPasswordSource(false, passwordCtx) === "rotate";
-      } else if (resolveInitAdminPasswordSource(false, passwordCtx) === "re-persist") {
-        writeAdminPassFile(adminPassPath, adminPass + "\n");
+      } else {
+        await persistSuppliedAdminPass();
       }
     } else if (process.env.FLAIR_ADMIN_PASS) {
       adminPass = process.env.FLAIR_ADMIN_PASS;
@@ -768,8 +892,8 @@ program
       if (opts.resetAdminPass) {
         refuseIfNeeded(false);
         pendingAdminPassRotate = resolveInitAdminPasswordSource(false, passwordCtx) === "rotate";
-      } else if (resolveInitAdminPasswordSource(false, passwordCtx) === "re-persist") {
-        writeAdminPassFile(adminPassPath, adminPass + "\n");
+      } else {
+        await persistSuppliedAdminPass();
       }
     } else if (process.env.HDB_ADMIN_PASSWORD) {
       adminPass = process.env.HDB_ADMIN_PASSWORD;
@@ -777,8 +901,8 @@ program
       if (opts.resetAdminPass) {
         refuseIfNeeded(false);
         pendingAdminPassRotate = resolveInitAdminPasswordSource(false, passwordCtx) === "rotate";
-      } else if (resolveInitAdminPasswordSource(false, passwordCtx) === "re-persist") {
-        writeAdminPassFile(adminPassPath, adminPass + "\n");
+      } else {
+        await persistSuppliedAdminPass();
       }
     } else if (opts.adminPass) {
       // Inline admin pass (deprecated)
@@ -787,16 +911,14 @@ program
       if (opts.resetAdminPass) {
         refuseIfNeeded(false);
         pendingAdminPassRotate = resolveInitAdminPasswordSource(false, passwordCtx) === "rotate";
-      } else if (resolveInitAdminPasswordSource(false, passwordCtx) === "re-persist") {
-        writeAdminPassFile(adminPassPath, adminPass + "\n");
+      } else {
+        await persistSuppliedAdminPass();
       }
     } else {
       passwordSource = "generated";
       const fileExists = existsSync(adminPassPath);
       const decision = resolveInitAdminPasswordSource(fileExists, passwordCtx);
       if (decision === "reuse-existing") {
-        // flair#827: an admin-pass file already on disk means a PRIOR `flair
-        // init` already bootstrapped Harper's admin user with this password.
         try {
           adminPass = readAdminPassFileSecure(adminPassPath);
         } catch (err: any) {
@@ -853,17 +975,9 @@ program
     readyOpsSocketPosture(dataDir);
 
     let skippedOwnStart = false;
-    if (!opts.skipStart) {
-      if (alreadyRunning) {
-        console.log(`Harper already running on port ${httpPort} — skipping start`);
-        const httpListener = readOccupiedListener(httpPort);
-        const notice = staleHarperBeforeAuthNotice(dataDir, httpListener);
-        if (notice) {
-          console.error(notice);
-          process.exit(1);
-        }
-        skippedOwnStart = true;
-      }
+    if (!opts.skipStart && alreadyRunning) {
+      console.log(`Harper already running on port ${httpPort} — skipping start`);
+      skippedOwnStart = true;
     }
 
     if (!alreadyRunning) {
@@ -985,7 +1099,20 @@ program
         // count are set via HARPER_SET_CONFIG — no need for dev mode.
         if (willStart) {
           console.log(`Starting Harper on port ${httpPort}...`);
+          for (const [port, host] of [[httpPort, httpBind.host], [opsPort, opsBindHost]] as const) {
+            const listener = readOccupiedListener(port);
+            const state = await localPortState(port, host);
+            if (state === "unknown") refuseUnknownListener(listener);
+            if (listener.pids.length > 0 || state !== "free") {
+              const pid = listener.pids.length === 1 ? `, pid ${listener.pids[0]}` : "";
+              console.error(`Refusing init: port ${port}${pid}: pre-start port check failed.`);
+              console.error(foreignOccupiedListenerDetail(listener));
+              process.exit(1);
+            }
+            freeBeforeSpawn.add(port);
+          }
           const proc = spawn(process.execPath, [bin, "run", "."], { cwd: flairPackageDir(), env, detached: true, stdio: "ignore" });
+          ownChild = trackInitChild(proc);
           proc.unref();
           // flair#1454: write the identity sidecar immediately after spawn so
           // `flair stop` and `flair status` can classify this daemon's state
@@ -997,7 +1124,8 @@ program
 
     if (!opts.skipStart) {
       console.log("Waiting for Harper health check...");
-      await waitForHealth(httpPort, adminUser, adminPass, STARTUP_TIMEOUT_MS);
+      await waitForHealth(httpPort, adminUser, adminPass, STARTUP_TIMEOUT_MS,
+        () => attributeBeforeCredential(httpPort, httpBind.host));
       console.log("Harper is healthy ✓");
 
       // flair#763: the socket now exists — apply its file mode (+ chgrp for the
@@ -1205,6 +1333,7 @@ program
         }
         return;
       }
+      await attributeBeforeCredential(httpPort, httpBind.host);
       await seedUsingFlairSkillViaRest(`http://127.0.0.1:${httpPort}`, adminUser, adminPass);
       clearSkillSeedPending(dataDir);
     };
@@ -1235,16 +1364,10 @@ program
 
       const httpUrl = `http://127.0.0.1:${httpPort}`;
       if (!opts.skipStart) {
-        // Seed agent via operations API. Unlike the pre-auth observation,
-        // which is one read, a 401 names a pid only when the read before the
-        // insert and the read after the rejection are the same sole PID. The
-        // HTTP port's holder is not an input and is not assumed to have caused
-        // the rejection. Several holders, or a holder that changed during the
-        // request, stay unattributed. Init started Harper itself → no listener,
-        // and that 401 keeps the credential hint.
         console.log(`Seeding agent '${agentId}' via operations API...`);
         const opsListener = skippedOwnStart ? operationsPortAttribution(opsPort) : undefined;
-        await seedAgentViaOpsApi(opsPort, agentId, pubKeyB64url, adminUser, adminPass, opsListener);
+        await attributeBeforeCredential(opsPort, opsBindHost);
+        await seedAgentWithLocalHome(opsPort, agentId, pubKeyB64url, adminUser, adminPass, opsListener);
         console.log(`Agent '${agentId}' registered ✓`);
 
         // Verify Ed25519 auth
@@ -1516,7 +1639,7 @@ program
             // ~/.claude/settings.json — without it, mcp__flair__bootstrap only
             // ever runs if the agent remembers to call it itself.
             // --skip-hook opts out and prints the exact JSON to add by hand.
-            const hookResult = applyOrReportSessionStartHook(resolveHome(), agentId, !!opts.skipHook);
+            const hookResult = applyOrRepinSessionStartHook(resolveHome(), agentId, !!opts.skipHook);
             console.log(`   ${hookResult.ok ? "✓" : "•"} ${hookResult.message}`);
             if (hookResult.hint) {
               for (const line of hookResult.hint.split("\n")) console.log(`   ${line}`);
@@ -1545,7 +1668,7 @@ program
             // consent to set up the client, same as the Claude Code hook
             // applied above. --skip-hook opts out and prints the JSON.
             if (clientId === "codex" && result.ok) {
-              const hookResult = applyOrReportSessionStartHook(
+              const hookResult = applyOrRepinSessionStartHook(
                 resolveHome(),
                 agentId,
                 !!opts.skipHook,

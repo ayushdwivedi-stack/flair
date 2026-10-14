@@ -85,11 +85,11 @@ function nodeBin(): string {
   return "node";
 }
 
-function runLocalInit(install: Install, extraArgs: string[], cwd = ROOT) {
+function runLocalInit(install: Install, extraArgs: string[], cwd = ROOT, supplyCredential = true) {
   const startedAt = Date.now();
   const res = spawnSync(
     nodeBin(),
-    [CLI, "init", "--port", String(install.httpPort), "--ops-port", String(install.opsPort), "--admin-pass", ADMIN_PASS,
+    [CLI, "init", "--port", String(install.httpPort), "--ops-port", String(install.opsPort), ...(supplyCredential ? ["--admin-pass", ADMIN_PASS] : []),
       "--skip-soul", "--no-mcp", "--skip-smoke", "--skip-claude-md", "--skip-hook", ...extraArgs],
     {
       cwd,
@@ -282,9 +282,8 @@ describe("flair#2197 — local init --skip-start installs without starting", () 
         });
         const init = runLocalInit(install, skipStart ? ["--skip-start"] : []);
         expect(init.status, init.stdout + init.stderr).toBe(1);
-        expect(init.stderr).toContain(responds
-          ? `port ${install.httpPort} answered /health with HTTP 200`
-          : `port ${install.httpPort} has a listener without a /health response`);
+        expect(init.stderr).toContain(`port ${install.httpPort}`);
+        expect(init.stderr).toContain("attribution to this data directory was not confirmed");
         expect(init.stderr).toContain("Remedy:");
         expect(init.stdout).not.toContain("initialized successfully");
         expect(installed(install)).toBe(existing);
@@ -322,7 +321,7 @@ describe("flair#2197 — local init --skip-start installs without starting", () 
 
     const configBefore = readFileSync(join(install.dataDir, "harper-config.yaml"), "utf8");
 
-    const skipped = runLocalInit(install, ["--skip-start"]);
+    const skipped = runLocalInit(install, ["--skip-start"], ROOT, false);
     expect(skipped.status, skipped.stdout + skipped.stderr).toBe(0);
     // Nothing started ...
     expect(await serves(install.httpPort), "--skip-start started an installed instance").toBe(false);

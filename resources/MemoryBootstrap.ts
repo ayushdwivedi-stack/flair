@@ -2,7 +2,7 @@ import { Resource, databases } from "harper";
 import { allowVerified, resolveAgentAuth } from "./agent-auth.js";
 import { getEmbedding } from "./embeddings-provider.js";
 import { wrapUntrusted } from "./content-safety.js";
-import { isTeammate, formatTeamLine, isZeroRowNoOpEvent } from "./memory-bootstrap-lib.js";
+import { isTeammate, directoryHint, isZeroRowNoOpEvent } from "./memory-bootstrap-lib.js";
 import { resolveReadScope } from "./memory-read-scope.js";
 import { isValidEntity } from "./entity-vocab.js";
 import { withDetachedTxn, withDetachedTxnAsync } from "./table-helpers.js";
@@ -23,6 +23,8 @@ import {
 import { retrieveCandidates, DEFAULT_SELECT } from "./semantic-retrieval-core.js";
 import { retrievalMode } from "./bm25.js";
 import { buildTrustBlock } from "./trust-block.js";
+import { projectRowsThroughPointers } from "./memory-host-source.js";
+import { formatHostSourceCitation } from "./host-source-citation.js";
 import { bestSemanticSimilarity, evaluateAbstention } from "./abstention.js";
 import { estimateTokens } from "./token-estimate.js";
 import { initialPosition, ORG_EVENT_STREAM } from "./agent-read-position-lib.js";
@@ -292,16 +294,14 @@ const MAX_CANDIDATE_POOL = 100;
 // record's own agentId differs from the bootstrapping agent), so
 // `m._source !== agentId` is the "is this a teammate's finding" check; own
 // memories never carry `_source` at all.
-function formatMemory(m: any, agentId?: string): string {
-  // flair#1940 A1' item 5: bootstrap does NOT render pointers in this slice.
-  // The pointer lives in MemoryHostSource and is joined only into Memory.get/
-  // search/SemanticSearch results; the bootstrap citation (A6) arrives in slice
-  // 4. So this surface leaves the record unchanged.
+export function formatMemory(m: any, agentId?: string): string {
+  // flair#1940 A6: when the gated pointer join ran, `m.hostSource` is its output.
   const tag = m.durability === "permanent" ? "🔒" : m.durability === "persistent" ? "📌" : "📝";
   const date = m.createdAt ? ` (${m.createdAt.slice(0, 10)})` : "";
   const chain = m.supersedes ? " [supersedes earlier decision]" : "";
   const attribution = m._source && m._source !== agentId ? `[via ${m._source}] ` : "";
-  const base = `${tag} ${attribution}${m.content}${date}${chain}`;
+  const citation = formatHostSourceCitation(m.hostSource);
+  const base = `${tag} ${attribution}${m.content}${date}${chain}${citation ? ` ${citation}` : ""}`;
 
   // Wrap flagged memories in safety delimiters — composes with attribution
   // above (attribution is baked into `base` before wrapping, so a flagged
@@ -503,6 +503,17 @@ export class BootstrapMemories extends Resource {
     let eventWatermark: string | null = null;
     let eventsHasMore = false;
     let eventsRemaining = 0;
+    // flair#2448 item 3 (decision) — the STRUCTURED container deliberately
+    // carries NO host-source pointer: no `hostSource`, `hostSourceScope` or
+    // `hostSourceVisibility`. The pointer is a citation aid for the agent-facing
+    // RENDERED bootstrap (formatMemory's prose line); a non-admin structured
+    // consumer that needs the pointer reads the memory back through the gated
+    // Memory read (memory_get by id), which renders the pointer that caller may
+    // see. An admin Memory read takes no pointer join (Memory.ts), so it does not
+    // render the pointer either. The admin
+    // bootstrap's containers fall under the same rule (see hostSourceReader
+    // below). A test pins those three pointer fields absent here, so adding one
+    // is a deliberate change.
     const leanMemory = (m: any, section: string) => ({
       id: m.id,
       content: m.content,
@@ -545,6 +556,34 @@ export class BootstrapMemories extends Resource {
     //     `tokenEstimate` on each path.
     const contentCost = (structured: unknown, proseLine: string): number =>
       includeContext ? estimateTokens(proseLine) : estimateTokens(JSON.stringify(structured));
+
+    // flair#1940 A3/A6 (slice 2b) — the gated pointer join for the prose surface.
+    // A non-admin caller sees a bound pointer only through the join: their OWN
+    // records render their pointer, a teammate's author-only pointer renders
+    // `"withheld"` (A3), and everything else is unchanged. An admin/operator
+    // bootstrap stays unfiltered and takes no join — the same exception the
+    // named read surfaces take. ONE batched pointer query per row set, never
+    // one per row. The retrieved rows (DEFAULT_SELECT) carry every binding field
+    // (`agentId`, `instanceToken`, `visibility`, `archived`). The own-record
+    // sections (OWN_SELECT) carry `agentId` and `instanceToken` only: their query
+    // already excludes archived rows, and the reader is the author, so the author
+    // outcome never reads `visibility`.
+    // flair#2448 item 3 (decision) — an admin bootstrap takes no join, and the
+    // structured containers are built without the pointer (see leanMemory), so
+    // neither the admin prose nor any structured container carries the host
+    // source. A non-admin structured consumer that needs the pointer reads the
+    // memory back through the gated Memory read (memory_get by id); an admin
+    // Memory read takes no pointer join, so it does not render the pointer.
+    const hostSourceReader: string | undefined =
+      authenticatedAgent && !callerIsAdmin ? authenticatedAgent : undefined;
+    const pointerRenders = async (rows: readonly any[]): Promise<Map<string, any>> => {
+      const map = new Map<string, any>();
+      if (!hostSourceReader || rows.length === 0) return map;
+      for (const row of await projectRowsThroughPointers(rows, hostSourceReader)) {
+        if (row && typeof row.id === "string") map.set(row.id, row);
+      }
+      return map;
+    };
 
     // --- 1. Soul records (budgeted — prioritized by key importance) ---
     // Soul is who you are, but we still need to respect token budgets.
@@ -651,16 +690,28 @@ export class BootstrapMemories extends Resource {
     const org: OrgSkillInput = { assignments: [], rows: [], instanceId: null };
     if (orgRows.length > 0
       && receivesOrgSkills(await withDetachedTxnAsync(ctx, () => (databases as any).flair.Agent.get(agentId)))) {
-      const refRows: any[] = [];
+      const refRows = new Map<string, any>();
+      org.refSubjects = new Map();
       for (const ref of new Set(orgRows.map((row) => row.skillRef).filter((ref) => typeof ref === "string"))) {
+        const referenced: any = await withDetachedTxnAsync(ctx, () => (databases as any).flair.Memory.get(ref));
+        const subject = referenced && Array.isArray(referenced.tags) && referenced.tags.includes(SKILL_TAG)
+          && typeof referenced.skillSubjectId === "string" && referenced.skillSubjectId.length > 0
+          ? referenced.skillSubjectId : ref;
+        org.refSubjects.set(ref, subject);
         const refQuery = withDetachedTxn(ctx, () => (databases as any).flair.Memory.search({
-          conditions: [{ attribute: "id", comparator: "equals", value: ref }],
+          conditions: [{
+            operator: "or",
+            conditions: [
+              { attribute: "id", comparator: "equals", value: ref },
+              { attribute: "skillSubjectId", comparator: "equals", value: subject },
+            ],
+          }],
           select: SKILL_ROW_SELECT,
         }));
-        for await (const record of refQuery as AsyncIterable<any>) refRows.push(record);
+        for await (const record of refQuery as AsyncIterable<any>) refRows.set(record.id, record);
       }
       org.assignments = orgRows;
-      org.rows = resolvableSkillRows(refRows, scope.isAllowed);
+      org.rows = resolvableSkillRows([...refRows.values()], scope.isAllowed);
       org.instanceId = await localInstanceId();
     }
     if (skillAssignments.length > 0 || org.assignments.length > 0) {
@@ -722,8 +773,8 @@ export class BootstrapMemories extends Resource {
       for await (const record of (databases as any).flair.Agent.search()) {
         if (isTeammate(record, agentId)) teammateIds.push(record.id);
       }
-      const line = formatTeamLine(teammateIds);
-      if (line) sections.team.push(line);
+      const line = directoryHint();
+      if (teammateIds.length > 0) sections.team.push(line);
     } catch {
       // Agent table may not exist in older / standalone deployments
     }
@@ -787,9 +838,13 @@ export class BootstrapMemories extends Resource {
     // #1201 — `updatedAt` is projected on BOTH paths (not just the trust path):
     // the structured `memories`/`predicted` containers carry it so a consumer
     // can compute freshness, and the trust block's ageDays keys off it.
+    // flair#1940 A3 (slice 2b): `instanceToken` is projected on BOTH branches so
+    // the gated pointer join can bind a pointer to the row's current
+    // incarnation; it is a join input only (leanMemory/formatMemory never emit
+    // it), so the response bytes are unchanged.
     const OWN_SELECT = includeTrust
-      ? ["id", "agentId", "content", "durability", "createdAt", "updatedAt", "supersedes", "subject", "validTo", "expiresAt", "_safetyFlags", "provenance", "usageCount", "validFrom"]
-      : ["id", "agentId", "content", "durability", "createdAt", "updatedAt", "supersedes", "subject", "validTo", "expiresAt", "_safetyFlags"];
+      ? ["id", "agentId", "content", "durability", "createdAt", "updatedAt", "supersedes", "subject", "validTo", "expiresAt", "_safetyFlags", "instanceToken", "provenance", "usageCount", "validFrom"]
+      : ["id", "agentId", "content", "durability", "createdAt", "updatedAt", "supersedes", "subject", "validTo", "expiresAt", "_safetyFlags", "instanceToken"];
 
     // flair#744 slice 1 — the Memory records that became visible lines in the
     // memory-bearing sections (permanent/recent/predicted/relevant/teammate),
@@ -861,8 +916,9 @@ export class BootstrapMemories extends Resource {
     const permanentSupersededIds = new Set<string>();
     for (const m of permanentRows) if (m.supersedes) permanentSupersededIds.add(m.supersedes);
     const permanent = permanentRows.filter((m) => !permanentSupersededIds.has(m.id));
+    const permanentPtr = await pointerRenders(permanent);
     const admitPermanent = (m: any) => {
-      const line = formatMemory(m, agentId);
+      const line = formatMemory(permanentPtr.get(m.id) ?? m, agentId);
       const struct = leanMemory(m, "permanent");
       // #1199 (0.44.11) — charge what SHIPS (structured on the /mcp path, prose
       // on the REST path); see contentCost. #1207 stays honored: on the prose
@@ -940,8 +996,9 @@ export class BootstrapMemories extends Resource {
     // Budget: up to 40% of remaining for recent
     const recentBudget = Math.floor(tokenBudget * 0.4);
     let recentSpent = 0;
+    const recentPtr = await pointerRenders(recent);
     for (const m of recent) {
-      const line = formatMemory(m, agentId);
+      const line = formatMemory(recentPtr.get(m.id) ?? m, agentId);
       const struct = leanMemory(m, "recent");
       const cost = contentCost(struct, line); // #1199 (0.44.11) — charge what ships; see contentCost
       // flair#1199 trust-admission — charge the trust block's real serialized
@@ -991,8 +1048,9 @@ export class BootstrapMemories extends Resource {
 
       const predictedBudget = Math.floor(tokenBudget * 0.3);
       let predictedSpent = 0;
+      const predictedPtr = await pointerRenders(subjectMemories);
       for (const m of subjectMemories) {
-        const line = formatMemory(m, agentId);
+        const line = formatMemory(predictedPtr.get(m.id) ?? m, agentId);
         const struct = leanMemory(m, "predicted");
         const cost = contentCost(struct, line); // #1199 (0.44.11) — charge what ships; see contentCost
         // flair#1199 trust-admission — charge the trust block's real serialized
@@ -1182,6 +1240,7 @@ export class BootstrapMemories extends Resource {
         const scored = candidates
           .filter((m: any) => !includedIds.has(m.id))
           .map((m: any) => ({ memory: m, score: m._score }));
+        const retrievedPtr = await pointerRenders(scored.map((s: any) => s.memory));
 
         // flair#681: the collision block's semantic surface — one candidate
         // per teammate (`scored` is sorted best-first by the fused retrieval
@@ -1208,7 +1267,7 @@ export class BootstrapMemories extends Resource {
         // budget regardless of which section they land in, so neither
         // section double-spends.
         for (const { memory: m } of scored) {
-          const line = formatMemory(m, agentId);
+          const line = formatMemory(retrievedPtr.get(m.id) ?? m, agentId);
           // flair#1199 (0.44.11) — build the STRUCTURED container object BEFORE
           // the budget check so the finding is charged the cost of what actually
           // ships (structured on the /mcp path), not its cheaper prose line. A
@@ -1792,6 +1851,7 @@ export class BootstrapMemories extends Resource {
       // never absent, so "empty" is distinguishable from "unsupported").
       agentId,
       ...(taskRetrievalHint ? { taskRetrievalHint } : {}),
+      directoryHint: directoryHint(),
       scope: scopeInfo,
       soul: soulMap,
       // flair#2141 S1b — always present (`[]` when none), whatever includeSoul
@@ -1828,6 +1888,7 @@ export class BootstrapMemories extends Resource {
       sections: {
         soul: sections.soul.length,
         skills: sections.skills.length,
+        // Fixed directory hint when a roster exists.
         team: sections.team.length,
         permanent: sections.permanent.length,
         recent: sections.recent.length,

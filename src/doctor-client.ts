@@ -20,10 +20,14 @@
 // "not present", never a thrown error — doctor must never crash or hang on a
 // broken client config.
 
-import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { spawnSync, type SpawnSyncOptions } from "node:child_process";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { withHome } from "./lib/home.js";
+import { AGENT_ID_RULE, isValidAgentId } from "./lib/agent-id-rule.js";
+import { AGENT_HOME_STAMP_REMEDY, planAgentHomeStamps, type TargetInstanceIdentity } from "./lib/agent-home.js";
+import { INSTANCE_ROW_PRUNE_REMEDY } from "./lib/instance-identity-row.js";
 import type { SeedOwnerRead } from "./keystore.js";
 import {
   ALL_CLIENTS,
@@ -251,9 +255,14 @@ export function buildActionRecallHookCommand(
   return String.raw`sh -c 'out=$(${invocation} 2>/dev/null) && [ -n "$out" ] && [ "${"$"}{#out}" -le 4096 ] && printf %s "$out" || true'`;
 }
 
-/** Match the artifact marker in commands without npx. */
+const recognizeActionRecallCommand = installerCommandRecognizer(buildActionRecallHookCommand, ACTION_RECALL_HOOK_MARKER);
+
 export function isFlairActionRecallCommand(command: string): boolean {
-  return typeof command === "string" && command.includes(ACTION_RECALL_HOOK_MARKER) && !/(?:^|\s)npx(?:\s|$)/.test(command);
+  return recognizeActionRecallCommand(command) !== null;
+}
+
+export function parseActionRecallCommand(command: string): CaptureCommandParts | null {
+  return recognizeActionRecallCommand(command);
 }
 
 /**
@@ -402,6 +411,153 @@ export function isFlairContinuityCommand(command: string): boolean {
     command.includes("@tpsdev-ai/flair-mcp") &&
     command.includes(CONTINUITY_CAPTURE_HOOK_MARKER)
   );
+}
+
+// ── the capture PostToolUseFailure/PostToolUse/Stop hook (flair#2068) ──────
+//
+// Runs the provisioned absolute runtime + artifact paths (same Flair-owned
+// provisioning as the action-recall hook). One binary serves all three events; the
+// payload's hook_event_name tells it which fired.
+
+/** Matches this substring unless npx is bounded by whitespace or string edges; a match does not prove ownership. */
+export const CAPTURE_HOOK_MARKER = "capture-hook.js";
+
+/** Tools considered for a possible matching follow-up. */
+export const CAPTURE_POST_TOOL_USE_MATCHER = "Write|Edit|NotebookEdit|Bash";
+
+export const CAPTURE_POST_TOOL_USE_FAILURE_MATCHER = "Bash";
+
+/** The hook events the capture hook registers under. */
+export const CAPTURE_HOOK_EVENTS = ["PostToolUseFailure", "PostToolUse", "Stop"] as const;
+export type CaptureHookEvent = (typeof CAPTURE_HOOK_EVENTS)[number];
+
+/** The matcher each capture event's group carries (Stop has none). */
+export const CAPTURE_HOOK_MATCHERS: Record<CaptureHookEvent, string | null> = {
+  PostToolUseFailure: CAPTURE_POST_TOOL_USE_FAILURE_MATCHER,
+  PostToolUse: CAPTURE_POST_TOOL_USE_MATCHER,
+  Stop: null,
+};
+
+/** The pinned spec the background flush resolves through npx, so the flush
+ *  runs the published package and its flair-client dependency rather than the
+ *  dependency-free hot-path copy. */
+export function captureFlushSpec(): string {
+  return `${FLAIR_MCP_PACKAGE}@${flairCliVersion()}`;
+}
+
+/**
+ * Build the exact `command` string registered for every capture hook event.
+ */
+export function buildCaptureHookCommand(
+  bunPath: string,
+  artifactPath: string,
+  agentId: string,
+  flairUrl?: string,
+  flushSpec?: string | null,
+): string {
+  for (const [label, value] of [
+    ["agent id", agentId],
+    ["bun path", bunPath],
+    ["artefact path", artifactPath],
+  ] as const) {
+    if (!(label === "artefact path" ? /^[A-Za-z0-9._:@/-]+$/.test(value) : isHookCommandValueSafe(value))) {
+      throw new Error(
+        `${label} '${value}' contains characters that cannot be safely written into a shell hook command (allowed: letters, digits, . _ : / -; artefact paths also allow @)`,
+      );
+    }
+  }
+  if (flairUrl != null && flairUrl !== "" && !isHookCommandValueSafe(flairUrl)) {
+    throw new Error(
+      `Flair URL '${flairUrl}' contains characters that cannot be safely written into a shell hook command (allowed: letters, digits, . _ : / -)`,
+    );
+  }
+  if (flushSpec != null && flushSpec !== "" && !/^@[A-Za-z0-9._/-]+@[A-Za-z0-9._-]+$/.test(flushSpec)) {
+    throw new Error(`flush spec '${flushSpec}' is not a safe pinned package spec`);
+  }
+  const parts = [`FLAIR_AGENT_ID=${agentId}`];
+  if (flairUrl) parts.push(`FLAIR_URL=${flairUrl}`);
+  if (flushSpec) parts.push(`FLAIR_CAPTURE_FLUSH_SPEC=${flushSpec}`);
+  return `sh -c '${parts.join(" ")} ${bunPath} ${artifactPath} >/dev/null || true'`;
+}
+
+const recognizeCurrentCaptureCommand = installerCommandRecognizer(buildCaptureHookCommand, CAPTURE_HOOK_MARKER, true);
+const recognizeLegacyCaptureCommand = installerCommandRecognizer(
+  (...args) => buildCaptureHookCommand(...args).replace(" >/dev/null || true'", " >/dev/null 2>/dev/null || true'"),
+  CAPTURE_HOOK_MARKER,
+  true,
+);
+const recognizeCaptureCommand = (command: unknown) => recognizeCurrentCaptureCommand(command) ?? recognizeLegacyCaptureCommand(command);
+
+export function isFlairCaptureCommand(command: string): boolean {
+  return recognizeCaptureCommand(command) !== null;
+}
+
+/** The bun/artifact/agent/url/spec a wired capture command carries, or null. */
+export interface CaptureCommandParts {
+  bunPath: string;
+  artifactPath: string;
+  agentId: string;
+  flairUrl?: string;
+  flushSpec?: string;
+}
+
+export function parseCaptureCommand(command: string): CaptureCommandParts | null {
+  return recognizeCaptureCommand(command);
+}
+
+function installerCommandRecognizer(
+  builder: (bunPath: string, artifactPath: string, agentId: string, flairUrl?: string, flushSpec?: string) => string,
+  marker: string,
+  withFlushSpec = false,
+): (command: unknown) => CaptureCommandParts | null {
+  const tokens = {
+    bunPath: "MATCH_BUN_PATH",
+    artifactPath: "MATCH_ARTIFACT_PATH",
+    agentId: "MATCH_AGENT_ID",
+    flairUrl: "MATCH_FLAIR_URL",
+    flushSpec: "@MATCH_FLUSH_PACKAGE@MATCH_FLUSH_VERSION",
+  };
+  const forms: Array<Array<{ literal: string } | { name: keyof CaptureCommandParts; prefix: string; suffix: string }>> = [];
+  for (const url of [undefined, tokens.flairUrl]) {
+    for (const spec of withFlushSpec ? [undefined, tokens.flushSpec] : [undefined]) {
+      forms.push(builder(tokens.bunPath, tokens.artifactPath, tokens.agentId, url, spec).split(" ").map((part) => {
+        for (const name of Object.keys(tokens) as Array<keyof typeof tokens>) {
+          const token = tokens[name];
+          const offset = part.indexOf(token);
+          if (offset !== -1) return { name, prefix: part.slice(0, offset), suffix: part.slice(offset + token.length) };
+        }
+        return { literal: part };
+      }));
+    }
+  }
+  return (command) => {
+    if (typeof command !== "string") return null;
+    const commandTokens = command.split(" ");
+    for (const form of forms) {
+      if (commandTokens.length !== form.length) continue;
+      const parts: Partial<CaptureCommandParts> = {};
+      const matches = form.every((part, index) => {
+        const value = commandTokens[index]!;
+        if ("literal" in part) return value === part.literal;
+        if (!value.startsWith(part.prefix) || !value.endsWith(part.suffix)) return false;
+        const captured = value.slice(part.prefix.length, value.length - part.suffix.length);
+        if (!captured) return false;
+        parts[part.name] = captured;
+        return true;
+      });
+      if (!matches || parts.artifactPath?.split("/").at(-1) !== marker) continue;
+      const { bunPath, artifactPath, agentId, flairUrl, flushSpec } = parts;
+      if (!bunPath || !artifactPath || !agentId) continue;
+      try {
+        if (command === builder(bunPath, artifactPath, agentId, flairUrl, flushSpec)) {
+          return { bunPath, artifactPath, agentId, ...(flairUrl ? { flairUrl } : {}), ...(flushSpec ? { flushSpec } : {}) };
+        }
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  };
 }
 
 /** The two hook events continuity registers under. */
@@ -1204,6 +1360,9 @@ export interface SessionStartHookCheckResult {
    *  hook's PRESENCE was never the problem; whether the command it names can
    *  still execute is, and answering that needs the command itself. */
   command?: string;
+  /** How many hook commands carry the marker; `command` is the first
+   *  (flair#2291). Set when `present`. */
+  matches?: number;
 }
 
 /**
@@ -1221,16 +1380,19 @@ export function checkSessionStartHook(homeDir: string, settingsPath?: string): S
     const config = JSON.parse(raw);
     const groups = config?.hooks?.SessionStart;
     if (!Array.isArray(groups)) return { present: false, path };
+    let command: string | undefined;
+    let matches = 0;
     for (const group of groups) {
       const hooks = group?.hooks;
       if (!Array.isArray(hooks)) continue;
       for (const hook of hooks) {
         if (typeof hook?.command === "string" && hook.command.includes(SESSION_START_HOOK_MARKER)) {
-          return { present: true, path, command: hook.command };
+          matches++;
+          command ??= hook.command;
         }
       }
     }
-    return { present: false, path };
+    return command === undefined ? { present: false, path } : { present: true, path, command, matches };
   } catch {
     return { present: false, path };
   }
@@ -1553,6 +1715,8 @@ export interface HookProbeOutcome {
   timedOut: boolean;
   /** Set when the probe process could not be started at all. */
   spawnError: string | null;
+  cleanupError?: string | null;
+  outputOverflow?: boolean;
 }
 
 export type HookExecutionState = "runs" | "broken" | "unknown";
@@ -1582,15 +1746,228 @@ export function evidenceLine(s: string, max = 200): string {
   return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 }
 
-const defaultProbeRunner: HookProbeRunner = (command, timeoutMs) => {
-  // `/bin/sh -c` is not a guess: it is exactly how Claude Code runs a
-  // `type: "command"` hook (spawn with `shell: true`, $SHELL never consulted).
-  // Probing through any other shell would answer a question the user never
-  // asked.
-  const res = spawnSync("/bin/sh", ["-c", command], {
-    input: "",
-    encoding: "utf-8",
+const PROBE_GROUP_TERM_GRACE_MS = 200;
+const PROBE_GROUP_KILL_GRACE_MS = 2_000;
+
+const PROBE_PIN_MARGIN_S = 60;
+
+export const HOOK_PROBE_MAX_OUTPUT_BYTES = 1024 * 1024;
+
+function sleepMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(0, ms));
+}
+
+function sleepUntil(deadline: number): void {
+  for (let now = performance.now(); now < deadline; now = performance.now()) sleepMs(Math.min(5, deadline - now));
+}
+
+export type ProbeSignalSender = (pid: number, signal: NodeJS.Signals | 0) => void;
+const sendSignal: ProbeSignalSender = (pid, signal) => {
+  process.kill(pid, signal);
+};
+
+function signalTargetPresent(target: number, kill: ProbeSignalSender): boolean {
+  try {
+    kill(target, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+export function endProbeProcessGroup(
+  pgid: number,
+  pinPid: number | null,
+  kill: ProbeSignalSender = sendSignal,
+): string | null {
+  const groupGone = (): boolean => !signalTargetPresent(-pgid, kill);
+  const pinned = (): boolean => pinPid !== null && signalTargetPresent(pinPid, kill);
+  const unconfirmed = (reason: string): string | null => (groupGone() ? null : reason);
+  let signalError = "";
+  const signalGroup = (signal: NodeJS.Signals): void => {
+    try {
+      kill(-pgid, signal);
+    } catch (err) {
+      signalError = `; ${signal} failed: ${(err as NodeJS.ErrnoException).code ?? String(err)}`;
+    }
+  };
+  if (!pinned()) return unconfirmed("its pin process was not present, so the group was not signalled");
+  signalGroup("SIGTERM");
+  sleepUntil(performance.now() + PROBE_GROUP_TERM_GRACE_MS);
+  if (!pinned()) return unconfirmed(`its pin process exited before SIGKILL, so SIGKILL was not sent${signalError}`);
+  signalGroup("SIGKILL");
+  const deadline = performance.now() + PROBE_GROUP_KILL_GRACE_MS;
+  while (!groupGone() && performance.now() < deadline) sleepMs(5);
+  return unconfirmed(`the group was still present ${PROBE_GROUP_KILL_GRACE_MS} ms after SIGKILL${signalError}`);
+}
+
+function readPinPid(path: string): number | null {
+  let fd = -1;
+  try {
+    fd = openSync(path, "r");
+    const buf = Buffer.alloc(32);
+    const text = buf.toString("utf-8", 0, readSync(fd, buf, 0, buf.length, 0));
+    if (!/^[1-9][0-9]{0,9}$/.test(text)) return null;
+    const pid = Number(text);
+    return pid > 1 && pid <= 0x7fffffff ? pid : null;
+  } catch {
+    return null;
+  } finally {
+    if (fd >= 0) closeSync(fd);
+  }
+}
+
+function readCappedOutput(fd: number): { text: string; overflow: boolean } {
+  const buf = Buffer.alloc(HOOK_PROBE_MAX_OUTPUT_BYTES + 1);
+  let total = 0;
+  while (total < buf.length) {
+    const n = readSync(fd, buf, total, buf.length - total, total);
+    if (n === 0) break;
+    total += n;
+  }
+  return {
+    text: buf.toString("utf-8", 0, Math.min(total, HOOK_PROBE_MAX_OUTPUT_BYTES)),
+    overflow: total > HOOK_PROBE_MAX_OUTPUT_BYTES,
+  };
+}
+
+interface BunSyncSubprocess {
+  pid: number;
+  exitCode: number | null;
+  signalCode: string | null;
+  exitedDueToTimeout: boolean;
+}
+interface BunRuntime {
+  spawnSync(
+    command: string[],
+    options: {
+      detached: boolean;
+      stdin: Uint8Array;
+      stdout: number;
+      stderr: number;
+      timeout: number;
+      killSignal: string;
+      env: NodeJS.ProcessEnv;
+    },
+  ): BunSyncSubprocess;
+}
+const bunRuntime = (globalThis as { Bun?: BunRuntime }).Bun;
+
+interface ProbeSpawn {
+  pid: number | null;
+  exitCode: number | null;
+  timedOut: boolean;
+  spawnError: string | null;
+}
+
+// The pin must never sit at SIGTERM's default disposition: cleanup sends SIGKILL
+// only while the pin answers signal 0, so a pin killed by the probe's own
+// SIGTERM skips that SIGKILL. Ignoring the signals here, before the fork, lets
+// the pin inherit them across fork and exec instead of racing to run its own
+// `trap`; the command's shell gets the defaults back via `trap -` before its exec.
+const PROBE_WRAPPER =
+  `trap '' HUP INT QUIT TERM; ` +
+  `( ( PATH="$PATH:/bin:/usr/bin"; exec sleep "$2" ) </dev/null >/dev/null 2>&1 & ` +
+  `printf '%s' "$!" >"$1" ); ` +
+  `trap - HUP INT QUIT TERM; exec /bin/sh -c "$3"`;
+
+function spawnProbeBounded(
+  command: string,
+  timeoutMs: number,
+  input: string,
+  env: NodeJS.ProcessEnv,
+  outFd: number,
+  errFd: number,
+  pinPath: string,
+): ProbeSpawn {
+  const pinSeconds = String(Math.ceil(timeoutMs / 1000) + PROBE_PIN_MARGIN_S);
+  const args = ["-c", PROBE_WRAPPER, "flair-hook-probe", pinPath, pinSeconds, command];
+  if (bunRuntime) {
+    try {
+      const r = bunRuntime.spawnSync(["/bin/sh", ...args], {
+        detached: true,
+        stdin: Buffer.from(input),
+        stdout: outFd,
+        stderr: errFd,
+        timeout: timeoutMs,
+        killSignal: "SIGTERM",
+        env,
+      });
+      return { pid: r.pid, exitCode: r.exitCode, timedOut: r.exitedDueToTimeout === true, spawnError: null };
+    } catch (err: unknown) {
+      return { pid: null, exitCode: null, timedOut: false, spawnError: err instanceof Error ? err.message : String(err) };
+    }
+  }
+  const res = spawnSync("/bin/sh", args, {
+    detached: true,
+    stdio: ["pipe", outFd, errFd],
+    input,
     timeout: timeoutMs,
+    env,
+  } as SpawnSyncOptions);
+  const timedOut = (res as { signal?: string | null }).signal === "SIGTERM" && res.status === null;
+  return {
+    pid: typeof res.pid === "number" && res.pid > 1 ? res.pid : null,
+    exitCode: res.status,
+    timedOut,
+    spawnError: res.error && !timedOut ? res.error.message : null,
+  };
+}
+
+export interface ProbeRunOptions {
+  input: string;
+  env: NodeJS.ProcessEnv;
+  kill?: ProbeSignalSender;
+  tmpRoot?: string;
+  openOutput?: (path: string) => number;
+}
+
+export function runProbeInOwnGroup(command: string, timeoutMs: number, opts: ProbeRunOptions): HookProbeOutcome {
+  const { input, env } = opts;
+  if (process.platform === "win32") {
+    const res = spawnSync("/bin/sh", ["-c", command], { input, encoding: "utf-8", timeout: timeoutMs, env });
+    const timedOut = (res as { signal?: string | null }).signal === "SIGTERM" && res.status === null;
+    return { exitCode: res.status, stdout: res.stdout ?? "", stderr: res.stderr ?? "", timedOut, spawnError: res.error && !timedOut ? res.error.message : null };
+  }
+  const openOutput = opts.openOutput ?? ((path: string) => openSync(path, "w+"));
+  const dir = mkdtempSync(join(opts.tmpRoot ?? tmpdir(), "flair-hook-probe-"));
+  const fds: number[] = [];
+  try {
+    const outFd = openOutput(join(dir, "stdout"));
+    fds.push(outFd);
+    const errFd = openOutput(join(dir, "stderr"));
+    fds.push(errFd);
+    const pinPath = join(dir, "pin");
+    const spawned = spawnProbeBounded(command, timeoutMs, input, env, outFd, errFd, pinPath);
+    const cleanupError = spawned.pid === null ? null : endProbeProcessGroup(spawned.pid, readPinPid(pinPath), opts.kill);
+    const out = readCappedOutput(outFd);
+    const err = readCappedOutput(errFd);
+    return {
+      exitCode: spawned.exitCode,
+      stdout: out.text,
+      stderr: err.text,
+      timedOut: spawned.timedOut,
+      spawnError: spawned.spawnError,
+      cleanupError,
+      outputOverflow: out.overflow || err.overflow,
+    };
+  } finally {
+    for (const fd of fds) {
+      try {
+        closeSync(fd);
+      } catch {
+      }
+    }
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+    }
+  }
+}
+
+const defaultProbeRunner: HookProbeRunner = (command, timeoutMs) =>
+  runProbeInOwnGroup(command, timeoutMs, {
+    input: "",
     env: {
       ...process.env,
       // Tell a #1007-or-later adapter to answer without side effects.
@@ -1601,15 +1978,6 @@ const defaultProbeRunner: HookProbeRunner = (command, timeoutMs) => {
       FLAIR_PRESENCE_TIMEOUT_MS: "500",
     },
   });
-  const timedOut = (res as { signal?: string | null }).signal === "SIGTERM" && res.status === null;
-  return {
-    exitCode: res.status,
-    stdout: res.stdout ?? "",
-    stderr: res.stderr ?? "",
-    timedOut,
-    spawnError: res.error && !timedOut ? res.error.message : null,
-  };
-};
 
 /**
  * Delivery probe (flair#1734): run the registered command so we can classify
@@ -1621,11 +1989,9 @@ export function probeSessionStartHookDelivery(
   opts: { timeoutMs?: number; runner?: HookProbeRunner } = {},
 ): HookProbeOutcome {
   const timeoutMs = opts.timeoutMs ?? 8_000;
-  const runner = opts.runner ?? ((cmd, ms) => {
-    const res = spawnSync("/bin/sh", ["-c", cmd], {
+  const runner = opts.runner ?? ((cmd, ms) =>
+    runProbeInOwnGroup(cmd, ms, {
       input: "{}",
-      encoding: "utf-8",
-      timeout: ms,
       env: {
         ...process.env,
         FLAIR_HOOK_PROBE: "0",
@@ -1633,16 +1999,7 @@ export function probeSessionStartHookDelivery(
         FLAIR_HOOK_TIMEOUT_MS: "4000",
         FLAIR_PRESENCE_TIMEOUT_MS: "1",
       },
-    });
-    const timedOut = (res as { signal?: string | null }).signal === "SIGTERM" && res.status === null;
-    return {
-      exitCode: res.status,
-      stdout: res.stdout ?? "",
-      stderr: res.stderr ?? "",
-      timedOut,
-      spawnError: res.error && !timedOut ? res.error.message : null,
-    };
-  });
+    }));
   try {
     return runner(command, timeoutMs);
   } catch (err: unknown) {
@@ -1673,6 +2030,12 @@ export function probeSessionStartHookCommand(
 /** Pure: probe outcome -> verdict. See the section doc for why "exit 0, no
  *  output" is a definite failure rather than an ambiguous one. */
 export function classifyHookProbe(outcome: HookProbeOutcome): HookProbeVerdict {
+  if (outcome.cleanupError) {
+    return { execution: "unknown", detail: `could not confirm the command's process group ended (${outcome.cleanupError})` };
+  }
+  if (outcome.outputOverflow) {
+    return { execution: "unknown", detail: `the command's output exceeded the probe's ${HOOK_PROBE_MAX_OUTPUT_BYTES}-byte limit` };
+  }
   if (outcome.timedOut) {
     return { execution: "unknown", detail: "the command did not answer in time" };
   }
@@ -1929,7 +2292,7 @@ export function applyOrReportClaudeMdBootstrap(cwd: string, homeDir: string, ski
   return { applied: fix.ok, ok: fix.ok, message: fix.message, hint: fix.ok ? undefined : hint };
 }
 
-function sessionStartHookHint(agentId: string, path: string): string {
+export function sessionStartHookHint(agentId: string, path: string): string {
   const snippet = {
     hooks: {
       SessionStart: [
@@ -2467,4 +2830,115 @@ export function resolveFixAgentId(args: {
   const candidate = optsAgent || envAgentId || anyKnownAgentId || inferSoleAgentId(keyAgentIds);
   if (candidate && isNodeKeyId(candidate, keysDir)) return undefined;
   return candidate;
+}
+
+/** A stored agent id outside the shared rule, as reported by `flair doctor`. */
+export interface AgentIdRuleFinding {
+  invalidIds: string[];
+  message: string;
+  fixHint: string;
+}
+
+/**
+ * Report a stored Agent id that is outside the shared agent-ID rule
+ * (flair#2359). `rows` is the Agent roster read from the instance. Returns null
+ * when the roster's ids conform. PURE — it reports; nothing is rewritten.
+ */
+export function describeAgentIdRuleFinding(rows: Array<{ id?: unknown }>): AgentIdRuleFinding | null {
+  const invalidIds = (Array.isArray(rows) ? rows : [])
+    .filter((row) => row == null || !isValidAgentId(row.id))
+    .map((row) => String(row?.id))
+    .sort();
+  if (invalidIds.length === 0) return null;
+  return {
+    invalidIds,
+    message:
+      `${invalidIds.length} stored agent id(s) are outside the agent-ID rule (${AGENT_ID_RULE}): ` +
+      invalidIds.join(", "),
+    fixHint:
+      "after any needed data migration and registration with `flair agent add <new-id>`, " +
+      "remove the old row with `flair agent remove <id>`, or remove it alone if stale; " +
+      "`flair agent remove` also deletes the agent's Memory and Soul data, but not the key files of an id outside the rule — clean those up manually",
+  };
+}
+
+/** A stored Agent row with no home instance, as reported by `flair doctor` (flair#2433). */
+export interface AgentHomeFinding {
+  /** Every Agent row whose `originatorInstanceId` is null/absent, sorted. */
+  homeLessIds: string[];
+  /**
+   * The home-less rows that carry no federation-sync provenance; the remedy may stamp them.
+   */
+  stampableIds: string[];
+  /** The home-less rows that arrived through a federation merge — listed, never stamped. */
+  syncIds: string[];
+  /**
+   * `info`: the instance has no single canonical id, so a null home is the local-origin
+   * state. `advisory`: an id exists and the rows can be stamped. Neither counts as a
+   * doctor issue.
+   */
+  severity: "info" | "advisory";
+  /** Whether doctor counts this toward its issue total / exit code. */
+  isIssue: boolean;
+  message: string;
+  fixHint: string | null;
+}
+
+/**
+ * Report every stored Agent row with no home (flair#2433). `rows` is the Agent
+ * roster read from the instance (each row's full record).
+ *
+ * The split is the remedy's contract: a row that carries sync provenance
+ * (`_syncedFrom`/`_originatorInstanceId`, resources/Federation.ts's receiver
+ * stamps) arrived through federation and is LISTED ONLY — stamping it would
+ * forge its origin. `flair agent stamp-home --apply` stamps the local id on a
+ * home-less row that carries no federation-sync provenance.
+ *
+ * PURE — it reports; nothing is rewritten.
+ */
+export function describeAgentHomeFinding(
+  rows: Array<Record<string, unknown>>,
+  identity: TargetInstanceIdentity,
+): AgentHomeFinding | null {
+  const plan = planAgentHomeStamps(rows, identity.kind === "one" ? identity.id : null);
+  if (plan.homeLess.length === 0) return null;
+  const base = {
+    homeLessIds: plan.homeLess,
+    stampableIds: plan.stampable,
+    syncIds: plan.sync,
+  };
+  const listed = `${plan.homeLess.length} stored agent row(s) have no home instance (originatorInstanceId): ${plan.homeLess.join(", ")}`;
+  if (identity.kind === "one") {
+    return {
+      ...base,
+      severity: "advisory",
+      isIssue: false,
+      message:
+        `${listed}; ${plan.stampable.length} can be stamped with this instance's id (${identity.id})` +
+        (plan.sync.length > 0 ? `, ${plan.sync.length} arrived through federation and are listed only` : ""),
+      fixHint: AGENT_HOME_STAMP_REMEDY,
+    };
+  }
+  if (identity.kind === "multiple") {
+    return {
+      ...base,
+      severity: "info",
+      isIssue: false,
+      message:
+        `${listed}; this instance has ${identity.count} Instance rows, so no single canonical id; ` +
+        "homes stay unset (the local-origin state) until it has one",
+      fixHint: `keep one Instance row and delete the rest with: ${INSTANCE_ROW_PRUNE_REMEDY}`,
+    };
+  }
+  return {
+    ...base,
+    severity: "info",
+    isIssue: false,
+    message:
+      `${listed}; ` +
+      (identity.kind === "none"
+        ? "this instance has no Instance row yet, so homes stay unset (the local-origin state) until it has an identity"
+        : "the Instance row could not be read, so no id was resolved"),
+    fixHint: null,
+  };
 }

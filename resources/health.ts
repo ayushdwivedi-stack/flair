@@ -28,11 +28,13 @@ import { decideInstanceAnswer, INSTANCE_ROW_PRUNE_REMEDY } from "../src/lib/inst
 import { summarizeExpiredByAgent, expiredByAgentWarningLines, type NightlyDriverFacts } from "../src/lib/expired-by-agent.js";
 import { readAllInstanceRows } from "./Federation.js";
 
+import { mcpOAuthProviderReadiness } from "./mcp-oauth-env-guard.js";
+
 const db = databases as any;
 
 const redactHome = (p: string): string => {
   const home = homedir();
-  return p.startsWith(home) ? "~" + p.slice(home.length) : p;
+  return p === home ? "~" : p.startsWith(home + "/") ? "~" + p.slice(home.length) : "[redacted]";
 };
 
 const exists = async (path: string): Promise<boolean> => {
@@ -105,10 +107,6 @@ export class Health extends Resource {
     // `version` (flair#695, the CLI↔server handshake — src/version-handshake.ts):
     // exposed on the PUBLIC endpoint deliberately, so the check works even
     // before an agent identity/key exists (fresh install, pre-`flair init`).
-    // Sherlock verdict: fine while locally bound; if /Health is ever fronted
-    // PUBLICLY over Fabric, the public surface must omit this field (the
-    // richer, auth-gated /HealthDetail already carried version pre-existing —
-    // this only adds it to the anonymous endpoint too).
     //
     // flair#1076: both values come from dist/build-info.json — the stamp the
     // build wrote next to the modules Harper actually loaded — so /Health
@@ -142,7 +140,7 @@ export class Health extends Resource {
 }
 
 /**
- * Same sources /Health and /HealthDetail consult so they cannot disagree.
+ * Sources /Health and /HealthDetail consult.
  *
  * `detail` includes the progress summary (doc counts) on the lag reason.
  * Public /Health leaves it off — corpus size stays on the authenticated
@@ -190,7 +188,7 @@ export class HealthDetail extends Resource {
   }
 
   async get() {
-    const stats: Record<string, any> = { ok: true };
+    const stats: Record<string, any> = { ok: true, mcpOAuthProvider: mcpOAuthProviderReadiness() };
     const nowMs = Date.now();
     const warnings: Array<{ level: "warn" | "info"; message: string }> = [];
     // flair#1073: set while walking memories, consumed after the migrations
@@ -788,7 +786,19 @@ export class HealthDetail extends Resource {
     // didn't run, not merely that it didn't.
     try {
       const migrationsDataDir = resolveMigrationDataDirForRead();
-      const snapshot = getMigrationStatusSnapshot(migrationsDataDir);
+      const rawSnapshot = getMigrationStatusSnapshot(migrationsDataDir);
+      const redactReason = (reason: string | undefined): string | undefined =>
+        reason ? "details redacted; consult the operator log or an administrator" : reason;
+      const snapshot = isAdmin ? rawSnapshot : {
+        ...rawSnapshot,
+        lastCycleError: redactReason(rawSnapshot.lastCycleError),
+        migrations: rawSnapshot.migrations.map((m) => ({
+          ...m,
+          reason: m.state === "completed" && m.reason
+            ? "recorded complete; not re-verified this boot"
+            : redactReason(m.reason),
+        })),
+      };
       stats.migrations = {
         cyclePhase: snapshot.cyclePhase,
         lastCycleAt: snapshot.lastCycleAt ?? null,

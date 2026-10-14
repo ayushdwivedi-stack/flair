@@ -17,12 +17,15 @@
 // this worktree, `ROOTPATH` = the data dir — exactly the evidence the existing
 // self-heal requires (#1478). HOME is a throwaway dir; nothing touches the real
 // launchctl/systemctl or any real Flair data dir.
+import { atomicSignalWriterSource } from "../helpers/atomic-signal-source.ts";
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gatherDaemonEvidence, readSidecar } from "../../src/cli.ts";
+import { socketPathLimit } from "../../src/lib/socket-path-limit.ts";
+
+const SHORT_ROOT = process.env.FLAIR_UNIT_TEMP_ROOT ?? "/tmp";
 
 const cliPath = join(import.meta.dirname, "..", "..", "src", "cli.ts");
 const repoRoot = join(import.meta.dirname, "..", "..");
@@ -42,17 +45,20 @@ describe("flair#2055 — a stale identity sidecar never refuses and never surviv
   const spawned: Array<{ kill: (sig?: NodeJS.Signals | number) => void }> = [];
 
   beforeEach(() => {
-    tmpHome = mkdtempSync(join(tmpdir(), "flair2055-"));
+    tmpHome = mkdtempSync(join(SHORT_ROOT, "f2055-"));
     // `flair restart` has no --data-dir and acts on defaultDataDir(); the other
     // cases use --data-dir. Both name this same directory.
     dataDir = join(tmpHome, ".flair", "data");
     mkdirSync(dataDir, { recursive: true });
+    // The fixture must FIT the socket limit, or a case measures a refusal
+    // instead of the cleanup (flair#2075 item 1).
+    expect(Buffer.byteLength(join(dataDir, "operations-server"), "utf8")).toBeLessThanOrEqual(socketPathLimit(process.platform));
     // A service-manager STAND-IN first on the CLI's PATH: `flair restart`'s
     // Linux leg reads the serving process's cgroup unit and asks `systemctl`
     // about it. This keeps that probe off the host's real systemctl — the
     // stand-in reports a MainPID that is not the decoy, so the restart takes
     // the direct path (which is the code under test). Nothing real is touched.
-    shimBin = mkdtempSync(join(tmpdir(), "flair2055-shim-"));
+    shimBin = mkdtempSync(join(SHORT_ROOT, "f2055-shim-"));
     writeFileSync(
       join(shimBin, "systemctl"),
       "#!/bin/sh\nfor a in \"$@\"; do if [ \"$a\" = \"show\" ]; then printf 'MainPID=1\\n'; exit 0; fi; done\nexit 0\n",
@@ -72,10 +78,24 @@ describe("flair#2055 — a stale identity sidecar never refuses and never surviv
   function pidAlive(pid: number): boolean {
     try {
       process.kill(pid, 0);
-      return true;
     } catch {
       return false;
     }
+    // Signal 0 says the pid EXISTS, which is not the same as running: an exited
+    // child whose parent has not reaped it is a zombie (state `Z`) that still
+    // answers it. Flair's own liveness probe reports a zombie as gone
+    // (flair#2313), so this oracle must too, or a stopped child reads as still
+    // running (flair#2391). A read that finds the pid already gone is gone too.
+    if (process.platform === "linux") {
+      try {
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
+        const close = stat.lastIndexOf(")");
+        if (close >= 0 && stat.slice(close + 1).trim().startsWith("Z")) return false;
+      } catch {
+        return false;
+      }
+    }
+    return true;
   }
 
   /** A pid that is CONFIRMED gone: spawn, record it, and wait until `kill(pid, 0)` says ESRCH. */
@@ -94,6 +114,15 @@ describe("flair#2055 — a stale identity sidecar never refuses and never surviv
     throw new Error(`pid ${pid} never reported ESRCH after exit`);
   }
 
+  /** An OS-assigned port with nothing listening: bind, read the port, close. */
+  async function closedPort(): Promise<number> {
+    const srv = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("x") });
+    const port = srv.port;
+    await srv.stop(true);
+    if (typeof port !== "number" || port <= 0) throw new Error("closedPort: Bun.serve reported no port");
+    return port;
+  }
+
   /**
    * The "live Harper": a decoy in its own process that serves flair's /Health.
    * Its cwd is this worktree and its ROOTPATH is the data dir, so the self-heal
@@ -108,14 +137,15 @@ describe("flair#2055 — a stale identity sidecar never refuses and never surviv
       script,
       [
         `import { createServer } from "node:http";`,
-        `import { writeFileSync } from "node:fs";`,
+        `import * as fs from "node:fs";`,
+        atomicSignalWriterSource,
         `const body = process.env.DECOY_BODY ?? "";`,
         `const portFile = process.env.DECOY_PORT_FILE;`,
         `const srv = createServer((_req, res) => {`,
         `  res.writeHead(200, { "content-type": "application/json" });`,
         `  res.end(body);`,
         `});`,
-        `srv.listen(0, "127.0.0.1", () => writeFileSync(portFile, String(srv.address().port)));`,
+        `srv.listen(0, "127.0.0.1", () => publishSignal(portFile, String(srv.address().port)));`,
       ].join("\n"),
     );
     const proc = Bun.spawn(["bun", script], {
@@ -306,6 +336,54 @@ describe("flair#2055 — a stale identity sidecar never refuses and never surviv
       expect(stdout + stderr).toMatch(/Flair stopped/i);
       expect(stdout + stderr).not.toMatch(/could not be verified/i);
       expect(pidAlive(pid)).toBe(false);
+    },
+    30_000,
+  );
+
+  test(
+    "flair#2075: a repeat `flair stop` drops a leftover sidecar on the NOT_RUNNING leg",
+    async () => {
+      // 1. A live instance; its stop removes the sidecar.
+      const { pid, port } = await spawnHarperDecoy();
+      writeFileSync(join(dataDir, "hdb.pid"), `${pid}\n`);
+      writeFileSync(sidecarPath(), JSON.stringify({ pid, startTimeMs: Date.now(), port, flairVersion: "0.57.0" }));
+      const first = await runFlair(["stop", "--port", String(port)]);
+      expect(first.exitCode).toBe(0);
+      expect(pidAlive(pid)).toBe(false);
+      expect(existsSync(sidecarPath())).toBe(false);
+
+      // 2. The leftover the published stop did not remove: a sidecar naming a
+      //    pid that is now CONFIRMED gone, with hdb.pid gone too, so the next
+      //    stop is NOT_RUNNING — the leg under test.
+      writeFileSync(sidecarPath(), JSON.stringify({ pid, startTimeMs: Date.now() - 3_600_000, port, flairVersion: "0.57.0" }));
+      rmSync(join(dataDir, "hdb.pid"), { force: true });
+
+      const second = await runFlair(["stop", "--port", String(port)]);
+      expect(second.exitCode).toBe(0);
+      expect(second.stdout + second.stderr).toMatch(/not running/i);
+      // THE ASSERTION (the defect): the NOT_RUNNING leg drops the leftover.
+      expect(existsSync(sidecarPath())).toBe(false);
+    },
+    30_000,
+  );
+
+  test(
+    "flair#2075: a `flair restart` on a stopped instance drops a leftover sidecar on the cli.ts NOT_RUNNING leg",
+    async () => {
+      const deadPid = await confirmedDeadPid();
+      // No live process and no hdb.pid: `flair restart`'s STOP leg is
+      // NOT_RUNNING (the cli.ts leg this pins). The leftover names a pid that
+      // is CONFIRMED gone.
+      writeFileSync(sidecarPath(), JSON.stringify({ pid: deadPid, startTimeMs: Date.now() - 3_600_000, port: await closedPort(), flairVersion: "0.57.0" }));
+      rmSync(join(dataDir, "hdb.pid"), { force: true });
+      // The START leg refuses on a newer engine stamp, so no real Harper spawns.
+      writeFileSync(join(dataDir, "engine-version.txt"), "99.0.0\n");
+
+      const { stdout, stderr, exitCode } = await runFlair(["restart", "--port", String(await closedPort())]);
+      expect(exitCode).not.toBe(0);
+      // THE ASSERTION: the cli.ts NOT_RUNNING leg dropped the leftover.
+      expect(existsSync(sidecarPath())).toBe(false);
+      expect(stdout + stderr).toMatch(/was last written by Harper 99\.0\.0/i);
     },
     30_000,
   );

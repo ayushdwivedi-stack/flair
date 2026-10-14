@@ -6,7 +6,7 @@
 > Do NOT enable in production until Sherlock signs off on live enablement.
 
 This is the **Model 2** native-MCP path: a custom in-process `/mcp` JSON-RPC
-handler guarded by `@harperfast/oauth`'s `withMCPAuth`, serving the 17 tools in `resources/mcp-tools.ts`
+handler guarded by `@harperfast/oauth`'s `withMCPAuth`, serving the 18 tools in `resources/mcp-tools.ts`
 with a per-agent OAuth identity. It is distinct from the
 native-application-MCP surface (design A / `FLAIR_MCP_ENABLED`); Model 2 does not
 use Harper's native MCP transport, so it is not blocked by the Harper native-MCP
@@ -18,10 +18,9 @@ gating gaps.
   Streamable HTTP: `initialize` / `tools/list` / `tools/call` / `ping`. On
   `tools/call` it resolves the verified token `sub` → a flair `Agent`, then
   dispatches to the curated tool.
-- `resources/mcp-tools.ts` — the 17 tools in `resources/mcp-tools.ts`, each a thin wrapper over the existing resource handler
+- `resources/mcp-tools.ts` — the 18 tools in `resources/mcp-tools.ts`, delegating to resource handlers or the team-directory resolver
   (Memory / SemanticSearch / BootstrapMemories / Soul / WorkspaceState /
-  OrgEvent / AttentionQuery / RecordUsage). No raw CRUD surface — the only path to the datastore through `/mcp`
-  is one of the 17 tools in `resources/mcp-tools.ts`. Curated **by construction**.
+  OrgEvent / AttentionQuery / RecordUsage / the team-directory resolver).
 - `resources/mcp-oauth.ts` — registers `server.http(withMCPAuth(mcpHandler),
   { urlPath: '/mcp' })` **only when `FLAIR_MCP_OAUTH` is on.** `/mcp` runs on its
   own dispatch chain; flair's default auth-middleware does not run for it.
@@ -171,6 +170,31 @@ registered identities.
      auto-provisioned (default OFF; pre-provision Agent+Credential otherwise).
 
 3. **Restart flair.** `/mcp` mounts, OAuth-guarded.
+
+4. **Upgrading an instance that still holds the old staged value.** When the
+   component loads `FLAIR_MCP_OAUTH=1`, its MCP AS is disabled. Correct the value without re-running IdP intake
+   or changing the identity mapping:
+
+   `--admin-pass <target-admin-password>` is required.
+
+   ```bash
+   flair mcp enable --instance https://your-public-origin --refresh-flag --admin-pass <target-admin-password>
+   ```
+
+   It ATTEMPTS an encrypted
+   `FLAIR_MCP_OAUTH=true` push: it probes for a usable public key, attempts the update,
+   and checks the secret row's `processEnv` marker before restart and discovery
+   checks: the target's own discovery document must advertise that issuer with
+   the MCP token endpoint, and
+   the public document read at that issuer must match the same normalized issuer and its token
+   endpoint. When the update could not be pushed or confirmed — a failed capability
+   probe, a local encryption failure, a refused or unconfirmed push, or
+   a push whose read-back could not confirm storage with `processEnv=true` — it attempts a 0600
+   one-var fallback file. Refresh uses a separate default filename; an explicit
+   `--secrets-path` can select `mcp enable`'s path. An occupied explicit path
+   is refused before probing; an occupied default path is refused when the fallback is
+   needed — in both cases by name rather than truncated (the writer opens
+   exclusively). These fallback outcomes exit non-zero.
 
 ## Sherlock's 4 requirements — how they are met
 

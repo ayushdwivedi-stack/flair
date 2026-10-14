@@ -81,7 +81,7 @@ function mockTransaction(ctx: any, cb: (txn: any) => any): any {
   return result;
 }
 
-const { runSkillVersionWrite, resolveSkillHead } = await import("../../resources/skill-version-write.ts");
+const { runSkillVersionWrite, resolveSkillHead, closedSkillPayloadReadable } = await import("../../resources/skill-version-write.ts");
 const { recordDigest, valueDigest } = await import("../../resources/instruction-version-record.ts");
 const { deriveSkillSubjectId } = await import("../../resources/skill-subject.ts");
 
@@ -121,7 +121,7 @@ describe("flair#2139 S2 — skill version write: create", () => {
     const res = await runSkillVersionWrite({
       ctx: agentCtx(), subjectId: "m1", agentId: "agent-a",
       head: (shared) => resolveSkillHead("m1", null, shared),
-      plan: () => ({ kind: "create", predecessor: null, successor, closePatch: {}, value: "c1", visibility: "shared" }),
+      plan: () => ({ kind: "create", predecessor: null, successor, closePatch: {}, value: "c1", visibility: "shared", grantedClose: null }),
       hooks: { createSuccessor, closePredecessor },
     });
     expect(res.ok).toBe(true);
@@ -144,7 +144,7 @@ describe("flair#2139 S2 — skill version write: create", () => {
     await runSkillVersionWrite({
       ctx: operatorCtx(), subjectId: "m1", agentId: "agent-a",
       head: (shared) => resolveSkillHead("m1", null, shared),
-      plan: () => ({ kind: "create", predecessor: null, successor, closePatch: {}, value: "c1", visibility: "shared" }),
+      plan: () => ({ kind: "create", predecessor: null, successor, closePatch: {}, value: "c1", visibility: "shared", grantedClose: null }),
       hooks: { createSuccessor, closePredecessor },
     });
     const v = store.get("skill:m1:1")!;
@@ -164,7 +164,7 @@ describe("flair#2139 S2 — skill version write: supersede and delete", () => {
       head: (shared) => resolveSkillHead("m1", null, shared),
       plan: (head) => {
         expect(head?.id).toBe("m1");
-        return { kind: "update", predecessor: head, successor, closePatch: { validTo: "2020-01-02T00:00:00.000Z" }, value: "c2", visibility: "shared" };
+        return { kind: "update", predecessor: head, successor, closePatch: { validTo: "2020-01-02T00:00:00.000Z" }, value: "c2", visibility: "shared", grantedClose: null };
       },
       hooks: { createSuccessor, closePredecessor },
     });
@@ -182,7 +182,7 @@ describe("flair#2139 S2 — skill version write: supersede and delete", () => {
     const res = await runSkillVersionWrite({
       ctx: agentCtx(), subjectId: "m1", agentId: "agent-a",
       head: (shared) => resolveSkillHead("m1", null, shared),
-      plan: (head) => ({ kind: "delete", predecessor: head!, closePatch: { validTo: "2020-01-09T00:00:00.000Z" }, value: null, visibility: "shared" }),
+      plan: (head) => ({ kind: "delete", predecessor: head!, closePatch: { validTo: "2020-01-09T00:00:00.000Z" }, value: null, visibility: "shared", grantedClose: null }),
       hooks: { createSuccessor, closePredecessor },
     });
     expect(res.ok).toBe(true);
@@ -207,7 +207,7 @@ describe("flair#2139 S2 — skill version write atomicity", () => {
     return runSkillVersionWrite({
       ctx: agentCtx(), subjectId: "m1", agentId: "agent-a",
       head: (shared) => resolveSkillHead("m1", null, shared),
-      plan: () => ({ kind: "update", predecessor: memoryStore.get("m1") ?? null, successor, closePatch: { validTo: "2020-01-02T00:00:00.000Z" }, value: "c2", visibility: "shared" }),
+      plan: () => ({ kind: "update", predecessor: memoryStore.get("m1") ?? null, successor, closePatch: { validTo: "2020-01-02T00:00:00.000Z" }, value: "c2", visibility: "shared", grantedClose: null }),
       hooks: { createSuccessor, closePredecessor, ...overrides },
     });
   }
@@ -266,7 +266,7 @@ describe("flair#2139 S2 — skill version write atomicity", () => {
     const res = await runSkillVersionWrite({
       ctx: agentCtx(), subjectId: "m1", agentId: "agent-a",
       head: (shared) => resolveSkillHead("m1", null, shared),
-      plan: () => ({ kind: "update", predecessor: memoryStore.get("m1") ?? null, successor, closePatch: { validTo: "2020-01-02T00:00:00.000Z" }, value: "c2", visibility: "shared" }),
+      plan: () => ({ kind: "update", predecessor: memoryStore.get("m1") ?? null, successor, closePatch: { validTo: "2020-01-02T00:00:00.000Z" }, value: "c2", visibility: "shared", grantedClose: null }),
       hooks: { createSuccessor, closePredecessor },
     });
     expect(res.ok).toBe(false);
@@ -282,14 +282,14 @@ describe("flair#2139 S2 — skill version write atomicity", () => {
     await runSkillVersionWrite({
       ctx: agentCtx(), subjectId: "m1", agentId: "agent-a",
       head: (shared) => resolveSkillHead("m1", null, shared),
-      plan: (head) => ({ kind: "update", predecessor: head, successor: s2, closePatch: { validTo: "2020-01-02T00:00:00.000Z" }, value: "c2", visibility: "shared" }),
+      plan: (head) => ({ kind: "update", predecessor: head, successor: s2, closePatch: { validTo: "2020-01-02T00:00:00.000Z" }, value: "c2", visibility: "shared", grantedClose: null }),
       hooks: { createSuccessor, closePredecessor },
     });
     const s3 = { ...liveSkill("m3", "m1", "c3"), supersedes: "m2", createdAt: "2020-01-03T00:00:00.000Z" };
     await runSkillVersionWrite({
       ctx: agentCtx(), subjectId: "m1", agentId: "agent-a",
       head: (shared) => resolveSkillHead("m1", null, shared),
-      plan: (head) => ({ kind: "update", predecessor: head, successor: s3, closePatch: { validTo: "2020-01-03T00:00:00.000Z" }, value: "c3", visibility: "shared" }),
+      plan: (head) => ({ kind: "update", predecessor: head, successor: s3, closePatch: { validTo: "2020-01-03T00:00:00.000Z" }, value: "c3", visibility: "shared", grantedClose: null }),
       hooks: { createSuccessor, closePredecessor },
     });
     const v1 = store.get("skill:m1:1")!;
@@ -297,4 +297,31 @@ describe("flair#2139 S2 — skill version write atomicity", () => {
     expect(v2.previousVersionHash).toBe(v1.recordHash);
     for (const v of [v1, v2]) expect(v.recordHash).toBe(recordDigest(v));
   });
+});
+
+
+test("a closed root payload is denied once its successor expires", async () => {
+  const root = { ...liveSkill("root", "root", "old"), validTo: "2020-01-01T00:00:00.000Z" };
+  const successor = { ...liveSkill("s1", "root", "new"), expiresAt: "2999-01-01T00:00:00.000Z" };
+  memoryStore.set("root", root);
+  memoryStore.set("s1", successor);
+  store.set("v2", { id: "v2", subjectType: "skill", subjectId: "root", agentId: "agent-a", visibility: "shared", kind: "update", memoryId: "s1", version: 2 });
+  expect(await closedSkillPayloadReadable(root, "reader")).toBe(true);
+  successor.expiresAt = "2020-01-01T00:00:00.000Z";
+  expect(await closedSkillPayloadReadable(root, "reader")).toBe(false);
+  expect(await resolveSkillHead("root", "root", undefined)).toBeNull();
+  expect(await closedSkillPayloadReadable(root, "agent-a")).toBe(false);
+});
+
+
+test("a live successor does not bypass a missing or inconsistent version authority", async () => {
+  const root = { ...liveSkill("root", "root", "old"), validTo: "2020-01-01T00:00:00.000Z" };
+  memoryStore.set("root", root);
+  memoryStore.set("s1", liveSkill("s1", "root", "new"));
+  expect(await closedSkillPayloadReadable(root, "reader")).toBe(false);
+  const authority = { id: "v2", subjectType: "skill", subjectId: "root", agentId: "other-owner", visibility: "shared", kind: "update", memoryId: "s1", version: 2 };
+  store.set("v2", authority);
+  expect(await closedSkillPayloadReadable(root, "reader")).toBe(false);
+  authority.agentId = "agent-a";
+  expect(await closedSkillPayloadReadable(root, "reader")).toBe(true);
 });

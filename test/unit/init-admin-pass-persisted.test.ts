@@ -47,13 +47,13 @@ function makeTmpDir(): string {
  * `system` database whose `hdb_user/` primary column family holds one row per
  * user — using the same engine, resolved through the `harper` dependency.
  */
-function makeHarper5SystemDb(root: string, users: string[]): void {
+function makeHarper5SystemDb(root: string, users: string[], cf = "hdb_user/"): void {
   const requireHere = createRequire(import.meta.url);
   const rocksPath = createRequire(requireHere.resolve("harper")).resolve("@harperfast/rocksdb-js");
   const RocksDatabase = (requireHere(rocksPath) as { RocksDatabase: any }).RocksDatabase;
   const systemDir = join(root, "database", "system");
   mkdirSync(systemDir, { recursive: true });
-  const db = RocksDatabase.open(systemDir, { name: "hdb_user/" });
+  const db = RocksDatabase.open(systemDir, { name: cf });
   try {
     for (const user of users) db.put(user, "persisted-hash");
   } finally {
@@ -194,6 +194,21 @@ describe("detectPersistedAdminUser — Harper's own user-record paths", () => {
     expect(detectPersistedAdminUser(dir)).toBe(false);
   });
 
+  test("Harper 5.3: a generation-suffixed hdb_user/@<uuid> primary store is a persisted user", () => {
+    const dir = makeTmpDir();
+    dirs.push(dir);
+    makeHarper5SystemDb(dir, ["admin"], "hdb_user/@11111111-2222-3333-4444-555555555555");
+    expect(detectPersistedAdminUser(dir)).toBe(true);
+    expect(countRocksAdminUsers(join(dir, "database", "system"))).toBe(1);
+  });
+
+  test("Harper 5.3: an empty generation-suffixed store is NOT a persisted user", () => {
+    const dir = makeTmpDir();
+    dirs.push(dir);
+    makeHarper5SystemDb(dir, [], "hdb_user/@11111111-2222-3333-4444-555555555555");
+    expect(detectPersistedAdminUser(dir)).toBe(false);
+  });
+
   test("an unreadable system database is not read as 'no user' — the detector throws", () => {
     const dir = makeTmpDir();
     dirs.push(dir);
@@ -219,7 +234,8 @@ describe("refusal names the exact recovery command", () => {
   test("foreign-instance names flair stop verbatim", () => {
     const msg = initAdminPassRefusalMessage("foreign-instance", { httpPort: 19926 });
     expect(msg).toContain(INIT_STOP_FOREIGN_COMMAND);
-    expect(msg).toContain("19926");
+    expect(msg).toContain("port 19926: persisted admin user was not detected in this data directory");
+    expect(msg).not.toMatch(/listener|attribut|ownership|waiting/);
   });
 
   test("reset-without-socket names flair init --reset-admin-pass", () => {

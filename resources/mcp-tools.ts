@@ -1,5 +1,5 @@
 /**
- * mcp-tools.ts — the 17 curated flair tools for the Model-2 custom /mcp handler.
+ * mcp-tools.ts — the 18 curated flair tools for the Model-2 custom /mcp handler.
  * Curated BY CONSTRUCTION: this module implements a fixed set of tools, each a
  * thin wrapper over the existing flair Resource handler. No business logic is
  * re-implemented — the wrapped handlers (Memory / SemanticSearch /
@@ -14,7 +14,7 @@
  *   memory_search · memory_store · memory_update · memory_get · memory_delete ·
  *   memory_basement · memory_restore · skill_store · skill_search · skill_get ·
  *   bootstrap · soul_set · soul_get · flair_workspace_set · flair_orgevent ·
- *   attention · record_usage
+ *   attention · record_usage · team_directory
  *
  * ── The scoping seam ────────────────────────────────────────────────────────
  * The /mcp handler resolves the OAuth token's `sub` → a flair `Agent` id, then
@@ -215,6 +215,41 @@ function stripInternalFields(value: any): any {
   return out;
 }
 
+/** The Memory text fields a redacted write's `stored` reports: the list
+ *  REDACTED_MEMORY_FIELDS in resources/memory-redaction.ts, repeated here
+ *  because importing that module loads harper, which this module reaches only
+ *  through its lazy handler loaders. */
+const STORED_TEXT_FIELDS = ["content", "summary", "trigger"] as const;
+
+/**
+ * flair#2537 — the /mcp write echo after a server-side redaction. A Memory
+ * write whose text the server redacted answers with `redactedValues` and, since
+ * flair#2467, `stored`: the post-redaction values of the `content`, `summary`
+ * and `trigger` the write carried, as it committed them. The echo takes those
+ * fields from `stored`, drops `stored` itself, and makes no read after the
+ * write, so a later write to the row cannot change what this one reports. With
+ * the count and no string `stored.content`, the echo has no `content`,
+ * `summary` or `trigger` and sets `contentWithheld: true`; the caller's input
+ * is never put in their place. A response with no count, an error result
+ * included, is returned as it came.
+ */
+function redactedWriteEcho(response: any): any {
+  if (!response || typeof response !== "object" || Array.isArray(response)) return response;
+  if (typeof response.redactedValues !== "number" || response.redactedValues <= 0) return response;
+  const echo: Record<string, unknown> = { ...response };
+  delete echo.stored;
+  for (const field of STORED_TEXT_FIELDS) delete echo[field];
+  const stored = response.stored;
+  if (!stored || typeof stored !== "object" || Array.isArray(stored) || typeof stored.content !== "string") {
+    echo.contentWithheld = true;
+    return echo;
+  }
+  for (const field of STORED_TEXT_FIELDS) {
+    if (typeof stored[field] === "string") echo[field] = stored[field];
+  }
+  return echo;
+}
+
 // ── Tool implementations (thin wrappers over existing handlers) ──────────────
 //
 // Each takes the resolved agent + the parsed tool arguments and returns a plain
@@ -291,10 +326,23 @@ async function memoryStore(agent: ResolvedAgent, args: any) {
     }
     body.visibility = args.visibility;
   }
+  // flair#1940 slice 2b — the host-source envelope. Forwarded ONLY when the
+  // caller actually supplied it, so a store without a pointer delegates a
+  // byte-identical body. This wrapper adds NO second schema: `Memory.post()`
+  // validates the pointer with the SAME server-side validator the REST write
+  // uses (`resources/host-source.ts`'s validateHostSource, A2) and returns its
+  // 400 on an invalid pointer — reject, never coerce. `sessionId` is a declared,
+  // client-writable Memory attribute (schemas/memory.graphql); both are omitted
+  // from the body unless supplied.
+  if (args?.hostSource !== undefined && args?.hostSource !== null) body.hostSource = args.hostSource;
+  if (args?.hostSourceScope !== undefined && args?.hostSourceScope !== null) body.hostSourceScope = args.hostSourceScope;
+  if (args?.sessionId !== undefined && args?.sessionId !== null) body.sessionId = args.sessionId;
   // flair#1188 — memory_store's response goes through the same buildWriteResponse
   // echo as memory_update; strip the server-regenerated embedding so no write
   // tool ever inlines the vector. No-op when the response carries none.
-  return stripInternalFields(await unwrap(await h.post(body)));
+  // flair#2537 — a redacted write reports the stored text from its own
+  // response (redactedWriteEcho).
+  return redactedWriteEcho(stripInternalFields(await unwrap(await h.post(body))));
 }
 
 /**
@@ -533,7 +581,9 @@ async function memoryUpdate(agent: ResolvedAgent, args: any) {
     // flair#1188 — the write response echoes the stored row (Memory.post
     // regenerates the embedding server-side), so strip the vector before it
     // returns over the MCP surface. No-op when the response carries none.
-    return stripInternalFields(await unwrap(await coll.post(record)));
+    // flair#2537 — a redacted write reports the stored text from its own
+    // response (redactedWriteEcho); for a skill, the successor row's text.
+    return redactedWriteEcho(stripInternalFields(await unwrap(await coll.post(record))));
   }
 
   const merged: Record<string, unknown> = { ...existing, content, updatedAt: new Date().toISOString() };
@@ -552,7 +602,9 @@ async function memoryUpdate(agent: ResolvedAgent, args: any) {
   // Memory.put()'s own ownership gate — no scope change, same as the read.
   // flair#1188 — strip the embedding from the echoed write response (Memory.put
   // regenerates the vector server-side); no-op when the response carries none.
-  return stripInternalFields(await unwrap(await Cls.put(merged, delegationContext(agent))));
+  // flair#2537 — a redacted write reports the stored text from its own
+  // response (redactedWriteEcho).
+  return redactedWriteEcho(stripInternalFields(await unwrap(await Cls.put(merged, delegationContext(agent)))));
 }
 
 // ── flair#1472 memory_basement / memory_restore ──────────────────────────────
@@ -800,6 +852,19 @@ async function recordUsage(agent: ResolvedAgent, args: any) {
 }
 
 type ToolImpl = (agent: ResolvedAgent, args: any) => Promise<any>;
+
+async function teamDirectory(agent: ResolvedAgent, args: any) {
+  // Lazy import so this module keeps no top-level Harper link (the same reason
+  // the handler classes above load on first use).
+  const { resolveTeamDirectory } = await import("./team-directory.js");
+  const result = await resolveTeamDirectory(delegationContext(agent), {
+    id: args?.id,
+    name: args?.name,
+    cursor: args?.cursor,
+    limit: args?.limit,
+  });
+  return unwrap(result);
+}
 
 // ── flair#1213 — the connector CONSUMER CONTRACT, co-located with each tool ──
 //
@@ -1200,7 +1265,7 @@ export const TOOLS: Record<string, ToolEntry> = bindNativeTools({
   memory_search: {
         impl: memorySearch,
     contract: {
-      summary: "{ results: MemoryRecord[] } — semantic hits subject to the caller's read scope; each hit carries content, never the raw embedding.",
+      summary: "{ results: MemoryRecord[] } — semantic hits subject to the caller's read scope; each hit carries content, never the raw embedding. A hit whose record has a bound host-source pointer carries `hostSource`: the pointer object for a reader allowed to see it, or the literal \"withheld\" for one who may read the record but not the pointer. hostSource is the writer's unverified claim about an external source, stored with the writer's authenticated agent id; Flair does not verify it.",
       requiredFields: ["results"],
       fieldTypes: { results: "array" },
       invariants: {
@@ -1213,7 +1278,7 @@ export const TOOLS: Record<string, ToolEntry> = bindNativeTools({
   memory_store: {
         impl: memoryStore,
     contract: {
-      summary: "Write echo { id, written:true, deduplicated } — the new id + confirmation. No internal embedding fields; round-trips via memory_get.",
+      summary: "Write echo { id, written:true, deduplicated } — the new id + confirmation. No internal embedding fields; round-trips via memory_get. After a server-side redaction the echo also carries `redactedValues` and the stored `content` (with `summary`/`trigger` when written) from the write's own response; if that response returned no stored `content`, the echo omits those fields and sets `contentWithheld:true`.",
       requiredFields: ["id", "written"],
       fieldTypes: { id: "string", written: "boolean", deduplicated: "boolean" },
       forbiddenFields: INTERNAL_MEMORY_FIELDS,
@@ -1268,7 +1333,7 @@ export const TOOLS: Record<string, ToolEntry> = bindNativeTools({
   memory_update: {
         impl: memoryUpdate,
     contract: {
-      summary: "Write echo { id, written:true } for the in-place overwrite (or supersede). No internal embedding fields; the change round-trips via memory_get.",
+      summary: "Write echo { id, written:true } for the in-place overwrite (or supersede). No internal embedding fields; the change round-trips via memory_get. After a server-side redaction the echo also carries `redactedValues` and the stored `content` (with `summary`/`trigger` when written) from the write's own response; if that response returned no stored `content`, the echo omits those fields and sets `contentWithheld:true`.",
       requiredFields: ["id", "written"],
       fieldTypes: { id: "string", written: "boolean" },
       forbiddenFields: INTERNAL_MEMORY_FIELDS,
@@ -1338,6 +1403,7 @@ export const TOOLS: Record<string, ToolEntry> = bindNativeTools({
         // identity block in MemoryBootstrap's response tail).
         "soulTokens", "memoryTokens", "trustTokens", "eventsTokens", "scaffoldTokens",
         "skillsTokens", "skillDiagnosticsTokens",
+        "directoryHint",
       ],
       fieldTypes: {
         agentId: "string", soul: "object", memories: "array", predicted: "array",
@@ -1351,6 +1417,7 @@ export const TOOLS: Record<string, ToolEntry> = bindNativeTools({
         eventWatermark: "string", eventsHasMore: "boolean", eventsRemaining: "number",
         skills: "array", skillDiagnostics: "array", skillsTruncated: "number",
         skillDiagnosticsTruncated: "number", skillsTokens: "number", skillDiagnosticsTokens: "number",
+        directoryHint: "string",
       },
       invariants: {
         // count == delivered — the historical count/charge/deliver drift.
@@ -1493,6 +1560,20 @@ export const TOOLS: Record<string, ToolEntry> = bindNativeTools({
       },
     },
   },
+  team_directory: {
+        impl: teamDirectory,
+    contract: {
+      summary: "{ entries: TeamDirectoryEntry[], nextCursor, hasMore, limit, generatedAt } — active agent-kind principals with a published tps-mail contact.",
+      requiredFields: ["entries", "nextCursor", "hasMore", "limit", "generatedAt"],
+      fieldTypes: { entries: "array", hasMore: "boolean", limit: "number", generatedAt: "string" },
+      invariants: {
+        selfDescribingEmpty: [{ path: "entries", type: "array" }],
+        containerRules: [{ container: "entries", requiredFields: ["agentId", "name", "platform", "email", "publishedAt", "homeInstanceId"] }],
+        fullyResolved: true,
+      },
+      errorShape: { trigger: "a caller that is not a verified active agent", fields: ["error", "status"] },
+    },
+  },
   record_usage: {
         impl: recordUsage,
     contract: {
@@ -1504,7 +1585,7 @@ export const TOOLS: Record<string, ToolEntry> = bindNativeTools({
   },
 });
 
-/** The tool definitions for a tools/list response (exactly the 17 curated tools). */
+/** The tool definitions for a tools/list response (exactly the 18 curated tools). */
 export function listToolDefs(): McpToolDef[] {
   return Object.values(TOOLS).map((t) => t.def);
 }

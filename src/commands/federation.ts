@@ -12,6 +12,8 @@
  * non-strict entry into the strict check.
  */
 import { encodeRecordId } from "../lib/record-id-path.js";
+import { PEER_STATUS, isPeerMemberStatus } from "../lib/peer-status.js";
+import { protoSafeRecord } from "../lib/proto-safe-record.js";
 import { Command } from "commander";
 import nacl from "tweetnacl";
 import { existsSync, readFileSync } from "node:fs";
@@ -144,11 +146,10 @@ function shouldShowInlineSecretWarning(
 function sortKeys(val: unknown): unknown {
   if (val === null || val === undefined || typeof val !== "object") return val;
   if (Array.isArray(val)) return val.map(sortKeys);
-  const sorted: Record<string, unknown> = {};
-  for (const key of Object.keys(val as Record<string, unknown>).sort()) {
-    sorted[key] = sortKeys((val as Record<string, unknown>)[key]);
-  }
-  return sorted;
+  const src = val as Record<string, unknown>;
+  // Shared null-prototype copy: an own `__proto__` key is kept in the signing
+  // input rather than silently dropped (flair#2235).
+  return protoSafeRecord(src, { keys: Object.keys(src).sort(), map: sortKeys });
 }
 function canonicalize(obj: unknown): string {
   return JSON.stringify(sortKeys(obj));
@@ -402,7 +403,7 @@ const signBodyFresh = signRequestBody;
 /**
  * Persist last-contact on the local Peer row after confirmed hub contact.
  *
- * Callers must invoke this only after a FederationSync 200 (sendBatch or the
+ * Callers must invoke this only after a successful FederationSync response (sendBatch or the
  * no-change liveness ping). lastSyncAt is the value HealthDetail counts as
  * `connected` (flair#1499 / flair#1146) AND the spoke's OUTBOUND sync cursor
  * (`federation sync` re-sends from it) — so a frozen value re-sends from the
@@ -881,7 +882,7 @@ export async function runFederationSyncOnce(opts: any): Promise<{ pushed: number
     }
 
     // lastSyncAt is contact, not "the driver ran" (flair#1146). Persist only
-    // after a FederationSync 200 — sendBatch already threw on non-ok, so
+    // after a successful FederationSync response — sendBatch already threw on non-ok or invalid JSON, so
     // totalBatches > 0 means the hub answered. The no-change path must ping
     // first; a failed ping leaves the stamp untouched → unknown.
     const stampLocalContact = async () => {
@@ -1200,7 +1201,7 @@ export function register(program: Command): void {
           key: "status",
           format: (v) => {
             const s = String(v ?? "—");
-            const color = s === "paired" || s === "connected" || s === "active" ? render.c.green : s === "revoked" ? render.c.red : render.c.yellow;
+            const color = isPeerMemberStatus(s) ? render.c.green : s === PEER_STATUS.REVOKED ? render.c.red : render.c.yellow;
             return render.wrap(color, s);
           },
         },

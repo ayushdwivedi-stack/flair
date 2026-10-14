@@ -28,9 +28,17 @@
  * runner loops until processed=0 — and a re-run is idempotent.
  *
  * Reuses Memory's OWN regen branch — never duplicates embedding logic —
- * via the SAME mechanism `flair reembed` (src/cli.ts) already uses in
- * production: a genuine `PUT /Memory/:id` HTTP request (admin-authenticated
+ * via a genuine `PATCH /Memory/:id` HTTP request (admin-authenticated
  * loopback), not an in-process call on `databases.flair.Memory` directly.
+ * The one exception is a row whose id ends in `.content`, which that request
+ * cannot address (see regenContentSuffixRow below).
+ *
+ * The request is the re-embed PATCH (flair#2296): body
+ * `{"embedding": null, "embeddingModel": null}`. Memory.patch() embeds the row
+ * the PATCH handler reads and writes `embedding`, `embeddingModel` and
+ * `updatedAt`. Edits committed after this migration's read and before the PATCH
+ * handler's stored-row read are kept (flair#2275). An edit committed while
+ * Memory.patch() awaits the embedding is a separate, tracked window.
  *
  * THIS IS LOAD-BEARING, confirmed empirically while building
  * test/integration/migrations-embedding-stamp-e2e.test.ts against real
@@ -42,27 +50,23 @@
  * for a genuine `/Memory` request. Calling `.put()` on the raw reference
  * writes the record fine (confirmed: fields land exactly as passed) but
  * silently skips every override in resources/Memory.ts, INCLUDING the
- * `if (content.content && !content.embedding) { regenerate } ` branch this
- * migration exists to trigger. Reads (`.search()`/`.get()`, used below for
- * detect/countPending/candidate-selection) are unaffected by this — only
- * `.put()` needs the real dispatch, hence the loopback HTTP call for
- * exactly that one step.
+ * re-embed branch this migration exists to trigger. Reads
+ * (`.search()`/`.get()`, used below for detect/countPending/candidate-selection)
+ * are unaffected by this — only the re-embed request needs the real dispatch,
+ * hence the loopback HTTP call for exactly that one step.
  *
  * Query correctness (also verified against real Harper): Harper's
  * `not_equal` comparator only matches rows where the attribute holds an
  * EXPLICIT value (including explicit `null`) — a row where the attribute
  * was NEVER SET AT ALL (`getIndexedValues()` returns `undefined` for a
  * truly-absent property, never indexed regardless of `indexNulls`) is
- * invisible to ANY condition-based query, not just `not_equal`. Clearing to
- * `null` (never `undefined`) on write is therefore load-bearing: if the
- * regen HTTP call fails (engine not yet warmed up, transient failure,
- * admin credential unavailable this cycle), the row must land back in an
- * EXPLICIT-null state — queryable and retried on the next boot — never a
- * truly-absent one that would be permanently invisible to this migration
- * again. The pending condition is an OR of `not_equal <current>` (catches a
- * stale non-null model string) and `equals null` (catches that
- * explicit-null state) — together they catch every state this migration's
- * OWN writes can ever produce. A row whose `embeddingModel` was NEVER
+ * invisible to ANY condition-based query, not just `not_equal`. A re-embed
+ * request that fails (engine not yet warmed up, transient failure, admin
+ * credential unavailable this cycle) is retried on a later cycle while the row
+ * still matches the pending condition.
+ * The pending condition is an OR of `not_equal <current>` (catches a
+ * stale non-null model string) and `equals null` (catches an explicit-null
+ * state). A row whose `embeddingModel` was NEVER
  * touched by anything (truly absent from its very first write — only
  * possible if the embeddings engine was down for that entire write) is a
  * known, narrow gap this bounded query cannot see;
@@ -111,7 +115,7 @@
  * that a nonzero countPending() result is real before halting on it.
  *
  * ROOT-CAUSE GUARD — recall graph correctness (recall-hnsw-graph-heal).
- * This migration RE-EMBEDS rows in BULK via `PUT /Memory/:id` — it replaces
+ * This migration RE-EMBEDS rows in BULK via `PATCH /Memory/:id` — it replaces
  * the stored vector of many rows in place. Historically, an OLDER (pre-fix)
  * Harper's INCREMENTAL HNSW update left stale/asymmetric reverse edges under
  * exactly this kind of bulk re-embed (order-dependent), which collapsed prod
@@ -134,18 +138,29 @@
  * re-embed, ship a structural reindex trigger with it.
  */
 import { databases } from "harper";
-import { getModelId } from "../embeddings-provider.js";
+import { isDeepStrictEqual } from "node:util";
+import { confirmCommittedRow } from "../write-back.js";
+import { getEmbedding, getModelId } from "../embeddings-provider.js";
+import { withOwnedTransaction } from "../request-transaction.js";
+import { txnPausePoint } from "../txn-pause-point.js";
 import { harperPortValue } from "../../src/lib/harper-port-value.js";
 import { DEFAULT_HTTP_PORT } from "../a2a-url.js";
 import { currentSpaceRawForms, isCurrentSpaceStamp } from "../embedding-space-guard.js";
 import type { Migration, RunBatchResult } from "./types.js";
 import { EMBEDDING_STAMP_ID } from "./stamp-outstanding.js";
+import { endsWithContentSelectorSuffix } from "../../src/lib/memory-id-policy.js";
+import { skillEmbedText } from "../skill-write.js";
 
 export { EMBEDDING_STAMP_ID };
 
 export interface MemoryTableLike {
   search(query: unknown): AsyncIterable<Record<string, unknown>>;
-  get(id: string): Promise<Record<string, unknown> | null>;
+  /** `context` carries the owned transaction of the content-suffix fallback below, or an
+   *  empty context for its re-read of the committed row. */
+  get(id: string, context?: unknown): Promise<Record<string, unknown> | null>;
+  /** The raw table write handle, used only for the content-suffix fallback below: an
+   *  incremental update of the embedding fields (flair#2465), never a full-row put. */
+  update(id: string, row: Record<string, unknown>, context?: unknown): Promise<unknown>;
 }
 
 function defaultMemoryTable(): MemoryTableLike {
@@ -165,7 +180,7 @@ function resolveAdminAuthHeader(): string | null {
  * Base URL for the loopback self-call that regenerates an embedding.
  *
  * ALWAYS loopback. This is the destination of a credentialed self-call —
- * `regenViaHttpPut` sends `Authorization: Basic` carrying the admin password to
+ * `regenViaHttpPatch` sends `Authorization: Basic` carrying the admin password to
  * it — so it must never leave the box. `FLAIR_PUBLIC_URL` names a remote /
  * reverse-proxied origin and is deliberately ignored here, matching
  * `a2a-url.localBaseUrl` ("never the public/proxy URL"): two self-call
@@ -194,28 +209,110 @@ export function resolveSelfBaseUrl(env: NodeJS.ProcessEnv = process.env): string
 }
 
 /**
- * Triggers Memory.put()'s regen branch via a genuine loopback HTTP PUT —
- * the ONLY reliable way to reach resources/Memory.ts's subclass logic (see
- * module doc). Returns true iff the request succeeded (2xx); NEVER throws
- * — a failure just leaves the row in its current (queryable, explicit-null
- * or stale-string) state for the next attempt.
+ * Triggers Memory.patch()'s re-embed branch via a genuine loopback HTTP
+ * PATCH — the ONLY reliable way to reach resources/Memory.ts's subclass logic
+ * (see module doc). The body names only the two embedding fields, never the
+ * row this migration read. Returns true iff the request succeeded (2xx);
+ * NEVER throws — on false the row is re-checked on the next batch or cycle.
  */
-async function regenViaHttpPut(
+async function regenViaHttpPatch(
   id: string,
-  existing: Record<string, unknown>,
   fetchImpl: typeof fetch,
 ): Promise<boolean> {
   const authHeader = resolveAdminAuthHeader();
   if (!authHeader) return false; // no admin credential available this cycle — retried next boot
   try {
     const res = await fetchImpl(`${resolveSelfBaseUrl()}/Memory/${encodeURIComponent(id)}`, {
-      method: "PUT",
+      method: "PATCH",
       headers: { "Content-Type": "application/json", Authorization: authHeader },
-      body: JSON.stringify({ ...existing, embedding: null, embeddingModel: null }),
+      body: JSON.stringify({ embedding: null, embeddingModel: null }),
       signal: AbortSignal.timeout(REGEN_HTTP_TIMEOUT_MS),
     });
     return res.ok;
   } catch {
+    return false;
+  }
+}
+
+/** A vector this migration may stamp as current: a non-empty array of finite numbers. */
+function isUsableEmbedding(value: unknown): value is number[] {
+  return Array.isArray(value) && value.length > 0 && value.every((n) => typeof n === "number" && Number.isFinite(n));
+}
+
+/** The seams the content-suffix fallback reaches; injectable for unit tests. */
+export interface ContentSuffixRegenDeps {
+  embed: (text: string) => Promise<unknown>;
+  inTransaction: <T>(fn: (txn: unknown) => Promise<T>) => Promise<T>;
+}
+
+const defaultContentSuffixRegenDeps: ContentSuffixRegenDeps = {
+  embed: (text) => getEmbedding(text, "document"),
+  inTransaction: (fn) => withOwnedTransaction(undefined, fn),
+};
+
+/**
+ * Re-embed a legacy row whose id ends in the `.content` property suffix. The
+ * loopback `PATCH /Memory/:id` the regen path uses cannot address such an id
+ * (Harper's REST by-id path reads the suffix as a selector, and the write path
+ * refuses the id), so this computes the embedding itself and writes through the
+ * raw table handle.
+ *
+ * The text embedded is the one Memory's own write paths embed for the row
+ * (`skillEmbedText`: a skill row's `trigger` when present, else `content`); a
+ * row with no such text is not embedded.
+ *
+ * Writes a usable vector in an owned transaction. It STAGES an incremental
+ * `update` of only `embedding`, `embeddingModel` and `updatedAt` — the same
+ * field-only write Memory's own re-embed branch uses (flair#2465), never a
+ * full-row put — and the write touches no other field of the committed row.
+ * Then it CONFIRMS the committed row (an explicit fresh context) is still the
+ * row this transaction read and embedded; a row gone or distinguishably changed
+ * at confirmation aborts the owned transaction and returns false.
+ *
+ * Harper has no compare-and-set: a change committed after confirmation and
+ * before commit is not seen. The confirmation compares the WHOLE committed row
+ * with the row read (the supersede-close pattern), which is stronger than the
+ * identity list alone: a content-only change to a row that lacks a stored
+ * incarnation token (a legacy row may lack one) still fails it. The vector is computed for text unchanged through confirmation.
+ *
+ * Returns true when the update is staged, confirmation passes and the owned
+ * transaction completes; otherwise false.
+ * A row that still exists with a stale stamp stays pending for the next batch
+ * or cycle.
+ */
+async function regenContentSuffixRow(
+  table: MemoryTableLike,
+  id: string,
+  existing: Record<string, unknown>,
+  current: string,
+  deps: ContentSuffixRegenDeps,
+): Promise<boolean> {
+  try {
+    const text = skillEmbedText(existing);
+    if (typeof text !== "string" || text.length === 0) return false;
+    const embedding = await deps.embed(text);
+    if (!isUsableEmbedding(embedding)) return false;
+    return await deps.inTransaction(async (txn) => {
+      const fresh = await table.get(id, txn);
+      if (!fresh || !isDeepStrictEqual(fresh, existing)) return false;
+      // flair#2465: an incremental update of ONLY the embedding fields, not a
+      // full-row put. A full-row put carries this transaction's re-read row and
+      // can revert a field an owner edit committed meanwhile; this write touches
+      // only embedding/embeddingModel/updatedAt.
+      await table.update(id, { embedding, embeddingModel: current, updatedAt: new Date().toISOString() }, txn);
+      // Test-only: inert unless the fault-injection env opt-in is set and armed.
+      // After the write is STAGED and before the transaction commits.
+      const pause = txnPausePoint("embedding-stamp-content-suffix");
+      if (pause) await pause;
+      // Stage first, then confirm the COMMITTED row is still the row this
+      // transaction read and embedded; gone or distinguishably changed at
+      // confirmation aborts (the staged write is discarded). A change committed
+      // after this re-read and before the commit is not seen.
+      await confirmCommittedRow(table, id, (committed) => isDeepStrictEqual(committed, fresh));
+      return true;
+    });
+  } catch {
+    // Includes CommittedRowChanged: the transaction was aborted, nothing written.
     return false;
   }
 }
@@ -232,13 +329,13 @@ async function regenViaHttpPut(
 export function createEmbeddingStampMigration(
   getTable: () => MemoryTableLike = defaultMemoryTable,
   getCurrentModelId: () => string = getModelId,
-  regen: (id: string, existing: Record<string, unknown>) => Promise<boolean> = (id, existing) =>
-    regenViaHttpPut(id, existing, fetch),
+  regen: (id: string, existing: Record<string, unknown>) => Promise<boolean> = (id) =>
+    regenViaHttpPatch(id, fetch),
+  contentSuffixRegen: ContentSuffixRegenDeps = defaultContentSuffixRegenDeps,
 ): Migration {
   function staleCondition() {
     // OR-combined: `not_equals <current>` catches a stale non-null model
-    // string; `equals null` catches the explicit-null state this
-    // migration's own writes leave behind on a failed regen (see the
+    // string; `equals null` catches an explicit-null state (see the
     // module doc above — Harper's index never sees a TRULY ABSENT
     // property, only an explicit null).
     //
@@ -324,7 +421,15 @@ export function createEmbeddingStampMigration(
         if (!existing) continue; // deleted since the search above — nothing to fix
         if (isCurrentSpaceStamp(existing.embeddingModel as string | null | undefined, current)) continue; // already current-space (incl. bare equivalent) — idempotent skip
 
-        const ok = await regen(id, existing);
+        let ok: boolean;
+        if (endsWithContentSelectorSuffix(id)) {
+          ok = await regenContentSuffixRow(table, id, existing, current, contentSuffixRegen);
+        } else {
+          // Test-only: inert unless the fault-injection env opt-in is set and armed.
+          const pause = txnPausePoint("embedding-stamp-regen-pre");
+          if (pause) await pause;
+          ok = await regen(id, existing);
+        }
         if (ok) touchedIds.push(id);
         // A failed regen leaves the row untouched (still matching
         // staleCondition — retried next batch/boot), never partially

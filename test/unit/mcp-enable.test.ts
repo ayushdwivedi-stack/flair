@@ -430,6 +430,11 @@ function mockOpsFetch(opts: {
     if (body.operation === "restart") {
       return new Response(JSON.stringify({ message: "restarting" }), { status: 200 });
     }
+    if (body.operation === "sql") {
+      // flair#2433 — the create path resolves the instance's own id from the
+      // Instance table before it inserts the Agent row.
+      return new Response(JSON.stringify([{ id: "inst-local-2433" }]), { status: 200 });
+    }
     return new Response("{}", { status: 200 });
   }) as typeof fetch;
   return { fetchImpl, calls, creds };
@@ -468,9 +473,10 @@ describe("provisionIdpIdentityMapping", () => {
     expect(result.credentialSuperseded).toBe(false);
     expect(result.supersededCredentialIds).toEqual([]);
     const ops = calls.map((c) => c.body.operation);
-    expect(ops).toEqual(["search_by_value", "search_by_conditions", "search_by_value", "search_by_conditions", "insert", "search_by_value", "search_by_conditions", "upsert", "search_by_conditions"]);
+    expect(ops).toEqual(["search_by_value", "search_by_conditions", "search_by_value", "search_by_conditions", "sql", "insert", "search_by_value", "search_by_conditions", "upsert", "search_by_conditions"]);
     const agentRecord = calls.find((c) => c.body.operation === "insert")!.body.records[0];
     expect(agentRecord.publicKey).toBe("idp:github:octocat");
+    expect(agentRecord.originatorInstanceId).toBe("inst-local-2433");
     await expect(importEd25519Key(agentRecord.publicKey)).rejects.toThrow();
     const credRecord = calls.find((c) => c.body.operation === "upsert")!.body.records[0];
     expect(credRecord.kind).toBe("idp");
@@ -641,6 +647,52 @@ describe("provisionIdpIdentityMapping", () => {
     expect(result.credentialSuperseded).toBe(false);
   });
 
+  // ─── flair#2503 — the credential-status ALLOWLIST, at the linker ───────────
+  //
+  // A Credential is usable only when its status is exactly "active"
+  // (src/lib/credential-status-rule.ts, the same predicate
+  // resources/mcp-handler.ts resolves through and XAA's jwt-bearer grant
+  // applies). The linking layer used to accept everything except "revoked", so
+  // a principal-bearing row with a MISSING or unknown status counted as a live
+  // mapping, and the linker would REUSE that row and re-point it to
+  // status:"active". The resolver's old
+  // predicate was the same blocklist, so it would have served such a
+  // principal-bearing row too; both now apply the allowlist.
+  test("flair#2503: an ACTIVE same-provider credential is reused (positive control)", async () => {
+    const { fetchImpl, creds } = mockOpsFetch({
+      existingPrincipal: true,
+      existingCredential: { id: "cred_live", idpProvider: "github", principalId: "self", status: "active" },
+    });
+    const result = await provisionIdpIdentityMapping(
+      { opsPortOrUrl: ISSUER, adminUser: "admin", adminPass: "pw", principal: "self", principalKind: "human", idpProvider: "github", idpSubject: "octocat" },
+      { fetchImpl },
+    );
+    expect(result.credentialReused).toBe(true);
+    expect(result.credentialId).toBe("cred_live");
+    expect(creds.rows.get("cred_live")?.status).toBe("active");
+  });
+
+  for (const [label, status] of [["a MISSING status", undefined], ["an unknown status", "disabled"]] as const) {
+    test(`flair#2503: ${label} is not a usable mapping — no reuse, no resurrection`, async () => {
+      const { fetchImpl, creds } = mockOpsFetch({
+        existingPrincipal: true,
+        existingCredential: { id: "cred_legacy", idpProvider: "github", principalId: "self", status },
+      });
+      const result = await provisionIdpIdentityMapping(
+        { opsPortOrUrl: ISSUER, adminUser: "admin", adminPass: "pw", principal: "self", principalKind: "human", idpProvider: "github", idpSubject: "octocat" },
+        { fetchImpl },
+      );
+      // The legacy row is not the subject's mapping: a fresh ACTIVE credential is
+      // written, and the legacy row is left exactly as it was — not re-pointed,
+      // not flipped to "active". (On origin/main the blocklist predicate counted
+      // it active, reused it, and re-pointed it to status:"active".)
+      expect(result.credentialReused, "the stale row is not reused").toBe(false);
+      expect(result.credentialId).not.toBe("cred_legacy");
+      expect(creds.rows.get("cred_legacy")?.status, "the stale row is unchanged").toBe(status);
+      expect(creds.rows.get(result.credentialId)?.status).toBe("active");
+    });
+  }
+
   test("flair#1317: the post-write invariant read-back can FAIL — a store left with two active rows throws, never returns a mapping", async () => {
     // The check must be able to fire. Poison the store right after the write so
     // the read-back sees the very state the fix exists to prevent; if this
@@ -726,6 +778,7 @@ describe("provisionIdpIdentityMapping — ops target (flair#2102)", () => {
     const creds = credentialTable();
     const received: { host: string; operation: string }[] = [];
     let principalPresent = false;
+    const insertedHomes: unknown[] = [];
     const server = Bun.serve({
       hostname: "127.0.0.1",
       port: 0,
@@ -733,9 +786,11 @@ describe("provisionIdpIdentityMapping — ops target (flair#2102)", () => {
         const body: any = await req.json().catch(() => ({}));
         received.push({ host: req.headers.get("host") ?? "", operation: body.operation });
         if (body.operation === "search_by_value") return Response.json(principalPresent ? [{ id: body.search_value }] : []);
+        if (body.operation === "sql") return Response.json([{ id: "inst-local-2433" }]);
         if (body.operation === "insert") {
           const error = agentInsertSchemaError(body.records ?? []);
           if (error) return error;
+          insertedHomes.push(body.records?.[0]?.originatorInstanceId);
           principalPresent = true;
           return Response.json({ message: "inserted" });
         }
@@ -756,11 +811,12 @@ describe("provisionIdpIdentityMapping — ops target (flair#2102)", () => {
 
       const result = await provisionIdpIdentityMapping({ opsPortOrUrl: origin, ...MAPPING }, { fetchImpl });
 
-      expect(attempted).toEqual(Array(9).fill(`${origin}/`));
+      expect(attempted).toEqual(Array(10).fill(`${origin}/`));
       expect(received.map((r) => r.operation)).toEqual([
-        "search_by_value", "search_by_conditions", "search_by_value", "search_by_conditions", "insert", "search_by_value", "search_by_conditions", "upsert", "search_by_conditions",
+        "search_by_value", "search_by_conditions", "search_by_value", "search_by_conditions", "sql", "insert", "search_by_value", "search_by_conditions", "upsert", "search_by_conditions",
       ]);
       expect(received.every((r) => r.host === `127.0.0.1:${server.port}`)).toBe(true);
+      expect(insertedHomes).toEqual(["inst-local-2433"]);
       expect(creds.active().map((r) => r.id)).toEqual([result.credentialId]);
     } finally {
       server.stop(true);

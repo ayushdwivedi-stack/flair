@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { spawn, type ChildProcess } from "node:child_process";
 import { bootEphemeralHarper } from "../helpers/live-flair";
 import { waitForAppLoaded } from "../../../adk-flair/tests/helpers/app-readiness.mjs";
+import { parseProcStatState, isExitedState } from "../../../../src/lib/daemon-liveness.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TEST_TIMEOUT_MS = 5_000;
@@ -265,7 +266,7 @@ function writeRecoveryMock(rootPath: string): string {
   const mockScript = join(rootPath, "recovery-mock.mjs");
   writeFileSync(mockScript, [
     "import { spawn } from 'node:child_process';",
-    "import { writeFileSync, rmSync } from 'node:fs';",
+    "import { writeFileSync, renameSync, rmSync } from 'node:fs';",
     "import { join } from 'node:path';",
     "",
     `const ROOT = ${JSON.stringify(rootPath)};`,
@@ -315,7 +316,10 @@ function writeRecoveryMock(rootPath: string): string {
     "try { child.kill('SIGKILL'); } catch {}",
     "rmSync(ROOT, { recursive: true, force: true });",
     "if (process.env.RECOVERY_MOCK_EXIT_FILE) {",
-    "  writeFileSync(process.env.RECOVERY_MOCK_EXIT_FILE, reason);",
+    "  const exitFile = process.env.RECOVERY_MOCK_EXIT_FILE;",
+    "  const tempFile = `${exitFile}.tmp`;",
+    "  writeFileSync(tempFile, reason);",
+    "  renameSync(tempFile, exitFile);",
     "}",
     "process.exit(0);",
   ].join("\n"), "utf-8");
@@ -334,8 +338,10 @@ function processRunning(
 ): boolean {
   if (platform === "linux") {
     try {
-      const stat = readStat(pid);
-      return stat[stat.lastIndexOf(")") + 2] !== "Z";
+      // The kernel's state character (field 3, parsed past the last `)` because
+      // comm may hold spaces and parens) is `Z` for an exited-but-unreaped
+      // process (flair#2313).
+      return !isExitedState(parseProcStatState(readStat(pid)));
     } catch (error: any) {
       if (error.code === "ENOENT" || error.code === "ESRCH") return false;
       throw error;
@@ -543,7 +549,8 @@ test("recovery mock exits when its parent disappears", async () => {
     expect(wrapperPid).toBeGreaterThan(0);
     expect(harperPid).toBeGreaterThan(0);
 
-    await waitUntil(`parent-exit marker; launcher stderr: ${launcherStderr}`, () => existsSync(exitFile));
+    await waitUntil(`parent-exit marker; launcher stderr: ${launcherStderr}`, () =>
+      existsSync(exitFile) && readFileSync(exitFile, "utf-8") === "parent");
     expect(readFileSync(exitFile, "utf-8")).toBe("parent");
     expect(existsSync(rootPath)).toBe(false);
     await waitUntil("parentless recovery wrapper exit", () => !processRunning(wrapperPid!));
@@ -553,5 +560,6 @@ test("recovery mock exits when its parent disappears", async () => {
     killPid(harperPid ?? recordedMockPid(rootPath, "mock-child.pid"));
     try { rmSync(rootPath, { recursive: true, force: true }); } catch {}
     try { unlinkSync(exitFile); } catch {}
+    try { unlinkSync(`${exitFile}.tmp`); } catch {}
   }
 }, TEST_TIMEOUT_MS);

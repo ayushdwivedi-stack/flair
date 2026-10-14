@@ -2,13 +2,17 @@
 import { databases } from "harper";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { recordVersion, type RecordVersionOutcome } from "./instruction-version-record.js";
+import { recordVersion, readHead, skillRefReadable, SKILL_SUBJECT_TYPE, type RecordVersionOutcome } from "./instruction-version-record.js";
 import { SKILL_TAG, enforceSkillDurability, skillEmbedText } from "./skill-write.js";
 import { stripUndeclaredMemoryAttributes } from "./memory-declared-attributes.js";
 import { skillWriteSource } from "./skill-write-policy.js";
 import type { AgentAuthVerdict } from "./agent-auth.js";
 import { FORBIDDEN } from "./record-type-kit.js";
 import { PRIVATE_VISIBILITY, SHARED_VISIBILITY } from "./memory-visibility.js";
+import { maybeThrowSkillWriteFault } from "./skill-write-fault.js";
+import { supersedesTargetUnreadable } from "./memory-id-guard.js";
+import { grantedCloseRevokedRefusal, writeGrantHeld } from "./write-back.js";
+import { txnPausePoint } from "./txn-pause-point.js";
 
 /** Durability-keyed default visibility (mirrors Memory's write default). */
 function defaultVisibilityForDurability(durability: unknown): "private" | "shared" {
@@ -25,6 +29,47 @@ export function skillVersionVisibility(row: any): string {
   const v = row?.visibility;
   if (v === PRIVATE_VISIBILITY || v === SHARED_VISIBILITY) return v;
   return defaultVisibilityForDurability(row?.durability);
+}
+
+export async function closedSkillPayloadReadable(
+  row: Record<string, any> | null | undefined,
+  readerId: string,
+  read: { headOf?: (subjectId: string) => Promise<Record<string, any> | null>; memoryGet?: (id: string) => Promise<any> } = {},
+): Promise<boolean> {
+  if (!row || typeof row !== "object" || !rowIsSkill(row)) return true;
+  if (isOpenLiveRow(row)) return true;
+  if (!skillRefReadable({ agentId: row.agentId, visibility: row.visibility }, readerId)) return false;
+  const subjectId = typeof row.skillSubjectId === "string" && row.skillSubjectId.length > 0
+    ? row.skillSubjectId
+    : String(row.id);
+  const headOf = read.headOf ?? ((sid: string) => readHead(SKILL_SUBJECT_TYPE, sid));
+  let versionHead: Record<string, any> | null;
+  try {
+    versionHead = await headOf(subjectId);
+  } catch {
+    return false;
+  }
+  if (!versionHead || versionHead.subjectType !== SKILL_SUBJECT_TYPE || versionHead.subjectId !== subjectId) return false;
+  if (!skillRefReadable(versionHead, versionHead.agentId)) return false;
+  if (versionHead.kind === "delete") {
+    return versionHead.memoryId === null && skillRefReadable(versionHead, readerId);
+  }
+  if (versionHead.kind !== "create" && versionHead.kind !== "update") return false;
+  if (typeof versionHead.memoryId !== "string" || versionHead.memoryId.length === 0) return false;
+  const memoryGet = read.memoryGet ?? ((id: string) => (databases as any).flair?.Memory?.get(id));
+  let live: any;
+  try {
+    live = await memoryGet(versionHead.memoryId);
+  } catch {
+    return false;
+  }
+  if (!live || live.id !== versionHead.memoryId || live.skillSubjectId !== subjectId) return false;
+  if (live.agentId !== versionHead.agentId || !rowIsSkill(live) || live.archived === true) return false;
+  for (const end of [live.validTo, live.expiresAt]) {
+    if (end == null) continue;
+    if (typeof end !== "string" || !(Date.parse(end) > Date.now())) return false;
+  }
+  return skillRefReadable({ agentId: live.agentId, visibility: live.visibility }, readerId);
 }
 
 /**
@@ -66,6 +111,7 @@ function okResponse(): Response {
 function isOpenLiveRow(row: Record<string, any> | null | undefined): boolean {
   if (!row || typeof row !== "object") return false;
   if (row.archived === true) return false;
+  if (row.expiresAt != null && (typeof row.expiresAt !== "string" || !(Date.parse(row.expiresAt) > Date.now()))) return false;
   if (typeof row.validTo === "string" && row.validTo.length > 0) return false;
   return true;
 }
@@ -90,9 +136,16 @@ export function skillWriteConflict(error: string): Response {
 }
 
 export async function prepareSkillBody(content: any, stored: Record<string, any> | null) {
-  const predecessor = typeof content.supersedes === "string" && content.supersedes.length > 0
-    ? await (databases as any).flair.Memory.get(content.supersedes)
-    : null;
+  let predecessor: any = null;
+  if (typeof content.supersedes === "string" && content.supersedes.length > 0) {
+    // flair#2307: a failed read of the `supersedes` target refuses the write
+    // with a named error; it is never read as "no predecessor".
+    try {
+      predecessor = await (databases as any).flair.Memory.get(content.supersedes);
+    } catch (err) {
+      return supersedesTargetUnreadable(err);
+    }
+  }
   if (!rowIsSkill(content) && !rowIsSkill(stored) && !rowIsSkill(predecessor)) {
     return { content, predecessor };
   }
@@ -156,6 +209,27 @@ export async function authorizeSkillOwners(ctx: any, auth: AgentAuthVerdict, row
   return null;
 }
 
+/** flair#2511: the "write" grant a cross-agent close stands on. */
+export interface GrantedClose {
+  granteeId: string;
+  ownerId: string;
+}
+
+/**
+ * flair#2511: the "write" grant a cross-agent close of `closed` stands on, or
+ * null when the close is not a grant-authorized cross-agent one — an operator,
+ * internal or same-agent caller. The same predicate {@link authorizeSkillOwners}
+ * uses to demand the grant; the shared writer re-checks it on committed state
+ * after the close is staged. Every plan that closes a row passes this for the
+ * row it closes.
+ */
+export function grantedSkillClose(closed: Record<string, any> | null | undefined, ctx: any, auth: AgentAuthVerdict): GrantedClose | null {
+  if (!closed || typeof closed.agentId !== "string" || !closed.agentId.trim()) return null;
+  if (skillWriteSource(ctx, auth) !== "agent" || auth.kind !== "agent") return null;
+  if (closed.agentId === auth.agentId) return null;
+  return { granteeId: auth.agentId, ownerId: closed.agentId };
+}
+
 export async function validateSkillSnapshots(stored: any, predecessor: any, targetId: string | null, shared: any): Promise<Response | null> {
   for (const [id, expected] of [[targetId, stored], [predecessor?.id, predecessor]]) {
     if (!id) continue;
@@ -177,6 +251,16 @@ export interface SkillSuccessorPlan {
   value: string | null;
   /** The effective visibility stamped on the version row. */
   visibility: string | null;
+  /**
+   * flair#2511: {@link grantedSkillClose} of `predecessor` — the grant a CROSS-agent
+   * close of it stands on (an agent caller, not the operator's Basic admin or an
+   * internal call, closing another agent's row), else null (no predecessor, or a
+   * same-agent, operator or internal close).
+   * Required, so every plan states it. When set, the shared writer re-checks the
+   * grant on committed state after it stages the close and refuses the whole
+   * write — no close, no successor, no version — when the grant is gone.
+   */
+  grantedClose: GrantedClose | null;
 }
 
 /** The plan for a logical delete. */
@@ -186,6 +270,13 @@ export interface SkillDeletePlan {
   closePatch: Record<string, unknown>;
   value: null;
   visibility: string | null;
+  /**
+   * flair#2511: {@link grantedSkillClose} of the head this delete closes — set
+   * when that head is another agent's row a "write" grant authorizes the caller
+   * to close. The shared writer re-checks it after staging the close, as for a
+   * supersede.
+   */
+  grantedClose: GrantedClose | null;
 }
 
 export type SkillWritePlan = SkillSuccessorPlan | SkillDeletePlan;
@@ -234,6 +325,27 @@ export interface RunSkillVersionWriteArgs {
 }
 
 /**
+ * flair#2511: run once a close's write is staged — a supersede's predecessor
+ * close or a delete's head close. A grant-authorized cross-agent close stands on
+ * the grant read at authorization time; re-read it on committed state HERE,
+ * after the close is staged, through the shared write-back helper the non-skill
+ * close uses (Memory.ts closeSupersededRecord, flair#2333 H10). Returns the named
+ * 409 when the grant is gone — the caller returns it, so the whole transaction
+ * rolls back: no close, no successor, no version — else null. A plan with no
+ * grant (same-agent, operator, internal) reads nothing.
+ */
+async function afterCloseStaged(granted: GrantedClose | null | undefined): Promise<Response | null> {
+  // Test-only: inert unless armed — here the close write is staged, so a
+  // competing grant revocation and the committed-state re-check below can be
+  // exercised in either order (Memory's "supersede-close-staged").
+  const stagedPause = txnPausePoint("skill-close-staged");
+  if (stagedPause) await stagedPause;
+  if (!granted) return null;
+  const held = await writeGrantHeld((databases as any).flair.MemoryGrant, granted.granteeId, granted.ownerId, {});
+  return held ? null : grantedCloseRevokedRefusal();
+}
+
+/**
  * Run one skill version write atomically. The append helper owns the lock, the
  * transaction and the version row; this function performs the Memory-side
  * successor/close/pointer writes inside that same transaction.
@@ -266,6 +378,7 @@ export function captureCreatedFlag(ctx: any): () => void {
 
 async function runSkillVersionWriteInner(args: RunSkillVersionWriteArgs): Promise<RecordVersionOutcome> {
   let plan: SkillWritePlan | null = null;
+  let owner = "";
   return recordVersion(
     args.ctx,
     {
@@ -277,6 +390,7 @@ async function runSkillVersionWriteInner(args: RunSkillVersionWriteArgs): Promis
         if (built instanceof Response) return built;
         plan = built;
         const target = built.kind === "delete" ? built.predecessor : built.successor;
+        owner = String(target.agentId);
         return {
           subjectType: "skill" as const,
           subjectId: args.subjectId,
@@ -295,13 +409,23 @@ async function runSkillVersionWriteInner(args: RunSkillVersionWriteArgs): Promis
       if (plan === null) return okResponse();
       const writePlan = plan!;
       if (writePlan.kind === "delete") {
+        maybeThrowSkillWriteFault("close", owner);
         await args.hooks.closePredecessor!(writePlan.predecessor, writePlan.closePatch, shared);
+        // flair#2511: the grant re-check, after the close is staged.
+        const revoked = await afterCloseStaged(writePlan.grantedClose);
+        if (revoked) return revoked;
       } else {
+        maybeThrowSkillWriteFault("successor", owner);
         await args.hooks.createSuccessor!(writePlan.successor, shared);
         if (writePlan.predecessor) {
+          maybeThrowSkillWriteFault("close", owner);
           await args.hooks.closePredecessor!(writePlan.predecessor, writePlan.closePatch, shared);
+          // flair#2511: the grant re-check, after the close is staged.
+          const revoked = await afterCloseStaged(writePlan.grantedClose);
+          if (revoked) return revoked;
         }
       }
+      maybeThrowSkillWriteFault("pointer", owner);
       const pointerDenial = await args.hooks.pointer?.(shared);
       if (pointerDenial) return pointerDenial;
       return okResponse();

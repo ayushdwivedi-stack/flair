@@ -55,13 +55,29 @@
 
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { actionRecallInstallRoot, plannedActionRecallRuntime, probeActionRecallRuntime, provisionActionRecallRuntime } from "./lib/action-recall-runtime.js";
+import {
+  captureInstallRoot,
+  plannedCaptureRuntime,
+  probeCaptureRuntime,
+  provisionCaptureRuntime,
+} from "./lib/capture-runtime.js";
 import { dirname, join } from "node:path";
 import {
   SESSION_START_HOOK_MARKER,
+  ACTION_RECALL_HOOK_MARKER,
+  CAPTURE_HOOK_MARKER,
   ACTION_RECALL_PRE_TOOL_USE_MATCHER,
   buildSessionStartHookCommand,
   buildActionRecallHookCommand,
+  parseActionRecallCommand,
   buildContinuityCaptureHookCommand,
+  buildCaptureHookCommand,
+  captureFlushSpec,
+  parseCaptureCommand,
+  isFlairCaptureCommand,
+  CAPTURE_HOOK_EVENTS,
+  CAPTURE_HOOK_MATCHERS,
+  type CaptureHookEvent,
   checkContinuityCaptureHooks,
   computeContinuityHookInstall,
   computeContinuityHookRemoval,
@@ -875,6 +891,9 @@ export interface HookStatusResult {
   /** What status verified, not what it configured (flair#1734). */
   delivery: HookDeliveryState;
   deliveryReasons: string[];
+  pinStale: boolean;
+  /** The stale pin that finding named, else null. */
+  stalePin: string | null;
 }
 
 /** Injectable so `hook status` can classify a real run without unit tests spawning npx. */
@@ -884,10 +903,18 @@ export type HookDeliveryProbe = (command: string) => {
   stderr?: string;
   timedOut?: boolean;
   spawnError?: string | null;
+  cleanupError?: string | null;
+  outputOverflow?: boolean;
 };
 
 export interface HookStatusOptions {
   deliveryProbe?: HookDeliveryProbe;
+  stalePinFinding?: HookPinFinding | null;
+}
+
+export interface HookPinFinding {
+  pin: string | null;
+  direction: "ahead" | "behind" | "unknown";
 }
 
 /**
@@ -901,7 +928,15 @@ export function classifyHookDelivery(outcome: {
   stderr?: string;
   timedOut?: boolean;
   spawnError?: string | null;
+  cleanupError?: string | null;
+  outputOverflow?: boolean;
 }): HookDeliveryVerdict {
+  if (outcome.cleanupError) {
+    return { delivered: false, reason: `not delivered: probe could not confirm the command's process group ended (${outcome.cleanupError})` };
+  }
+  if (outcome.outputOverflow) {
+    return { delivered: false, reason: "not delivered: probe output exceeded its size limit" };
+  }
   if (outcome.timedOut) {
     return { delivered: false, reason: "not delivered: probe timed out" };
   }
@@ -1050,12 +1085,14 @@ export function hookStatusFailureLine(status: Pick<HookStatusResult, "silenced" 
 /** Read-only report: is the hook wired, does it look right, and which agent
  *  / Flair instance does it point at (recovered from the wired command). */
 export function hookStatus(homeDir: string, harness: Harness, opts: HookStatusOptions = {}): HookStatusResult {
+  const pinStale = opts.stalePinFinding?.direction === "behind";
+  const stalePin = pinStale ? opts.stalePinFinding?.pin ?? null : null;
   const path = hookSettingsPath(homeDir, harness);
   const read = readSettingsFile(path);
   if (read.parseError) {
     return {
       harness, path, wired: false, correctShape: false, silenced: false, stderrDiscarded: false,
-      parseError: read.parseError, delivery: "absent", deliveryReasons: [],
+      parseError: read.parseError, delivery: "absent", deliveryReasons: [], pinStale: false, stalePin: null,
     };
   }
 
@@ -1064,7 +1101,7 @@ export function hookStatus(homeDir: string, harness: Harness, opts: HookStatusOp
   if (!existing) {
     return {
       harness, path, wired: false, correctShape: false, silenced: false, stderrDiscarded: false,
-      parseError: null, delivery: "absent", deliveryReasons: [],
+      parseError: null, delivery: "absent", deliveryReasons: [], pinStale: false, stalePin: null,
     };
   }
 
@@ -1081,6 +1118,7 @@ export function hookStatus(homeDir: string, harness: Harness, opts: HookStatusOp
     stderrDiscarded: hookCommandDiscardsStderr(command),
     agentId: env.agentId, flairUrl: env.flairUrl, command, parseError: null,
     delivery: assessed.delivery, deliveryReasons: assessed.deliveryReasons,
+    pinStale, stalePin,
   };
 }
 
@@ -1130,6 +1168,11 @@ export interface ActionRecallMutationResult {
   actions: { preToolUse: HookDeltaAction; sessionStart: HookDeltaAction | "skipped" } | null;
 }
 
+function hookGroupIsFlairOnly(group: any, isOurs: (command: any) => boolean): boolean {
+  const hooks = group?.hooks;
+  return Array.isArray(hooks) && hooks.length > 0 && hooks.every((h: any) => isOurs(h?.command));
+}
+
 /** Find the PreToolUse group carrying an action-recall hook command. */
 function findActionRecallEntry(config: any): { groupIndex: number; hookIndex: number; group: any } | null {
   const groups = config?.hooks?.PreToolUse;
@@ -1168,13 +1211,26 @@ function computeActionRecallInstall(
   const newConfig = deepClone(config);
   let preToolUse: HookDeltaAction = "noop";
 
+  const groups = newConfig.hooks?.PreToolUse;
+  if (Array.isArray(groups)) {
+    for (const group of groups) {
+      if (!Array.isArray(group?.hooks) || hookGroupIsFlairOnly(group, isFlairActionRecallCommand)) continue;
+      const retained = group.hooks.filter((hook: any) => !isFlairActionRecallCommand(hook?.command));
+      if (retained.length !== group.hooks.length) {
+        group.hooks = retained;
+        preToolUse = "update";
+      }
+    }
+  }
+
   const existing = findActionRecallEntry(newConfig);
   if (existing) {
-    const hook = newConfig.hooks.PreToolUse[existing.groupIndex].hooks[existing.hookIndex];
-    if (hook.type !== "command" || hook.command !== command || existing.group.matcher !== ACTION_RECALL_PRE_TOOL_USE_MATCHER) {
+    const group = existing.group;
+    const hook = group.hooks[existing.hookIndex];
+    if (hook.type !== "command" || hook.command !== command || group.matcher !== ACTION_RECALL_PRE_TOOL_USE_MATCHER) {
       hook.command = command;
       hook.type = "command";
-      existing.group.matcher = ACTION_RECALL_PRE_TOOL_USE_MATCHER;
+      group.matcher = ACTION_RECALL_PRE_TOOL_USE_MATCHER;
       preToolUse = "update";
     }
   } else {
@@ -1184,7 +1240,7 @@ function computeActionRecallInstall(
       matcher: ACTION_RECALL_PRE_TOOL_USE_MATCHER,
       hooks: [{ type: "command", command }],
     });
-    preToolUse = "add";
+    if (preToolUse !== "update") preToolUse = "add";
   }
 
   let sessionStart: HookDeltaAction | "skipped" = "skipped";
@@ -1227,9 +1283,9 @@ function actionRecallInstallRefusal(delta: ActionRecallDelta, path: string): str
 
 function actionRecallCommandFailure(command: unknown): string | null {
   if (typeof command !== "string") return "action-recall command is not an installer command";
-  const match = /^sh -c 'out=\$\(FLAIR_AGENT_ID=([^ ]+) (?:FLAIR_URL=([^ ]+) )?([^ ]+) ([^ ]+) 2>\/dev\/null\) /.exec(command);
-  if (!match) return "action-recall command is not an installer command";
-  const [, agent, url, bun, artifact] = match;
+  const parts = parseActionRecallCommand(command);
+  if (!parts) return "action-recall command is not an installer command";
+  const { bunPath: bun, artifactPath: artifact, agentId: agent, flairUrl: url } = parts;
   try {
     if (command !== buildActionRecallHookCommand(bun, artifact, agent, url)) return "action-recall command is not an installer command";
     return probeActionRecallRuntime({ bunPath: bun, artifactPath: artifact }, agent, url, command);
@@ -1244,6 +1300,7 @@ export interface ActionRecallStatus {
   harness: Harness;
   installed: boolean;
   refreshEnabled: boolean;
+  problems: string[];
   runtimeFailure?: string;
 }
 
@@ -1253,8 +1310,11 @@ export function actionRecallHookStatus(homeDir: string, harness: Harness): Actio
   const config = read.parsed ?? {};
   const entry = findActionRecallEntry(config);
   const hook = entry ? entry.group.hooks[entry.hookIndex] : null;
+  const candidates = findCaptureEntries(config, "PreToolUse", command => isHookStatusCandidate(command, ACTION_RECALL_HOOK_MARKER));
+  const noncanonical = candidates.filter(candidate => !isFlairActionRecallCommand(candidate.group.hooks[candidate.hookIndex]?.command));
+  const problems = noncanonical.map(candidate => `PreToolUse[${candidate.groupIndex}].hooks[${candidate.hookIndex}]: noncanonical action-recall command`);
   const runtimeFailure = hook ? actionRecallCommandFailure(hook.command) : null;
-  const installed = harness === "claude-code" && hook?.type === "command" && entry?.group.matcher === ACTION_RECALL_PRE_TOOL_USE_MATCHER && runtimeFailure === null;
+  const installed = harness === "claude-code" && hook?.type === "command" && entry?.group.matcher === ACTION_RECALL_PRE_TOOL_USE_MATCHER && runtimeFailure === null && problems.length === 0;
   let refreshEnabled = false;
   const ss = findHookEntry(config);
   if (ss) {
@@ -1262,7 +1322,7 @@ export function actionRecallHookStatus(homeDir: string, harness: Harness): Actio
     const form = parseInstallerHookForm(hook.command);
     refreshEnabled = hook.type === "command" && form?.harness === "claude-code" && sessionStartEnablesActionRecall(hook.command);
   }
-  return { path, harness, installed, refreshEnabled, ...(runtimeFailure ? { runtimeFailure } : {}) };
+  return { path, harness, installed, refreshEnabled, problems, ...(runtimeFailure ? { runtimeFailure } : {}) };
 }
 
 /** Install (or repair) the action-recall PreToolUse hook + SessionStart refresh. */
@@ -1357,14 +1417,20 @@ export function installActionRecall(opts: ActionRecallInstallOptions): ActionRec
 function computeActionRecallRemoval(config: any): ActionRecallDelta {
   const newConfig = deepClone(config);
   let preToolUse: HookDeltaAction = "noop";
-  const entry = findActionRecallEntry(newConfig);
-  if (entry) {
-    const group = newConfig.hooks.PreToolUse[entry.groupIndex];
-    group.hooks.splice(entry.hookIndex, 1);
-    if (group.hooks.length === 0) newConfig.hooks.PreToolUse.splice(entry.groupIndex, 1);
-    if (newConfig.hooks.PreToolUse.length === 0) delete newConfig.hooks.PreToolUse;
-    preToolUse = "remove";
+  const groups = newConfig.hooks?.PreToolUse;
+  if (Array.isArray(groups)) {
+    for (let gi = groups.length - 1; gi >= 0; gi--) {
+      const group = groups[gi];
+      if (!Array.isArray(group?.hooks)) continue;
+      const retained = group.hooks.filter((hook: any) => !isFlairActionRecallCommand(hook?.command));
+      if (retained.length === group.hooks.length) continue;
+      group.hooks = retained;
+      if (retained.length === 0) groups.splice(gi, 1);
+      preToolUse = "remove";
+    }
+    if (preToolUse === "remove" && groups.length === 0) delete newConfig.hooks.PreToolUse;
   }
+
   let sessionStart: HookDeltaAction | "skipped" = "skipped";
   const ss = findHookEntry(newConfig);
   if (ss) {
@@ -1381,7 +1447,6 @@ function computeActionRecallRemoval(config: any): ActionRecallDelta {
   return { changed: preToolUse === "remove" || sessionStart === "update", newConfig, actions: { preToolUse, sessionStart } };
 }
 
-/** Remove the first marker-matched PreToolUse entry and compatible refresh flag. */
 export function uninstallActionRecall(opts: UninstallHookOptions): ActionRecallMutationResult {
   const { homeDir, harness } = opts;
   const dryRun = !!opts.dryRun;
@@ -1604,4 +1669,375 @@ export function uninstallContinuityHooks(opts: UninstallHookOptions): Continuity
  *  doctor's check consumes, resolved through the harness's settings path. */
 export function continuityHookStatus(homeDir: string, harness: Harness): ContinuityCaptureHookReport {
   return checkContinuityCaptureHooks(homeDir, hookSettingsPath(homeDir, harness));
+}
+
+// ── capture hooks (flair#2068) ───────────────────────────────────────────────
+//
+// Candidates are staged locally; the background flush attempts writes.
+
+export interface CaptureInstallOptions extends InstallHookOptions {
+  runtime: ActionRecallRuntime;
+}
+
+export interface CaptureMutationResult {
+  ok: boolean;
+  path: string;
+  harness: Harness;
+  dryRun: boolean;
+  message: string;
+  backupPath: string | null;
+  actions: Record<CaptureHookEvent, HookDeltaAction | "remove"> | null;
+}
+
+/** The capture status for `flair hook status --capture`. */
+export interface CaptureStatus {
+  path: string;
+  harness: Harness;
+  installed: boolean;
+  state: "installed" | "absent" | "partial" | "stale";
+  runtimeFailure?: string;
+  problems: string[];
+}
+
+function noCaptureActions(): Record<CaptureHookEvent, HookDeltaAction> {
+  return Object.fromEntries(CAPTURE_HOOK_EVENTS.map((event) => [event, "noop"])) as Record<CaptureHookEvent, HookDeltaAction>;
+}
+
+function describeCaptureActions(actions: Record<CaptureHookEvent, HookDeltaAction | "remove">): string {
+  return CAPTURE_HOOK_EVENTS.map((event) => `${event}: ${actions[event]}`).join(", ");
+}
+
+function isHookStatusCandidate(command: unknown, marker: string): boolean {
+  if (typeof command !== "string") return false;
+  const prefix = marker === ACTION_RECALL_HOOK_MARKER ? "sh -c 'out=$(" : "sh -c '";
+  const redirect = marker === ACTION_RECALL_HOOK_MARKER ? "2>/dev/null)" : ">/dev/null";
+  const tokens = command.split(" ");
+  return command.startsWith(prefix) && tokens.some((token, index) =>
+    token.split("/").at(-1) === marker && tokens[index + 1] === redirect);
+}
+
+function findCaptureEntries(config: any, event: CaptureHookEvent | "PreToolUse", isMatch: (command: any) => boolean = isFlairCaptureCommand): Array<{ group: any; hookIndex: number; groupIndex: number }> {
+  const entries: Array<{ group: any; hookIndex: number; groupIndex: number }> = [];
+  const groups = config?.hooks?.[event];
+  if (!Array.isArray(groups)) return entries;
+  for (let gi = 0; gi < groups.length; gi++) {
+    const hooks = groups[gi]?.hooks;
+    if (!Array.isArray(hooks)) continue;
+    for (let hi = 0; hi < hooks.length; hi++) {
+      if (isMatch(hooks[hi]?.command)) entries.push({ group: groups[gi], hookIndex: hi, groupIndex: gi });
+    }
+  }
+  return entries;
+}
+
+/** Most common command among each event's first match; ties go to the earliest event. */
+function expectedCaptureCommand(commands: ReadonlyArray<string | null>): string {
+  const counts = new Map<string, number>();
+  for (const command of commands) {
+    if (command !== null) counts.set(command, (counts.get(command) ?? 0) + 1);
+  }
+  let best = "";
+  let bestCount = 0;
+  for (const [command, count] of counts) {
+    if (count > bestCount) {
+      best = command;
+      bestCount = count;
+    }
+  }
+  return best;
+}
+
+interface CaptureDelta {
+  changed: boolean;
+  newConfig: any;
+  actions: Record<CaptureHookEvent, HookDeltaAction>;
+}
+
+/** Pure merge of the capture hooks into a parsed settings object. */
+export function computeCaptureHookInstall(config: any, runtime: ActionRecallRuntime, agentId: string, flairUrl: string): CaptureDelta {
+  const command = buildCaptureHookCommand(runtime.bunPath, runtime.artifactPath, agentId, flairUrl, captureFlushSpec());
+  const newConfig = deepClone(config ?? {});
+  newConfig.hooks = newConfig.hooks && typeof newConfig.hooks === "object" && !Array.isArray(newConfig.hooks) ? newConfig.hooks : {};
+  const actions = noCaptureActions();
+  let changed = false;
+  for (const event of CAPTURE_HOOK_EVENTS) {
+    const entries = findCaptureEntries(newConfig, event);
+    const existing = entries[0];
+    const wantMatcher = CAPTURE_HOOK_MATCHERS[event];
+    if (existing) {
+      if (entries.length > 1) {
+        for (const duplicate of entries.slice(1).reverse()) {
+          duplicate.group.hooks.splice(duplicate.hookIndex, 1);
+        }
+        newConfig.hooks[event] = newConfig.hooks[event].filter((group: any) => !Array.isArray(group?.hooks) || group.hooks.length > 0);
+        actions[event] = "update";
+        changed = true;
+      }
+      const group = existing.group;
+      const hook = group.hooks[existing.hookIndex];
+      if (hookGroupIsFlairOnly(group, isFlairCaptureCommand)) {
+        const matcherCurrent = wantMatcher === null
+          ? group.matcher == null || group.matcher === ""
+          : group.matcher === wantMatcher;
+        if (hook.type !== "command" || hook.command !== command || !matcherCurrent) {
+          hook.command = command;
+          hook.type = "command";
+          if (wantMatcher === null) delete group.matcher;
+          else group.matcher = wantMatcher;
+          actions[event] = "update";
+          changed = true;
+        }
+      } else {
+        group.hooks.splice(existing.hookIndex, 1);
+        const dedicated: any = { hooks: [{ type: "command", command }] };
+        if (wantMatcher !== null) dedicated.matcher = wantMatcher;
+        newConfig.hooks[event].push(dedicated);
+        actions[event] = "update";
+        changed = true;
+      }
+    } else {
+      newConfig.hooks[event] = Array.isArray(newConfig.hooks[event]) ? newConfig.hooks[event] : [];
+      const group: any = { hooks: [{ type: "command", command }] };
+      if (wantMatcher !== null) group.matcher = wantMatcher;
+      newConfig.hooks[event].push(group);
+      actions[event] = "add";
+      changed = true;
+    }
+  }
+  return { changed, newConfig, actions };
+}
+
+export function computeCaptureHookRemoval(config: any): CaptureDelta {
+  const newConfig = deepClone(config ?? {});
+  const actions = noCaptureActions();
+  for (const event of CAPTURE_HOOK_EVENTS) {
+    const groups = newConfig.hooks?.[event];
+    if (!Array.isArray(groups)) continue;
+    let removedAny = false;
+    const kept: any[] = [];
+    for (const group of groups) {
+      const isGroup = group && typeof group === "object" && Array.isArray(group.hooks);
+      if (isGroup) {
+        const before = group.hooks.length;
+        group.hooks = group.hooks.filter((hook: any) => !isFlairCaptureCommand(hook?.command));
+        if (group.hooks.length !== before) removedAny = true;
+      }
+      if (!isGroup || group.hooks.length > 0) kept.push(group);
+    }
+    if (!removedAny) continue;
+    actions[event] = "remove";
+    if (kept.length > 0) newConfig.hooks[event] = kept;
+    else delete newConfig.hooks[event];
+  }
+  if (newConfig.hooks && typeof newConfig.hooks === "object" && Object.keys(newConfig.hooks).length === 0) {
+    delete newConfig.hooks;
+  }
+  return { changed: CAPTURE_HOOK_EVENTS.some((event) => actions[event] !== "noop"), newConfig, actions };
+}
+
+/** Reproduce + re-probe a wired capture command, or a reason it is not one. */
+function captureCommandFailure(command: unknown): string | null {
+  const parts = parseCaptureCommand(typeof command === "string" ? command : "");
+  if (!parts) return "capture command is not an installer command";
+  if (parts.flushSpec !== captureFlushSpec()) return "capture command requires the current flush spec";
+  try {
+    const rebuilt = buildCaptureHookCommand(parts.bunPath, parts.artifactPath, parts.agentId, parts.flairUrl, parts.flushSpec);
+    if (command !== rebuilt) return "capture command is not an installer command";
+    return probeCaptureRuntime({ bunPath: parts.bunPath, artifactPath: parts.artifactPath }, parts.agentId, parts.flairUrl ?? "http://localhost:19926", command);
+  } catch {
+    return "capture command is not an installer command";
+  }
+}
+
+/** Install (or repair) the capture hooks. */
+export function installCaptureHooks(opts: CaptureInstallOptions): CaptureMutationResult {
+  const { homeDir, harness, agentId, flairUrl, runtime } = opts;
+  const dryRun = !!opts.dryRun;
+  const path = hookSettingsPath(homeDir, harness);
+
+  if (harness !== "claude-code") {
+    return {
+      ok: false, path, harness, dryRun,
+      message: `capture is Claude Code only — ${harness} has no PostToolUseFailure/PostToolUse/Stop matcher Flair can capture from`, backupPath: null, actions: null,
+    };
+  }
+  for (const [label, value] of [["agent id", agentId], ["Flair URL", flairUrl]] as const) {
+    if (!isHookCommandValueSafe(value)) {
+      return {
+        ok: false, path, harness, dryRun,
+        message: `${label} '${value}' contains characters that cannot be safely written into a shell hook command — refusing to write it`,
+        backupPath: null, actions: null,
+      };
+    }
+  }
+
+  const runtimeFailure = probeCaptureRuntime(runtime, agentId, flairUrl);
+  if (runtimeFailure) {
+    return { ok: false, path, harness, dryRun, message: `${runtimeFailure} — nothing written`, backupPath: null, actions: null };
+  }
+
+  if (dryRun) {
+    let planned: ActionRecallRuntime;
+    try {
+      planned = plannedCaptureRuntime(runtime, homeDir);
+    } catch (error) {
+      return { ok: false, path, harness, dryRun, message: `${error instanceof Error ? error.message : String(error)} — nothing written`, backupPath: null, actions: null };
+    }
+    const read = readSettingsFile(path);
+    if (read.parseError) {
+      return { ok: false, path, harness, dryRun, message: `${read.parseError} — dry run: nothing would be written until this is fixed`, backupPath: null, actions: null };
+    }
+    const delta = computeCaptureHookInstall(read.parsed ?? {}, planned, agentId, flairUrl);
+    const message = delta.changed
+      ? `would wire the capture hooks (${describeCaptureActions(delta.actions)}) in ${path} (dry run — nothing written)`
+      : `capture hooks already current in ${path} — no changes`;
+    return { ok: true, path, harness, dryRun, message, backupPath: null, actions: delta.actions };
+  }
+
+  mkdirSync(dirname(path), { recursive: true });
+  let actions: CaptureMutationResult["actions"] = null;
+  let refused = false;
+  const result = withConfigCriticalSection(
+    path,
+    (bytes) => {
+      const read = parseSettingsBytes(bytes, path);
+      if (read.parseError) {
+        refused = true;
+        return { hold: `${read.parseError} — refusing to modify a file we can't safely parse. Original left untouched at ${path}.` };
+      }
+      let installed: ActionRecallRuntime;
+      try {
+        installed = provisionCaptureRuntime(runtime, homeDir, agentId, flairUrl);
+      } catch (error) {
+        return { hold: `${error instanceof Error ? error.message : String(error)} — nothing written` };
+      }
+      const delta = computeCaptureHookInstall(read.parsed ?? {}, installed, agentId, flairUrl);
+      actions = delta.actions;
+      if (!delta.changed) return { noop: `capture hooks already current in ${path}` };
+      return { write: encodeConfig(delta.newConfig) };
+    },
+    { backup: (bytes) => backupBytesTo(path, bytes) },
+  );
+
+  const backupPath = result.backupPath ?? null;
+  if (result.status === "written") {
+    return { ok: true, path, harness, dryRun, message: `wired the capture hooks (${describeCaptureActions(actions!)}) in ${path}`, backupPath, actions };
+  }
+  if (result.status === "noop") {
+    return { ok: true, path, harness, dryRun, message: result.message, backupPath, actions };
+  }
+  if (result.status === "held") {
+    return { ok: false, path, harness, dryRun, message: result.message, backupPath, actions: refused ? null : actions };
+  }
+  return { ok: false, path, harness, dryRun, message: result.message, backupPath, actions: null };
+}
+
+/** Symmetric removal of the capture hooks + their provisioned runtime. */
+export function uninstallCaptureHooks(opts: UninstallHookOptions): CaptureMutationResult {
+  const { homeDir, harness } = opts;
+  const dryRun = !!opts.dryRun;
+  const path = hookSettingsPath(homeDir, harness);
+
+  if (harness !== "claude-code") {
+    return { ok: false, path, harness, dryRun, message: `capture is Claude Code only`, backupPath: null, actions: null };
+  }
+  if (!existsSync(path)) {
+    if (!dryRun) rmSync(captureInstallRoot(homeDir), { recursive: true, force: true });
+    return { ok: true, path, harness, dryRun, message: `no capture hooks found in ${path} — nothing to remove`, backupPath: null, actions: noCaptureActions() };
+  }
+  if (dryRun) {
+    const read = readSettingsFile(path);
+    if (read.parseError) return { ok: false, path, harness, dryRun, message: read.parseError, backupPath: null, actions: null };
+    const delta = computeCaptureHookRemoval(read.parsed ?? {});
+    const message = delta.changed
+      ? `would remove the capture hooks (${describeCaptureActions(delta.actions)}) from ${path} (dry run — nothing written)`
+      : `no capture hooks found in ${path} — nothing to remove (dry run)`;
+    return { ok: true, path, harness, dryRun, message, backupPath: null, actions: delta.actions };
+  }
+  let actions: CaptureMutationResult["actions"] = null;
+  let refused = false;
+  const result = withConfigCriticalSection(
+    path,
+    (bytes) => {
+      const read = parseSettingsBytes(bytes, path);
+      if (read.parseError) {
+        refused = true;
+        return { hold: `${read.parseError} — refusing to modify a file we can't safely parse. Original left untouched at ${path}.` };
+      }
+      const delta = computeCaptureHookRemoval(read.parsed ?? {});
+      actions = delta.actions;
+      if (!delta.changed) return { noop: `no capture hooks found in ${path} — nothing to remove` };
+      return { write: encodeConfig(delta.newConfig) };
+    },
+    { backup: (bytes) => backupBytesTo(path, bytes) },
+  );
+
+  if (result.status === "written" || result.status === "noop") {
+    rmSync(captureInstallRoot(homeDir), { recursive: true, force: true });
+  }
+  const backupPath = result.backupPath ?? null;
+  if (result.status === "written") {
+    return { ok: true, path, harness, dryRun, message: `removed the capture hooks from ${path}`, backupPath, actions };
+  }
+  if (result.status === "noop") {
+    return { ok: true, path, harness, dryRun, message: result.message, backupPath, actions };
+  }
+  if (result.status === "held") {
+    return { ok: false, path, harness, dryRun, message: result.message, backupPath, actions: refused ? null : actions };
+  }
+  return { ok: false, path, harness, dryRun, message: result.message, backupPath, actions: null };
+}
+
+/** Read-only capture status; names missing events in partial installations. */
+export function captureHookStatus(homeDir: string, harness: Harness): CaptureStatus {
+  const path = hookSettingsPath(homeDir, harness);
+  const read = readSettingsFile(path);
+  const config = read.parsed ?? {};
+  const matching = CAPTURE_HOOK_EVENTS.map((event) => findCaptureEntries(config, event, command => isHookStatusCandidate(command, CAPTURE_HOOK_MARKER)));
+  const entries = matching.map((entries) => entries[0] ?? null);
+  const commands = CAPTURE_HOOK_EVENTS.map((event, i) => {
+    const entry = entries[i];
+    if (!entry) return null;
+    const command = entry.group.hooks[entry.hookIndex]?.command;
+    return typeof command === "string" ? command : "";
+  });
+  const problems: string[] = [];
+  const presentCount = commands.filter((command) => command !== null).length;
+  if (presentCount === 0) return { path, harness, installed: false, state: "absent", problems };
+  const expected = expectedCaptureCommand(commands);
+  let runtimeFailure: string | null = null;
+  const checked = new Map<string, string | null>();
+  for (const [i, event] of CAPTURE_HOOK_EVENTS.entries()) {
+    const matches = matching[i]!;
+    if (matches.length === 0) problems.push(`${event} missing`);
+    if (matches.length > 1) problems.push(`${event} has duplicate capture entries`);
+    for (const entry of matches) {
+      const hook = entry.group.hooks[entry.hookIndex];
+      if (hook.type !== "command") problems.push(`${event} carries an unexpected type`);
+      const command = hook.command as string;
+      if (!isFlairCaptureCommand(command)) {
+        problems.push(`${event}[${entry.groupIndex}].hooks[${entry.hookIndex}]: noncanonical capture command`);
+        continue;
+      }
+      if (command !== expected) problems.push(`${event} carries a different command`);
+      const want = CAPTURE_HOOK_MATCHERS[event];
+      const matcher = entry.group.matcher;
+      if (want === null ? matcher != null && matcher !== "" : matcher !== want) {
+        problems.push(`${event} carries an unexpected matcher`);
+      }
+      if (!checked.has(command)) checked.set(command, captureCommandFailure(command));
+      const failure = checked.get(command);
+      if (failure) {
+        runtimeFailure ??= failure;
+        problems.push(`${event}: ${failure}`);
+      }
+    }
+  }
+  if (presentCount < CAPTURE_HOOK_EVENTS.length) {
+    return { path, harness, installed: false, state: "partial", problems };
+  }
+  if (runtimeFailure || problems.length > 0) {
+    return { path, harness, installed: false, state: "stale", ...(runtimeFailure ? { runtimeFailure } : {}), problems };
+  }
+  return { path, harness, installed: true, state: "installed", problems };
 }

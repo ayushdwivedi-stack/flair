@@ -2,7 +2,7 @@
 # Byte-identical gate for src/cli.ts modularization. Do not edit by hand.
 # Refresh: UPDATE_CLI_SURFACE_SNAPSHOT=1 bun test test/unit-isolated/cli-surface-snapshot.test.ts
 # helpWidth=80 (pinned; TTY columns must not affect this file)
-# commands=138 options=616
+# commands=140 options=633
 #
 # TREE is registration order: every command/subcommand + declared options/args.
 # HELP is each command's outputHelp() (--help, including addHelpText).
@@ -108,7 +108,7 @@ flair agent
   description: Manage Flair agents
   usage: [options] [command]
   options: (none)
-  subcommands: add, list, show, rotate-key, remove
+  subcommands: add, list, show, rotate-key, remove, stamp-home
 
 flair agent add
   description: Register a new agent. Refuses an id whose Agent record already exists
@@ -227,6 +227,29 @@ flair agent remove
       description: Skip interactive confirmation (required when stdin is not a TTY)
       attr: force
 
+flair agent stamp-home
+  description: Back-fill the home instance (originatorInstanceId) on home-less Agent rows with no federation-sync provenance
+  usage: [options]
+  options:
+    --port <port>
+      description: Harper HTTP port
+      attr: port
+    --ops-port <port>
+      description: Harper operations API port
+      attr: opsPort
+    --admin-pass <pass>
+      description: Admin password (or set FLAIR_ADMIN_PASS)
+      attr: adminPass
+    --admin-pass-file <path>
+      description: Read the admin password from a file (chmod 600 enforced)
+      attr: adminPassFile
+    --admin-user <name>
+      description: Admin username for Basic auth (env: FLAIR_ADMIN_USER; default: admin)
+      attr: adminUser
+    --apply
+      description: Write the home; without it the command is a dry run and writes nothing
+      attr: apply
+
 flair keys
   description: Manage Ed25519 key files in the key directory
   usage: [options] [command]
@@ -282,6 +305,9 @@ flair hook install
     --action-recall
       description: Wire the Claude Code PreToolUse action-recall hook instead (flair#2067)
       attr: actionRecall
+    --capture
+      description: Wire the Claude Code PostToolUseFailure + PostToolUse + Stop learning-capture hooks instead (flair#2068)
+      attr: capture
 
 flair hook uninstall
   description: Remove the Flair SessionStart hook entry — only ours, everything else in the file is left untouched
@@ -300,6 +326,9 @@ flair hook uninstall
     --action-recall
       description: Remove the Claude Code PreToolUse action-recall hook instead (flair#2067)
       attr: actionRecall
+    --capture
+      description: Remove the Claude Code PostToolUseFailure + PostToolUse + Stop learning-capture hooks instead (flair#2068)
+      attr: capture
 
 flair hook status
   description: Show whether the SessionStart hook is wired, its shape, and which Flair instance it targets
@@ -312,6 +341,9 @@ flair hook status
     --action-recall
       description: Also report the Claude Code PreToolUse action-recall hook (flair#2067)
       attr: actionRecall
+    --capture
+      description: Also report the Claude Code PostToolUseFailure + PostToolUse + Stop learning-capture hooks (flair#2068)
+      attr: capture
 
 flair mcp
   description: MCP client-credentials agent-auth (RFC 7523 private_key_jwt)
@@ -481,8 +513,11 @@ flair mcp enable
       description: Use the Fabric branch and default to Fabric secrets staging; refused for a localhost, *.localhost, 127/8, ::1, ::ffff:127/8, 0.0.0.0 or :: target host
       attr: fabric
     --dry-run
-      description: Check target syntax, issuer hostname/IP literal, IdP credential presence and any CIMD list/local config. Write no file and make no remote call. Skip process/config matching and live checks; a custom remote target can pass dry run and be refused without --dry-run
+      description: Preview enable or refresh without writing files or making remote calls. Skip live checks; refresh refuses an occupied explicit --secrets-path
       attr: dryRun
+    --refresh-flag
+      description: One-shot migration (flair#2283): attempt the encrypted FLAIR_MCP_OAUTH=true push, check the secret row's processEnv marker, restart and check discovery metadata; when the update could not be pushed or confirmed, attempt a 0600 fallback file and exit non-zero. An occupied explicit path is refused before probing, including in dry run; an occupied default path is refused when fallback is needed. Uses a separate default filename; --secrets-path can select mcp enable's path. Does not re-run IdP intake or apply identity mapping or CIMD changes. Use it to correct FLAIR_MCP_OAUTH=1, which does not enable the component's MCP AS
+      attr: refreshFlag
     --json
       description: Print machine-readable JSON instead of a human summary
       attr: json
@@ -862,7 +897,7 @@ flair integrity
   description: Detect missing checkpointed durable Memory IDs or changed or missing previously nonempty tokens
   usage: [options] [command]
   options: (none)
-  subcommands: check
+  subcommands: check, prune-history
 
 flair integrity check
   description: Report missing checkpointed durable IDs or changed or missing previously nonempty tokens; rows created and lost entirely between scans are not observed
@@ -877,6 +912,33 @@ flair integrity check
     --checkpoint <path>
       description: Checkpoint file path (default: ~/.flair/integrity-checkpoint.json)
       attr: checkpoint
+    --ops-port <port>
+      description: Harper operations API port
+      attr: opsPort
+    --admin-pass <pass>
+      description: Admin password (or set FLAIR_ADMIN_PASS env)
+      attr: adminPass
+    --admin-user <name>
+      description: Admin username for Basic auth (env: FLAIR_ADMIN_USER; default: admin)
+      attr: adminUser
+
+flair integrity prune-history
+  description: Prune MemoryDeletionHistory rows older than the oldest named checkpoint watermark minus a margin; dry-run unless --apply
+  usage: [options]
+  options:
+    --checkpoint <path...>
+      description: Checkpoint file whose watermark bounds the prune; repeat for several (default: ~/.flair/integrity-checkpoint.json)
+      attr: checkpoint
+      variadic: true
+    --apply
+      description: Delete the eligible rows; without it nothing is deleted
+      attr: apply
+    --max <n>
+      description: Hard cap on rows pruned in one run (default: 500)
+      attr: max
+    --json
+      description: Print the plan as JSON
+      attr: json
     --ops-port <port>
       description: Harper operations API port
       attr: opsPort
@@ -2873,6 +2935,9 @@ Commands:
   show [options] <id>        Show agent details
   rotate-key [options] <id>  Rotate an agent's Ed25519 keypair
   remove [options] <id>      Remove an agent and all its data from Flair
+  stamp-home [options]       Back-fill the home instance (originatorInstanceId)
+                             on home-less Agent rows with no federation-sync
+                             provenance
   help [command]             display help for command
 
 ----- flair agent add -----
@@ -2972,6 +3037,27 @@ Options:
 Global Options:
   -v, --version        output the version number
 
+----- flair agent stamp-home -----
+Usage: flair agent stamp-home [options]
+
+Back-fill the home instance (originatorInstanceId) on home-less Agent rows with
+no federation-sync provenance
+
+Options:
+  --port <port>             Harper HTTP port
+  --ops-port <port>         Harper operations API port
+  --admin-pass <pass>       Admin password (or set FLAIR_ADMIN_PASS)
+  --admin-pass-file <path>  Read the admin password from a file (chmod 600
+                            enforced)
+  --admin-user <name>       Admin username for Basic auth (env:
+                            FLAIR_ADMIN_USER; default: admin)
+  --apply                   Write the home; without it the command is a dry run
+                            and writes nothing
+  -h, --help                display help for command
+
+Global Options:
+  -v, --version             output the version number
+
 ----- flair keys -----
 Usage: flair keys [options] [command]
 
@@ -3047,6 +3133,8 @@ Options:
                     Stop — flair#1257; installing them IS the opt-in)
   --action-recall   Wire the Claude Code PreToolUse action-recall hook instead
                     (flair#2067)
+  --capture         Wire the Claude Code PostToolUseFailure + PostToolUse + Stop
+                    learning-capture hooks instead (flair#2068)
   -h, --help        display help for command
 
 Global Options:
@@ -3065,6 +3153,8 @@ Options:
                     Stop — flair#1257)
   --action-recall   Remove the Claude Code PreToolUse action-recall hook instead
                     (flair#2067)
+  --capture         Remove the Claude Code PostToolUseFailure + PostToolUse +
+                    Stop learning-capture hooks instead (flair#2068)
   -h, --help        display help for command
 
 Global Options:
@@ -3080,6 +3170,8 @@ Options:
   --harness <name>  Target harness (claude-code, codex) (default: "claude-code")
   --action-recall   Also report the Claude Code PreToolUse action-recall hook
                     (flair#2067)
+  --capture         Also report the Claude Code PostToolUseFailure + PostToolUse
+                    + Stop learning-capture hooks (flair#2068)
   -h, --help        display help for command
 
 Global Options:
@@ -3253,7 +3345,8 @@ Options:
   --admin-user <name>                                Admin username for Basic auth (env: FLAIR_ADMIN_USER; default: admin)
   --confirm-secrets-applied                          Confirm the staged secrets are already live on the target instance's environment (skips the interactive confirm)
   --fabric                                           Use the Fabric branch and default to Fabric secrets staging; refused for a localhost, *.localhost, 127/8, ::1, ::ffff:127/8, 0.0.0.0 or :: target host
-  --dry-run                                          Check target syntax, issuer hostname/IP literal, IdP credential presence and any CIMD list/local config. Write no file and make no remote call. Skip process/config matching and live checks; a custom remote target can pass dry run and be refused without --dry-run
+  --dry-run                                          Preview enable or refresh without writing files or making remote calls. Skip live checks; refresh refuses an occupied explicit --secrets-path
+  --refresh-flag                                     One-shot migration (flair#2283): attempt the encrypted FLAIR_MCP_OAUTH=true push, check the secret row's processEnv marker, restart and check discovery metadata; when the update could not be pushed or confirmed, attempt a 0600 fallback file and exit non-zero. An occupied explicit path is refused before probing, including in dry run; an occupied default path is refused when fallback is needed. Uses a separate default filename; --secrets-path can select mcp enable's path. Does not re-run IdP intake or apply identity mapping or CIMD changes. Use it to correct FLAIR_MCP_OAUTH=1, which does not enable the component's MCP AS
   --json                                             Print machine-readable JSON instead of a human summary
   -h, --help                                         display help for command
 
@@ -3649,16 +3742,19 @@ Detect missing checkpointed durable Memory IDs or changed or missing previously
 nonempty tokens
 
 Options:
-  -h, --help       display help for command
+  -h, --help               display help for command
 
 Global Options:
-  -v, --version    output the version number
+  -v, --version            output the version number
 
 Commands:
-  check [options]  Report missing checkpointed durable IDs or changed or missing
-                   previously nonempty tokens; rows created and lost entirely
-                   between scans are not observed
-  help [command]   display help for command
+  check [options]          Report missing checkpointed durable IDs or changed or
+                           missing previously nonempty tokens; rows created and
+                           lost entirely between scans are not observed
+  prune-history [options]  Prune MemoryDeletionHistory rows older than the
+                           oldest named checkpoint watermark minus a margin;
+                           dry-run unless --apply
+  help [command]           display help for command
 
 ----- flair integrity check -----
 Usage: flair integrity check [options]
@@ -3681,6 +3777,29 @@ Options:
 
 Global Options:
   -v, --version        output the version number
+
+----- flair integrity prune-history -----
+Usage: flair integrity prune-history [options]
+
+Prune MemoryDeletionHistory rows older than the oldest named checkpoint
+watermark minus a margin; dry-run unless --apply
+
+Options:
+  --checkpoint <path...>  Checkpoint file whose watermark bounds the prune;
+                          repeat for several (default:
+                          ~/.flair/integrity-checkpoint.json)
+  --apply                 Delete the eligible rows; without it nothing is
+                          deleted
+  --max <n>               Hard cap on rows pruned in one run (default: 500)
+  --json                  Print the plan as JSON
+  --ops-port <port>       Harper operations API port
+  --admin-pass <pass>     Admin password (or set FLAIR_ADMIN_PASS env)
+  --admin-user <name>     Admin username for Basic auth (env: FLAIR_ADMIN_USER;
+                          default: admin)
+  -h, --help              display help for command
+
+Global Options:
+  -v, --version           output the version number
 
 ----- flair federation -----
 Usage: flair federation [options] [command]

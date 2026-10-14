@@ -18,6 +18,7 @@
  * Each test spawns its own subprocess via Bun.spawn so HOME isolation is real
  * (same harness convention as harper-config-port.test.ts).
  */
+import { atomicSignalWriterSource } from "../helpers/atomic-signal-source.ts";
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -108,9 +109,10 @@ describe("flair#917 — uninstall refuses to kill a PID that is not this instanc
       script,
       [
         `import { createServer } from "node:http";`,
-        `import { writeFileSync } from "node:fs";`,
+        `import * as fs from "node:fs";`,
+        atomicSignalWriterSource,
         `const srv = createServer((_req, res) => { res.writeHead(200); res.end('foreign'); });`,
-        `srv.listen(0, "127.0.0.1", () => writeFileSync(process.argv[2], String(srv.address().port)));`,
+        `srv.listen(0, "127.0.0.1", () => publishSignal(process.argv[2], String(srv.address().port)));`,
       ].join("\n"),
     );
     const proc = Bun.spawn(["bun", script, portFile], { stdout: "ignore", stderr: "ignore" });
@@ -236,9 +238,10 @@ describe("flair#862 — probePort rejects non-200 responses; discoverPortFromPid
       script,
       [
         `import { createServer } from "node:http";`,
-        `import { writeFileSync } from "node:fs";`,
+        `import * as fs from "node:fs";`,
+        atomicSignalWriterSource,
         `const srv = createServer((_req, res) => { res.writeHead(404); res.end('not found'); });`,
-        `srv.listen(0, "127.0.0.1", () => writeFileSync(process.argv[2], String(srv.address().port)));`,
+        `srv.listen(0, "127.0.0.1", () => publishSignal(process.argv[2], String(srv.address().port)));`,
       ].join("\n"),
     );
     const proc = Bun.spawn(["bun", script, portFile], { stdout: "ignore", stderr: "ignore" });
@@ -339,9 +342,10 @@ describe("flair#915 — the default install attribution gap is closed", () => {
       script,
       [
         `import { createServer } from "node:http";`,
-        `import { writeFileSync } from "node:fs";`,
+        `import * as fs from "node:fs";`,
+        atomicSignalWriterSource,
         `const srv = createServer((_req, res) => { res.writeHead(200); res.end('foreign'); });`,
-        `srv.listen(0, "127.0.0.1", () => writeFileSync(process.argv[2], String(srv.address().port)));`,
+        `srv.listen(0, "127.0.0.1", () => publishSignal(process.argv[2], String(srv.address().port)));`,
       ].join("\n"),
     );
     const proc = Bun.spawn(["bun", script, portFile], { stdout: "ignore", stderr: "ignore" });
@@ -456,9 +460,10 @@ describe("flair#819 — uninstall reads Harper's config instead of defaulting to
       script,
       [
         `import { createServer } from "node:http";`,
-        `import { writeFileSync } from "node:fs";`,
+        `import * as fs from "node:fs";`,
+        atomicSignalWriterSource,
         `const srv = createServer((_req, res) => { res.writeHead(200); res.end('foreign'); });`,
-        `srv.listen(0, "127.0.0.1", () => writeFileSync(process.argv[2], String(srv.address().port)));`,
+        `srv.listen(0, "127.0.0.1", () => publishSignal(process.argv[2], String(srv.address().port)));`,
       ].join("\n"),
     );
     const proc = Bun.spawn(["bun", script, portFile], { stdout: "ignore", stderr: "ignore" });
@@ -480,36 +485,14 @@ describe("flair#819 — uninstall reads Harper's config instead of defaulting to
     };
   }
 
-  test("uninstall resolves the port from Harper's config, not from the DEFAULT_PORT fallback", async () => {
-    // Harper's config says port 20500. A foreign server sits on DEFAULT_PORT (19926).
-    // If uninstall resolved to 19926 it would find the foreign server and refuse to
-    // kill it (attribution guard), emitting a warning mentioning 19926 and NOT purging.
-    // With the fix (port = 20500 from Harper's config), nothing is on that port so
-    // uninstall proceeds silently — the foreign server on 19926 is untouched.
-    //
-    // Spawn a foreign server bound to EXACTLY port 19926 so the port mismatch is observable.
-    const portFile = join(tmpHome, "foreign819-port");
-    const script = join(tmpHome, "foreign819.mjs");
+  test("uninstall prefers Harper's config over a per-user port held by a foreign server", async () => {
     writeFileSync(
-      script,
-      [
-        `import { createServer } from "node:http";`,
-        `import { writeFileSync } from "node:fs";`,
-        `const srv = createServer((_req, res) => { res.writeHead(200); res.end('foreign'); });`,
-        `srv.listen(19926, "127.0.0.1", () => {`,
-        `  writeFileSync(process.argv[2], "ready");`,
-        `  srv.on('close', () => writeFileSync(process.argv[2], "stopped"));`,
-        `});`,
-      ].join("\n"),
+      join(shimBin, "lsof"),
+      `#!/bin/sh\nprintf '%s\\n' "$*" >> "$HOME/port-queries"\nexit 0\n`,
+      { mode: 0o755 },
     );
-    const proc = Bun.spawn(["bun", script, portFile], { stdout: "ignore", stderr: "ignore" });
-    spawned.push(proc);
-    // Wait for the server to be ready
-    for (let i = 0; i < 100; i++) {
-      const content = existsSync(portFile) ? readFileSync(portFile, "utf-8").trim() : "";
-      if (content === "ready") break;
-      await new Promise((r) => setTimeout(r, 50));
-    }
+    const foreign = await spawnForeignServer();
+    writeFileSync(join(tmpHome, ".flair", "config.yaml"), `port: ${foreign.port}\n`);
 
     writeFileSync(
       join(dataDir, "harper-config.yaml"),
@@ -518,21 +501,9 @@ describe("flair#819 — uninstall reads Harper's config instead of defaulting to
 
     const { stdout, stderr, exitCode } = await runCli(["uninstall", "--purge"]);
 
-    // Foreign server on 19926 survives — uninstall targeted 20500 (from Harper's config).
-    // If the old code resolved to 19926, the attribution guard would refuse to kill
-    // the foreign process and skip the purge.
-    const stillAlive = await new Promise<boolean>((resolve) => {
-      try {
-        fetch(`http://127.0.0.1:19926/`, { signal: AbortSignal.timeout(2000) })
-          .then(r => resolve(r.ok))
-          .catch(() => resolve(false));
-      } catch {
-        resolve(false);
-      }
-    });
-    expect(stillAlive).toBe(true);
-    // The foreign server on 19926 should NOT be mentioned — uninstall targeted 20500.
-    expect(stdout + stderr).not.toContain("19926");
+    expect(readFileSync(join(tmpHome, "port-queries"), "utf-8")).toBe("-ti :20500 -sTCP:LISTEN\n");
+    expect(await foreign.alive()).toBe(true);
+    expect(stdout + stderr).not.toContain(String(foreign.port));
     expect(exitCode).toBe(0);
   }, 30_000);
 

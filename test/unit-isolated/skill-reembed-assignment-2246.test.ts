@@ -277,6 +277,14 @@ test("an admin agent cannot reembed another agent's skill", async () => {
 function feed(ctx = operator): any {
   const resource: any = new FeedMemories();
   resource.getContext = () => ctx;
+  // A feed write refuses a body embedding stamp (flair#2354), and skill()
+  // carries one, so the feed body is sent without it.
+  const post = resource.post.bind(resource);
+  resource.post = (body: any) => {
+    if (!body || typeof body !== "object") return post(body);
+    const { embedding: _embedding, embeddingModel: _embeddingModel, ...rest } = body;
+    return post(rest);
+  };
   return resource;
 }
 
@@ -370,8 +378,11 @@ test.each(["put", "post", "feed"])("%s scans a tagless explicit skill successor"
 test.each(["put", "post", "feed"])("%s refuses a failed predecessor lookup", async (method) => {
   harnessState.getOverride = (id) => { if (id === "unreadable") throw new Error("lookup failed"); };
   const body = { ...skill("next"), supersedes: "unreadable" };
-  const call = method === "feed" ? feed().post(body) : writer("next")[method](body);
-  await expect(call).rejects.toThrow("lookup failed");
+  const result = await (method === "feed" ? feed().post(body) : writer("next")[method](body));
+  // flair#2307: the failed read refuses with a named error instead of throwing.
+  expect(result).toBeInstanceOf(Response);
+  expect(result.status).toBe(503);
+  expect((await result.json()).error).toBe("supersedes_target_unreadable");
   expect(harnessState.memoryStore.size).toBe(0);
   expect(versions.size).toBe(0);
 });
