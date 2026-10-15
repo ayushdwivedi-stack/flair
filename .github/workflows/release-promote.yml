@@ -15,20 +15,16 @@ name: Release promote
 # changed or deleted, so it is validated, never trusted), and the package-set
 # digest from the registry bytes.
 #
-# THE BOUNDARY IS OUTSIDE THIS FILE. GitHub runs the TAG's copy of this file and
-# of `canary.yml` (a dispatched workflow and a local reusable workflow both
-# resolve at the dispatch ref), so a tag carrying a changed copy could drop any
-# check written here, including the guard below. What stops that is two
-# repository settings, which the poll (the default branch's copy) verifies through
-# the API before it dispatches (docs/releasing.md, "The promote boundary"):
-#   - the tag rulesets `release-tags-create` (only its configured creation actors may create a
-#     `v*` tag) and `release-tags-immutable` (update, non-fast-forward and deletion
-#     rules on v* and adk-flair-v*; the promotion token cannot update or delete
-#     those tags), both active;
-#     other actors' exceptions are administered by repository admins and are
-#     not visible to this check;
-#   - the `release-promote` environment holding `NPM_TOKEN`, with a deployment
-#     policy of exactly the tag pattern `v*` (required reviewers optional).
+# THE BOUNDARY IS OUTSIDE THIS FILE. GitHub resolves this workflow and its local
+# reusable canary at the dispatch ref. Nathan audits the creation actors and other
+# actors' rule exceptions before adding NPM_TOKEN (docs/releasing.md, "The promote boundary").
+# The default-branch poll checks both pinned tag rulesets are active, target tags,
+# have no exclusions and carry the expected rule types and patterns: creation on
+# refs/tags/v*; update, non-fast-forward and deletion on refs/tags/v* and refs/tags/adk-flair-v*.
+# It requires current_user_can_bypass=never for its own token on the immutable ruleset.
+# Other actors' rule exceptions are not visible to the poll.
+# It also checks the release-promote environment has exactly the tag deployment
+# pattern v* (required reviewers optional); it does not check for NPM_TOKEN.
 #
 # DEFENCE IN DEPTH, not the boundary. For a tag whose copy of this file is the
 # reviewed one: the promote job first requires both workflow files, and every
@@ -200,7 +196,7 @@ jobs:
         run: |
           set -euo pipefail
           if ! SHA="$(node scripts/ci/registry-tarball-sha256.mjs "$VERSION" @tpsdev-ai/flair)"; then
-            echo "::error::release-promote: could not hash @tpsdev-ai/flair@${VERSION} from the registry; is it approved and public?"
+            echo "::error::release-promote: could not hash @tpsdev-ai/flair@${VERSION} from the public registry"
             exit 1
           fi
           if ! [[ "$SHA" =~ ^[0-9a-f]{64}$ ]]; then

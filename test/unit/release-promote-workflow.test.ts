@@ -5,11 +5,10 @@
  * promote, and for the `workflow_call` trigger it adds to `canary.yml`.
  *
  * What this file guards is DEFENCE IN DEPTH inside the workflow, not the
- * boundary. GitHub runs the TAG's copy of these workflows, so a changed copy
- * could drop any check here. The boundary is the `v*` tag rulesets plus the
- * `release-promote` environment, which the poll verifies before it dispatches
- * (release-promote-poll-workflow.test.ts). For a tag whose copy is the reviewed
- * one: no job runs a REPOSITORY script from the tag's checkout (after a failed
+ * boundary. GitHub resolves these workflows at the tag ref. The poll checks
+ * tag ruleset properties, its own token's immutable-rule status and the environment
+ * tag policy before dispatch (release-promote-poll-workflow.test.ts). For a tag
+ * whose copy is the reviewed one: no job runs a REPOSITORY script from the tag's checkout (after a failed
  * tree selection, none runs at all), every executed repository file equals
  * `origin/main`'s copy, and every fact the promote acts on is re-read, validated
  * and fails closed when it cannot be. (The canary does run the published

@@ -1,15 +1,15 @@
 # Releasing Flair
 
-Flair publishes nine workspace packages to npm under `@tpsdev-ai/*`. Releases are
-**tokenless** and **staged**: CI authenticates to npm with a short-lived OIDC token
-(no `NPM_TOKEN` lives anywhere) and submits each package to npm's **staging** area
+Flair publishes nine workspace packages to npm under `@tpsdev-ai/*`. On the normal
+staged-release path, CI authenticates to npm with a short-lived OIDC token and
+submits each package to npm's **staging** area
 **under the `staged` tag** (never straight to `latest`). A maintainer then approves
 the staged tarballs on npmjs.com with 2FA. Approval makes the version public, but
 **not `latest`** — a credential-less post-publish canary installs that exact version
 from the registry and boots it on Linux and macOS. Only a canary PASS prints the
-sha256-bound promote commands that move `latest` — one per lockstep package, all
-or none; the canary runs on the same definition of "it boots" the rockit ritual
-uses (`scripts/ci/check-instance-boot.sh`).
+sha256-bound promote commands that move `latest` — one per lockstep package,
+sequentially, stopping on failure; the canary runs on the same definition of
+"it boots" the rockit ritual uses (`scripts/ci/check-instance-boot.sh`).
 
 The staging tag is an **immutable property of the staged package** (`npm help stage`):
 re-staging the same version under a different tag requires `npm stage reject` first.
@@ -227,9 +227,9 @@ Once [the promote boundary](#the-promote-boundary-flair1928) is in place (the ta
 rulesets and the `release-promote` environment with its `NPM_TOKEN`), this phase runs
 for you. The unprivileged
 [`release-promote-poll`](../.github/workflows/release-promote-poll.yml) poll requires
-a valid `release-attempt` marker, every staged package approved and public, a registry
-set matching the marker's digest, no visible run for the version, and a verified
-boundary before dispatching the privileged
+a valid `release-attempt` marker, public tarballs for every lockstep package matching
+the certified package-set digest, no visible run for the version, and passing
+[settings checks](#the-promote-boundary-flair1928) before dispatching the privileged
 [`release-promote`](../.github/workflows/release-promote.yml) workflow on the version's
 tag ref, and that workflow calls the
 [`post-publish canary`](../.github/workflows/canary.yml) — the same one below; its
@@ -248,7 +248,7 @@ To run the canary alone by hand (it moves nothing), dispatch it with three input
 
 | Input | Value |
 | ----- | ----- |
-| `version` | the version just approved, exact (e.g. `vX.Y.Z` without the `v`) |
+| `version` | the public version, exact (e.g. `vX.Y.Z` without the `v`) |
 | `expected_sha256` | the published tarball's sha256 (64 hex). The canary computes it from the registry with `node scripts/ci/registry-tarball-sha256.mjs <ver>`. |
 | `package_set_digest` | the certified package-set digest (64 lowercase hex), printed as `package-set-digest=<digest>` in the log of the release run's "Pack publishable packages and write the release manifest" step. It can also be recomputed from that step's lines (`<name>@<version>  <sha256>  <basename>`) by feeding `<name>=<sha256>` lines to `node scripts/ci/package-set-digest.mjs --version <ver>`. The canary re-derives the digest from the tarballs it verified and refuses a mismatch before any verdict. |
 
@@ -396,13 +396,11 @@ Selected branches and tags → add tag rule `v*`).
 
 ### The promote boundary (flair#1928)
 
-GitHub runs a dispatched workflow, and the reusable canary it calls, from the **tag's**
-copy. A tag carrying a changed `release-promote.yml` could therefore drop any check
-written in it, so no in-workflow check is the boundary. The boundary is these two
-repository settings. The poll, which always runs the default branch's copy, reads both
-through the API on every run. If either is missing or different, the poll records the
-reason as a warning and dispatches nothing; it fails, with the reason, when a ready
-version reaches the dispatch (a poll with nothing ready still succeeds).
+GitHub resolves a dispatched workflow and its local reusable canary at the tag ref.
+The boundary is these two repository settings. The default-branch poll checks the
+properties listed below through the API. A failed settings check records a warning
+and prevents dispatch; the poll fails when a ready version reaches the dispatch
+(a poll with nothing ready still succeeds).
 
 **1. The `v*` tag rulesets** (Settings → Rules → Rulesets). Both must stay **Active**:
 
@@ -411,16 +409,13 @@ version reaches the dispatch (a poll with nothing ready still succeeds).
   repository admins, plus the release-tag App only if the auto-tagger is to create tags.
 - **`release-tags-immutable`** (id `23944797`): target tags, include `refs/tags/v*`
   and `refs/tags/adk-flair-v*`, no exclusions, rules **Restrict updates**,
-  **Restrict deletions** and **Block force pushes**. The poll requires that its
-  promotion token cannot update or delete those tags.
+  **Restrict deletions** and **Block force pushes**.
 
-The poll checks each pinned id for enforcement, target, patterns and rule types,
-and requires `current_user_can_bypass` to be `never` on the immutable ruleset.
-Other actors' exceptions are administered by repository admins and are not visible
-to this check. Its token cannot read configured creation actors, so keeping that
-creation actor list is part of this setting. A
-ruleset recreated under a new id fails closed until the pins in
-`release-promote-poll.yml` are updated.
+The poll checks both pinned tag rulesets are active, target tags, have no exclusions
+and carry the expected rule types and patterns, and requires
+`current_user_can_bypass=never` for its own token on the immutable ruleset.
+Other actors' rule exceptions are not visible to the poll.
+A ruleset recreated under a new id requires updated pins in `release-promote-poll.yml`.
 
 **2. The GitHub `release-promote` environment** (Settings → Environments), created once
 by a repository admin before the first automated promote:
@@ -428,15 +423,16 @@ by a repository admin before the first automated promote:
 - Environment name: **`release-promote`**.
 - **Deployment branches and tags:** Selected branches and tags, with exactly one rule:
   the **tag** pattern **`v*`**. The secret is available only to runs on a `v*` tag.
-- **Required reviewers:** not required. With none configured, the release has one
-  human action, the npm 2FA approval. An operator may add reviewers; the poll accepts
-  that, and each promote then waits for that approval after its canary.
+- **Required reviewers:** optional. On the normal staged-release path, npm 2FA
+  approval is the human action when no environment reviewers are configured.
+  The poll checks no npm approval record. If reviewers are added, each promote
+  waits for their approval after its canary.
 - Secret: **`NPM_TOKEN`**, a granular npm access token with **read and write on the
   lockstep packages** (`node scripts/ci/lockstep-packages.mjs` prints the list), automation access, expiry ≤ 90 days with a rotation reminder. It needs exactly the scope to
   move a dist-tag on those packages.
 
-Before creating the environment, audit the existing `v*` tags: none may carry a
-`release-promote.yml` that was not reviewed on main.
+Before adding `NPM_TOKEN`, audit the creation actors, other actors' rule exceptions,
+and existing `v*` tags: each tag must carry a `release-promote.yml` reviewed on main.
 
 The checks inside `release-promote.yml` and `canary.yml` are **defence in depth**, not
 the boundary. They compare the executed files with `origin/main`, run repository scripts
@@ -487,9 +483,8 @@ The maintainer who approves staged packages must have 2FA enabled on their npm a
 
 ## Automated promote (flair#1928)
 
-After the npm approval, a maintainer today pastes the promote block from a
-checkout. Slice 1 landed the four pieces the privileged promote job (slice 2) stands
-on; it holds no npm credential (the poll runs on the automatic
+On the normal staged-release path, npm approval precedes promotion. Slice 1 landed
+the four pieces the privileged promote job (slice 2) stands on; it holds no npm credential (the poll runs on the automatic
 `GITHUB_TOKEN` with `actions: write`, `contents: read` and `deployments: read`).
 
 - **The certified digest travels with the release attempt.** The `release-attempt`
@@ -516,7 +511,7 @@ on; it holds no npm credential (the poll runs on the automatic
   refused). It requires EVERY lockstep package `<name>@<version>` to be public and
   to re-derive the certified package-set digest (ALL-form: one missing/odd package
   is NOT READY, exit 0, the package named). Dispatch also requires the workflow
-  to exist, no visible run for the version, and the verified promote boundary.
+  to exist, no visible run for the version, and passing settings checks.
   Every run is a schedule run of the default branch's copy of the file, so
   `github.sha` is always a main sha. **The poll's outputs are
   never an input to what gets promoted** — the privileged job re-derives everything
@@ -533,8 +528,9 @@ on; it holds no npm credential (the poll runs on the automatic
 
 `release-promote.yml` (`workflow_dispatch` on the tag ref, `environment:
 release-promote`) is the only job that can see `NPM_TOKEN`. It takes nothing from the
-poll but "run now on this ref". The boundary is [the promote boundary](#the-promote-boundary-flair1928),
-which the poll verifies before dispatching; the controls below are defence in depth
+poll but "run now on this ref". The poll requires the
+[settings checks](#the-promote-boundary-flair1928) to pass before dispatching;
+the controls below are defence in depth
 inside the workflow, each a test in `test/unit/release-promote-workflow.test.ts`:
 
 - **No repository script from the tag's checkout** (defence in depth). GitHub runs the tag's copy of

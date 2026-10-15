@@ -23,27 +23,20 @@ name: Release promote poll
 # branch (slice 2 lands it); without the file the poll logs "would dispatch" and
 # exits 0.
 #
-# THE PROMOTE BOUNDARY (flair#1928). GitHub runs a dispatched workflow from the
-# TAG's copy, so a tag carrying a changed `release-promote.yml` could drop any
-# check written there. The boundary is two repository settings outside that
-# file, and this poll (the default branch's copy, never a tag's) verifies both
-# through the API before it dispatches anything:
-#   - the tag rulesets: `release-tags-create` (creating `refs/tags/v*` is
-#     restricted to its configured creation actors) and `release-tags-immutable`
-#     (update, non-fast-forward and deletion rules on v* and adk-flair-v*;
-#     the promotion token cannot update or delete those tags), both active;
-#     other actors' exceptions are administered by repository admins and are
-#     not visible to this check;
-#   - the `release-promote` environment that holds the npm token, with a
-#     deployment policy of exactly the tag pattern `v*`, so the token is only
-#     available to runs on a tag that only the creation ruleset's configured
-#     creation actors could create (repository admins, plus the release-tag App
-#     if it is configured as one). Required reviewers are not required: with
-#     none configured, the npm approval is the one human action (Nathan's
-#     rule); if an operator adds them, that is accepted.
-# Either missing, every poll records the reason as a warning and dispatches
-# nothing; the poll FAILS, with the reason, when a ready version reaches the
-# dispatch. A poll with nothing ready still succeeds.
+# PROMOTE SETTINGS (flair#1928). Before dispatch, this default-branch poll checks:
+#   - both pinned tag rulesets are active, target tags, have no exclusions and
+#     carry the expected rule types and patterns: creation on refs/tags/v*;
+#     update, non-fast-forward and deletion on refs/tags/v* and refs/tags/adk-flair-v*;
+#   - the poll's own token reports current_user_can_bypass=never on the immutable ruleset;
+#   - the release-promote environment has exactly the tag deployment pattern v*.
+# Other actors' rule exceptions are not visible to the poll.
+# Before adding NPM_TOKEN, Nathan audits the creation actors and other actors' rule
+# exceptions (docs/releasing.md, "The promote boundary"). Required reviewers are optional.
+# On the normal staged-release path, npm approval is the human action when no
+# environment reviewers are configured; the poll checks public tarballs matching
+# the certified package-set digest, not an approval record.
+# A failed settings check records a warning and prevents dispatch; the poll fails
+# when a ready version reaches that check. A poll with nothing ready still succeeds.
 
 on:
   # SCHEDULE ONLY. A schedule run always executes the DEFAULT BRANCH's copy of this file.
@@ -72,7 +65,7 @@ jobs:
       contents: read
       deployments: read
     env:
-      # The boundary the dispatch depends on (docs/releasing.md, "The promote
+      # The settings the dispatch checks (docs/releasing.md, "The promote
       # boundary"). A ruleset recreated under a new id fails closed until these
       # pins are updated.
       PROMOTE_ENV: release-promote
@@ -94,7 +87,7 @@ jobs:
             packages/*/package.json
           sparse-checkout-cone-mode: false
 
-      - name: Verify the promote boundary (environment + tag rulesets)
+      - name: Verify the promote boundary settings (environment + tag rulesets)
         # Records WHETHER a dispatch is allowed and, if not, why; it never fails
         # the poll by itself (nothing may be pending). The dispatch below refuses,
         # as an error exit that dispatches nothing, unless `ok` is `true`. Every
@@ -139,7 +132,7 @@ jobs:
                 echo "tag ruleset $1 ($2) does not cover refs/tags/adk-flair-v*" >> "${REASONS}"
               fi
               if ! jq -e '.current_user_can_bypass == "never"' "${rs}" >/dev/null; then
-                echo "tag ruleset $1 ($2) must report current_user_can_bypass=never for the promotion token" >> "${REASONS}"
+                echo "tag ruleset $1 ($2) must report current_user_can_bypass=never for the poll token" >> "${REASONS}"
               fi
             fi
           }
@@ -152,7 +145,7 @@ jobs:
             echo "::warning::promote boundary not in place (a ready version will be refused at dispatch): ${REASON}"
           else
             echo "ok=true" >> "$GITHUB_OUTPUT"
-            echo "  promote boundary in place: environment ${PROMOTE_ENV} (v* tags only); tag rulesets ${TAG_CREATE_RULESET} + ${TAG_IMMUTABLE_RULESET} active"
+            echo "  tag rulesets match the expected settings; environment ${PROMOTE_ENV} has the v*-only tag policy"
           fi
 
       - name: Poll and dispatch
@@ -280,9 +273,7 @@ jobs:
                 echo "  v${version}: a release-promote run for this version is visible in the run list — not dispatching again"
                 continue
               fi
-              # THE BOUNDARY (the step above): no dispatch unless the environment
-              # and the tag rulesets are verified in place. An error exit, so the
-              # refusal is visible, and nothing is dispatched in this poll.
+              # Require the settings check above to pass before dispatch.
               if [ "${BOUNDARY_OK:-}" != "true" ]; then
                 echo "release-promote-poll: ERROR — refusing to dispatch release-promote for v${version}: the promote boundary is not in place: ${BOUNDARY_REASON:-not verified}. Nothing was dispatched (docs/releasing.md, 'The promote boundary')." >&2
                 exit 1

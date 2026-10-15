@@ -5,13 +5,13 @@ name: Post-publish canary — install + boot a published version
 # for ~1.5 h until a human moved the tag by hand. Nothing between publish and
 # announce installed the published artifact the way a user does and booted it.
 #
-# This is that last line. `release-promote.yml` calls it after the npm approval
-# (flair#1928: the poll notices the approval, since npm exposes no webhook). This
-# definition then resolves at the caller's tag; its workspace selects the pinned
-# main commit before any repository script runs (defence in depth: the boundary
+# On the normal staged-release path, npm approval makes the packages public.
+# The poll checks public tarballs matching the certified package-set digest.
+# `release-promote.yml` calls this definition at the caller's tag; its workspace
+# selects the pinned main commit before any repository script runs (defence in depth: the boundary
 # is the tag rulesets plus the release-promote environment, see
 # docs/releasing.md). A maintainer can still dispatch it by hand. `release-publish.yml` stages with
-# `--tag staged`, so between approval and promote the version is public but NOT
+# `--tag staged`, so on the normal staged-release path the approved version is public but NOT
 # `latest` — the window this canary uses.
 #
 # It runs on a clean ubuntu-latest AND macos-latest, credential-less: no npm
@@ -24,7 +24,7 @@ name: Post-publish canary — install + boot a published version
 #     must install the bytes it was dispatched for.
 #   - The published tarball's sha256 must equal the `expected_sha256` recorded
 #     for the staged tarball. A mismatch is a stop (npm versions are immutable, so
-#     a matching sha is what makes the later promote race-free). npm exposes no
+#     the comparison binds the measured tarball to that input). npm provides no
 #     sha256 directly — `dist.shasum` is SHA-1 — so
 #     `scripts/ci/registry-tarball-sha256.mjs` downloads the tarball and hashes it.
 #     flair#1781: EVERY lockstep package is hashed (each promote line binds its
@@ -58,8 +58,8 @@ name: Post-publish canary — install + boot a published version
 #   Failed tree selection or a malformed `package_set_digest` prints no deprecate lines.
 #   Deprecate lines do not establish that package measurement completed.
 #   On the default automated path `release-promote.yml` runs the block
-#   itself after a PASS. On the manual fallback a human approves on npmjs, then
-#   pastes the block. Its digest preflight refuses a changed package set before
+#   itself after a PASS. On the normal staged-release manual path, a human approves
+#   on npmjs, then pastes the block. Its digest preflight refuses a changed package set before
 #   `latest` can move. FAIL prints no promote block. A SemVer prerelease PASS
 #   prints a note and no promote block.
 
@@ -67,7 +67,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Published version to canary, exact (e.g. 0.54.2). Must be 2FA-approved and public."
+        description: "Public version to canary, exact (e.g. 0.54.2)."
         required: true
         type: string
       expected_sha256:
@@ -79,13 +79,13 @@ on:
         required: true
         type: string
   # flair#1928 slice 2: the privileged `release-promote.yml` calls THIS workflow
-  # (`workflow_call`) after the npm approval, so there is ONE canary definition,
+  # (`workflow_call`), so there is ONE canary definition,
   # not a second copy embedded in the promote job. It takes the manual dispatch's
   # three inputs plus `trusted_sha`; the canary is credential-less either way.
   workflow_call:
     inputs:
       version:
-        description: "Published version to canary, exact (e.g. 0.54.2). Must be 2FA-approved and public."
+        description: "Public version to canary, exact (e.g. 0.54.2)."
         required: true
         type: string
       expected_sha256:
@@ -215,7 +215,7 @@ jobs:
           while read -r pkg; do
             [ -n "$pkg" ] || continue
             if ! sha="$(node scripts/ci/registry-tarball-sha256.mjs "$VERSION" "$pkg" 2>> canary-logs/sha256.err)"; then
-              echo "::error::could not hash ${pkg}@${VERSION} — is it approved and public? (unmeasurable is FAIL)"
+              echo "::error::could not hash ${pkg}@${VERSION} — public tarball is not measurable (unmeasurable is FAIL)"
               missing=1
               continue
             fi
@@ -228,7 +228,7 @@ jobs:
                  # change the re-derived digest, and the line-count check below counts
                  # lines, not values. `expected_count` is 0 only if the derivation failed.
             if ! [[ "$sha" =~ ^[0-9a-f]{64}$ ]]; then
-              echo "::error::could not hash ${pkg}@${VERSION} — is it approved and public? (unmeasurable is FAIL)"
+              echo "::error::could not hash ${pkg}@${VERSION} — public tarball is not measurable (unmeasurable is FAIL)"
               missing=1
               continue
             fi

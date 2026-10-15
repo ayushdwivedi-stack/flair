@@ -235,11 +235,10 @@ describe("release-promote-poll — visible-run check (#1928 slice 2)", () => {
   });
 });
 
-// ── The promote boundary, verified before any dispatch (flair#1928) ──────────
+// ── Promote settings checked before dispatch (flair#1928) ──────────
 //
-// GitHub runs a dispatched workflow from the TAG's copy, so the boundary is two
-// repository settings, verified by this poll (the default branch's copy) through
-// the API. The API is an external service: a fake `gh` serves JSON in the live
+// The default-branch poll checks tag ruleset properties, its own token's immutable-rule
+// status and the environment tag policy through the API. A fake `gh` serves JSON
 // shapes (rulesets 24044017 / 23944797 as read on 2026-10-13; the environment
 // as the REST API documents it).
 
@@ -344,7 +343,7 @@ function runBoundary(fixtures: Record<string, unknown>) {
   }
 }
 
-describe("release-promote-poll — the promote boundary is verified before any dispatch", () => {
+describe("release-promote-poll — checked settings are required before dispatch", () => {
   test("the pins name the environment the promote job uses and the two pinned v* tag rulesets", () => {
     expect(POLL_ENV.PROMOTE_ENV).toBe("release-promote");
     expect(POLL_ENV.TAG_CREATE_RULESET).toBe("24044017");
@@ -376,7 +375,7 @@ describe("release-promote-poll — the promote boundary is verified before any d
     expect(r.reason).toContain("environment 'release-promote' is missing or unreadable");
   });
 
-  test("reviewers absent → ok (one human action: the npm approval; reviewers are optional)", () => {
+  test("reviewers absent → ok (reviewers are optional)", () => {
     const noRule = { ...goodEnv(), protection_rules: [{ type: "branch_policy" }] };
     const empty = { ...goodEnv(), protection_rules: [{ type: "required_reviewers", reviewers: [] }, { type: "branch_policy" }] };
     const none = { ...goodEnv(), protection_rules: [] };
@@ -411,7 +410,7 @@ describe("release-promote-poll — the promote boundary is verified before any d
       const r = runBoundary(boundaryFixtures({ [IMMUT_PATH]: immutable }));
       expect(r.status, r.log).toBe(0);
       expect(r.ok).toBe("false");
-      expect(r.reason).toContain("must report current_user_can_bypass=never for the promotion token");
+      expect(r.reason).toContain("must report current_user_can_bypass=never for the poll token");
     },
   );
 
@@ -526,13 +525,13 @@ describe("release-promote-poll — each version is dispatched at most once per p
     ]);
   });
 
-  test("a boundary NOT in place: an error exit naming the reason, and nothing dispatched", () => {
+  test("a failed settings check: an error exit naming the reason, and nothing dispatched", () => {
     const reason = "environment 'release-promote' is missing or unreadable";
     const r = runPoll([marker("1.2.3"), marker("1.2.4")], { ok: "false", reason });
     expect(r.status).toBe(1);
     expect(r.log).toContain(`refusing to dispatch release-promote for v1.2.3: the promote boundary is not in place: ${reason}`);
     expect(r.dispatches).toEqual([]);
-    // An unverified boundary (no output at all) refuses the same way.
+    // A missing settings result also prevents dispatch.
     const unknown = runPoll([marker("1.2.3")], { ok: "" });
     expect(unknown.status).toBe(1);
     expect(unknown.dispatches).toEqual([]);
