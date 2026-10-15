@@ -9,7 +9,7 @@ the staged tarballs on npmjs.com with 2FA. Approval makes the version public, bu
 from the registry and boots it on Linux and macOS. Only a canary PASS prints the
 sha256-bound promote commands that move `latest` — one per lockstep package,
 sequentially, stopping on failure; the canary runs on the same definition of
-"it boots" check the maintainers run (`scripts/ci/check-instance-boot.sh`).
+"it boots" that the maintainers' boot check uses (`scripts/ci/check-instance-boot.sh`).
 
 The staging tag is an **immutable property of the staged package** (`npm help stage`):
 re-staging the same version under a different tag requires `npm stage reject` first.
