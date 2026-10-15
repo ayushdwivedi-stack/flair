@@ -59,9 +59,11 @@ name: Post-publish canary — install + boot a published version
 #   because the tree selection did not succeed prints none (nothing was
 #   measured). On the default automated path `release-promote.yml` runs the block
 #   itself after a PASS. On the manual fallback a human approves on npmjs, then
-#   pastes the block — a stale PASS, a re-cut version, a different package set, or
-#   a paste-from-FAIL aborts at the digest preflight before `latest` can move. A SemVer prerelease is never promoted, so a
-#   prerelease PASS prints a note and NO promote block.
+#   pastes the block; its digest preflight refuses a CHANGED package set (a
+#   re-cut version, a different set) before `latest` can move. An old PASS with
+#   unchanged bytes passes that preflight, and a FAIL prints no promote block. A
+#   SemVer prerelease is never promoted, so a prerelease PASS prints a note and
+#   NO promote block.
 
 on:
   workflow_dispatch:

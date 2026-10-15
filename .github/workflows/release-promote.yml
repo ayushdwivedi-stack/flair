@@ -133,10 +133,11 @@ jobs:
           echo "  resolved version ${BASH_REMATCH[1]} from $REF_NAME"
 
       - name: Verify the tag is on origin/main, pin origin/main and move the workspace to it
-        # A tag can point at any commit; require it to be merged to main, so a
-        # promote never documents an un-reviewed tree. Then pin origin/main (the
-        # canary runs this same commit) and move the workspace to it, so the one
-        # script this job runs, the flair tarball hasher, comes from trusted main.
+        # A tag can point at any commit; require it to be on main, so a promote
+        # documents a commit on main, subject to main's review rules. Then pin
+        # origin/main (the canary runs this same commit) and move the workspace to
+        # it, so the one script this job runs, the flair tarball hasher, comes from
+        # trusted main.
         id: trusted
         run: |
           set -euo pipefail
@@ -295,8 +296,8 @@ jobs:
       - name: Materialise the trusted tree from origin/main at the pinned sha
         # Every repository script the token-holding step runs, and the emitted
         # block, comes from HERE, never from the tag's checkout (node and the
-        # pinned npm are the job's toolchain, not repository code). `git archive` of the pinned sha keeps the tree immutable
-        # for the rest of the job.
+        # pinned npm are the job's toolchain, not repository code). `git archive`
+        # materialises a snapshot of the pinned commit.
         env:
           MAIN_SHA: ${{ steps.guard.outputs.main_sha }}
         run: |
@@ -498,4 +499,4 @@ jobs:
           # (flair LAST), and its convergence check all run from the trusted tree.
           set +x
           bash "$BLOCK"
-          echo "  latest now points at ${VERSION} for every lockstep package"
+          echo "  the convergence check observed latest at ${VERSION} for every lockstep package"

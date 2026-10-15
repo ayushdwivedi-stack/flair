@@ -225,9 +225,11 @@ cannot be re-staged under a different tag.
 
 Once [the promote boundary](#the-promote-boundary-flair1928) is in place (the tag
 rulesets and the `release-promote` environment with its `NPM_TOKEN`), this phase runs
-for you. When every staged package is approved and public, the unprivileged
-[`release-promote-poll`](../.github/workflows/release-promote-poll.yml) poll verifies the
-boundary and dispatches the privileged
+for you. The unprivileged
+[`release-promote-poll`](../.github/workflows/release-promote-poll.yml) poll dispatches
+when the version's `release-attempt` marker is valid, every staged package is approved
+and public, the registry set re-derives to the marker's digest, no run for the version
+is visible in the run list, and the boundary is verified. It dispatches the privileged
 [`release-promote`](../.github/workflows/release-promote.yml) workflow on the version's
 tag ref, and that workflow calls the
 [`post-publish canary`](../.github/workflows/canary.yml) — the same one below; its
@@ -275,9 +277,10 @@ not run must not read as a pass.
 
 ### Phase 5 — promote `latest` (or deprecate)
 
-The promote is **lockstep**: every package the release staged moves to the same
-version. npm has no atomic multi-package move, so the block moves them one at a time
-(`@tpsdev-ai/flair` last) and stops at the first failure with RESTORE lines. `flair` at `latest` 0.55.1 while `flair-client` / `flair-mcp` / the
+The promote is **lockstep**: a successful promote moves every package the release
+staged to the same version. npm has no atomic multi-package move, so the block moves
+them one at a time (`@tpsdev-ai/flair` last) and stops at the first failure with
+RESTORE lines. `flair` at `latest` 0.55.1 while `flair-client` / `flair-mcp` / the
 plugins sit at 0.54.2 is exactly the mismatch `flair#1383` detects at runtime —
 and 0.55.1's promote had to be assembled by hand, line by line, for this reason.
 
@@ -322,8 +325,9 @@ below stays as the fallback; a failed run's recovery is
   node scripts/ci/registry-latest-skew.mjs <ver>
   ```
 
-  The preflight `test` guards integrity: a stale PASS, a re-cut version, or a
-  paste from a failed run aborts before `latest` moves. Before the first move the
+  The preflight guards integrity: it refuses a CHANGED package set (a re-cut
+  version, a different set) before `latest` moves. An old PASS with unchanged bytes
+  passes it, and a FAIL prints no promote block. Before the first move the
   block also reads every package's current `latest` and refuses if any is already
   NEWER than `<ver>` at that pre-move read: a superseded version is refused. Paste
   **all** of the block or **none** — a partial paste is the skew this phase exists to
@@ -450,8 +454,8 @@ by a repository admin before the first automated promote:
 - **Deployment branches and tags:** Selected branches and tags, with exactly one rule:
   the **tag** pattern **`v*`**. The secret is then exposed only to runs on a `v*` tag,
   which only the ruleset's bypass actors can create and nobody can move.
-- **Required reviewers:** not required. The release has one human action, the npm 2FA
-  approval. An operator may add reviewers; the poll accepts that, and each promote then
+- **Required reviewers:** not required. With none configured, the release has one
+  human action, the npm 2FA approval. An operator may add reviewers; the poll accepts that, and each promote then
   waits for that approval after its canary.
 - Secret: **`NPM_TOKEN`**, a granular npm access token with **read and write on the
   lockstep packages** (`node scripts/ci/lockstep-packages.mjs` prints the list), 2FA-bypass

@@ -3,7 +3,8 @@
   package is public and hashes to the certified digest. It first verifies the promote
   boundary through the API: the `v*` tag rulesets are active, and the `release-promote`
   environment exists with a `v*`-only tag policy. The run executes the post-publish
-  canary, then the promote block, so the npm approval stays the one human action.
+  canary, then the promote block; with no environment reviewers configured, the npm
+  approval stays the one human action.
   The poll does not redispatch a version whose run is visible in the run list, and
   dispatches each version at most once per poll; re-running a failed run is an
   operator step. If the boundary is missing, the poll dispatches nothing and fails

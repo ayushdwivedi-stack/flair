@@ -39,9 +39,9 @@ name: Release promote poll
 #     deployment policy of exactly the tag pattern `v*`, so the token is only
 #     exposed to runs on a tag that only the creation ruleset's configured
 #     bypass actors could create (repository admins, plus the release-tag App
-#     if it is configured as one). Required
-#     reviewers are not required (Nathan's rule: one human action, the npm
-#     approval); if an operator adds them, that is accepted.
+#     if it is configured as one). Required reviewers are not required: with
+#     none configured, the npm approval is the one human action (Nathan's
+#     rule); if an operator adds them, that is accepted.
 # Either missing, every poll records the reason as a warning and dispatches
 # nothing; the poll FAILS, with the reason, when a ready version reaches the
 # dispatch. A poll with nothing ready still succeeds.

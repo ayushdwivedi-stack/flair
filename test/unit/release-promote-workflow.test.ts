@@ -955,7 +955,7 @@ describe("release-promote — the token step with the real npm CLI against a loc
     try {
       const r = await runTokenStep(reg, TOKEN);
       expect(r.status, r.log).toBe(0);
-      expect(r.stdout).toContain(`latest now points at ${VER}`);
+      expect(r.stdout).toContain(`the convergence check observed latest at ${VER}`);
       // The file holds the LITERAL `${NPM_TOKEN}`; npm expanded it from the env.
       expect(r.npmrc).toBe(`${reg.base.replace(/^http:/, "")}/:_authToken=\${NPM_TOKEN}\n`);
       const moves = puts(reg.requests);
