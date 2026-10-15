@@ -55,9 +55,9 @@ name: Post-publish canary — install + boot a published version
 #   PASS prints the complete, package-set-digest-bound promote block — one
 #   `npm dist-tag add` per lockstep package (sequential, stopping at the first
 #   failure with RESTORE lines; npm has no atomic move; `@tpsdev-ai/flair` LAST).
-#   A FAIL from the checks prints one `npm deprecate` line per package; a FAIL
-#   because the tree selection did not succeed prints none (nothing was
-#   measured). On the default automated path `release-promote.yml` runs the block
+#   Failed tree selection or a malformed `package_set_digest` prints no deprecate lines.
+#   Deprecate lines do not establish that package measurement completed.
+#   On the default automated path `release-promote.yml` runs the block
 #   itself after a PASS. On the manual fallback a human approves on npmjs, then
 #   pastes the block. Its digest preflight refuses a changed package set before
 #   `latest` can move. FAIL prints no promote block. A SemVer prerelease PASS
@@ -437,12 +437,6 @@ jobs:
           exit 0
 
       - name: Canary verdict — emit the promote or deprecate command
-        # Runs whether or not the checks passed; the job itself still fails on a
-        # red step (no continue-on-error anywhere). This step exists so the
-        # PASS/FAIL line — with the sha256-bound promote command, or the
-        # deprecate command — is the last thing both the log and the run summary
-        # show. It runs the trusted tree's canary-verdict.sh, so only after a
-        # SUCCESSFUL tree selection; a FAIL of any later check still reaches it.
         if: always() && steps.select.outcome == 'success'
         env:
           VERSION: ${{ inputs.version }}
@@ -483,9 +477,7 @@ jobs:
 
       - name: Canary verdict — FAIL, the tree selection did not succeed (no repository script)
         # The workspace may still be the caller's tag checkout, so this verdict is
-        # INLINE: it runs no repository script. Nothing was installed, booted or
-        # measured, so it prints no deprecate lines: those are for published
-        # bytes the canary measured as broken.
+        # INLINE: it runs no repository script and prints no deprecate lines.
         if: always() && steps.select.outcome != 'success'
         env:
           VERSION: ${{ inputs.version }}

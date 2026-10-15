@@ -486,8 +486,7 @@ jobs:
             exit 1
           fi
           NPMRC="$RUNNER_TEMP/npmrc"
-          # Single quotes on purpose: the file holds the literal `${NPM_TOKEN}`,
-          # which npm expands from the environment; the token never touches disk.
+          # The `.npmrc` contains the literal `${NPM_TOKEN}` reference.
           # shellcheck disable=SC2016
           printf '//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n' > "$NPMRC"
           export NPM_CONFIG_USERCONFIG="$NPMRC"

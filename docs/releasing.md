@@ -238,10 +238,10 @@ pinned commit — before it promotes anything. The poll does not redispatch a ve
 whose run is visible in the run list, and dispatches each version at most once per
 poll, so a version whose failed run (a red canary, a refusal) is visible in the run
 list is not dispatched again. Re-running it is an operator step: dispatch the promote
-by hand on the TAG ref, which re-runs its canary too:
+by hand on the TAG ref, which re-runs its canary too (replace `v1.2.3` with the release tag):
 
 ```bash
-gh workflow run release-promote.yml --ref v<ver> -f dry_run=false
+gh workflow run release-promote.yml --ref v1.2.3 -f dry_run=false
 ```
 
 To run the canary alone by hand (it moves nothing), dispatch it with three inputs:
