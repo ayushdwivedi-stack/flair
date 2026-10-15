@@ -822,6 +822,23 @@ describe("release-promote — the emit step refuses when the machine surface yie
   });
 });
 
+test("the token step reports an observation only after the block succeeds", () => {
+  const dir = scratch();
+  const block = join(dir, "block.sh");
+  const steps = job("promote").steps ?? [];
+  const script = steps[steps.length - 1]?.run ?? "";
+  const env = { NPM_TOKEN: "fixture-token", VERSION: VER, BLOCK: block, TRUSTED: dir };
+  writeFileSync(block, "exit 0\n");
+  const success = runStep(script, dir, env);
+  expect(success.status, success.log).toBe(0);
+  expect(success.log).toContain(`the convergence check observed latest at ${VER} for every lockstep package`);
+  expect(success.log).not.toContain("latest now points at");
+  writeFileSync(block, "exit 1\n");
+  const failure = runStep(script, dir, env);
+  expect(failure.status).toBe(1);
+  expect(failure.log).not.toContain("the convergence check observed");
+});
+
 interface RegistryRequest {
   method: string;
   path: string;

@@ -96,7 +96,7 @@ describe("release-promote-poll — no credential, trusted-main only", () => {
     expect(script).toContain("NOT READY");
   });
 
-  test("on READY it dispatches release-promote.yml on the tag REF, and the dispatch is gated on the file existing", () => {
+  test("the READY path checks for the workflow before dispatching on the tag ref", () => {
     const script = job("poll").steps?.map((s) => s.run ?? "").join("\n") ?? "";
     expect(script).toContain("gh workflow run release-promote.yml");
     expect(script).toContain("--ref");
@@ -168,7 +168,7 @@ describe("release-promote-poll — round 2: derivation, payload version, all pag
   });
 });
 
-describe("release-promote-poll — dispatch at most once per version (#1928 slice 2)", () => {
+describe("release-promote-poll — visible-run check (#1928 slice 2)", () => {
   const runScript = () => (job("poll").steps ?? []).map((s) => s.run ?? "").join("\n");
 
   test("the READY dispatch is gated on a run already existing for the version, read fail-closed", () => {
@@ -178,8 +178,7 @@ describe("release-promote-poll — dispatch at most once per version (#1928 slic
     // A failed (or uninterpretable) read is an error exit, never a dispatch on an unknown.
     expect(script).toContain("refusing to dispatch");
     expect(script).toMatch(/if ! gh api --paginate "repos\/\$\{REPO\}\/actions\/workflows\/release-promote\.yml\/runs/);
-    // The auto-dispatch is a REAL promote (the workflow's dry_run defaults to true
-    // for a manual run), so the npm approval really is the only human action.
+    // The auto-dispatch sets dry_run=false.
     expect(script).toContain('gh workflow run release-promote.yml --ref "${ref}" -f dry_run=false');
   });
 
@@ -212,7 +211,7 @@ describe("release-promote-poll — dispatch at most once per version (#1928 slic
     expect(already([page({ display_title: "release-promote v1.2.3", head_branch: "v1.2.3" })])).toBe("true");
     expect(already([page({ display_title: "other", head_branch: "v1.2.3" })])).toBe("true");
     expect(already([page({ display_title: "release-promote v1.2.3", head_branch: null })])).toBe("true");
-    // No run for this version → false (dispatch once).
+    // No visible match for this version → false.
     expect(already([page({ display_title: "release-promote v1.2.2", head_branch: "v1.2.2" })])).toBe("false");
     expect(already([page()])).toBe("false");
   });

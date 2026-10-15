@@ -1,6 +1,7 @@
 - **A privileged `release-promote` workflow moves `latest` after the npm approval.**
-  The unprivileged poll dispatches it on the version's tag ref once every lockstep
-  package is public and hashes to the certified digest. It first verifies the promote
+  Dispatch on the version's tag ref requires a valid marker, every lockstep package
+  public and hashing to the certified digest, and no visible run for the version.
+  The unprivileged poll first verifies the promote
   boundary through the API: the `v*` tag rulesets are active, and the `release-promote`
   environment exists with a `v*`-only tag policy. The run executes the post-publish
   canary, then the promote block; with no environment reviewers configured, the npm

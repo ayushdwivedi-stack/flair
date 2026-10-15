@@ -226,10 +226,10 @@ cannot be re-staged under a different tag.
 Once [the promote boundary](#the-promote-boundary-flair1928) is in place (the tag
 rulesets and the `release-promote` environment with its `NPM_TOKEN`), this phase runs
 for you. The unprivileged
-[`release-promote-poll`](../.github/workflows/release-promote-poll.yml) poll dispatches
-when the version's `release-attempt` marker is valid, every staged package is approved
-and public, the registry set re-derives to the marker's digest, no run for the version
-is visible in the run list, and the boundary is verified. It dispatches the privileged
+[`release-promote-poll`](../.github/workflows/release-promote-poll.yml) poll requires
+a valid `release-attempt` marker, every staged package approved and public, a registry
+set matching the marker's digest, no visible run for the version, and a verified
+boundary before dispatching the privileged
 [`release-promote`](../.github/workflows/release-promote.yml) workflow on the version's
 tag ref, and that workflow calls the
 [`post-publish canary`](../.github/workflows/canary.yml) — the same one below; its
@@ -325,9 +325,8 @@ below stays as the fallback; a failed run's recovery is
   node scripts/ci/registry-latest-skew.mjs <ver>
   ```
 
-  The preflight guards integrity: it refuses a CHANGED package set (a re-cut
-  version, a different set) before `latest` moves. An old PASS with unchanged bytes
-  passes it, and a FAIL prints no promote block. Before the first move the
+  The digest preflight refuses a changed package set before `latest` moves.
+  FAIL prints no promote block. Before the first move the
   block also reads every package's current `latest` and refuses if any is already
   NEWER than `<ver>` at that pre-move read: a superseded version is refused. Paste
   **all** of the block or **none** — a partial paste is the skew this phase exists to
@@ -455,16 +454,15 @@ by a repository admin before the first automated promote:
   the **tag** pattern **`v*`**. The secret is then exposed only to runs on a `v*` tag,
   which only the ruleset's bypass actors can create and nobody can move.
 - **Required reviewers:** not required. With none configured, the release has one
-  human action, the npm 2FA approval. An operator may add reviewers; the poll accepts that, and each promote then
-  waits for that approval after its canary.
+  human action, the npm 2FA approval. An operator may add reviewers; the poll accepts
+  that, and each promote then waits for that approval after its canary.
 - Secret: **`NPM_TOKEN`**, a granular npm access token with **read and write on the
   lockstep packages** (`node scripts/ci/lockstep-packages.mjs` prints the list), 2FA-bypass
   (automation), expiry ≤ 90 days with a rotation reminder. It needs exactly the scope to
   move a dist-tag on those packages.
 
 Before creating the environment, audit the existing `v*` tags: none may carry a
-`release-promote.yml` that was not reviewed on main. On 2026-10-13 none of the 93 live
-`v*` tags carried the file at all (`git cat-file -e <tag>:.github/workflows/release-promote.yml`).
+`release-promote.yml` that was not reviewed on main.
 
 The checks inside `release-promote.yml` and `canary.yml` are **defence in depth**, not
 the boundary. They compare the executed files with `origin/main`, run repository scripts
@@ -543,9 +541,9 @@ on; it holds no npm credential (the poll runs on the automatic
   never the ref alone — the ref must equal `v<payload.version>` or the marker is
   refused). It requires EVERY lockstep package `<name>@<version>` to be public and
   to re-derive the certified package-set digest (ALL-form: one missing/odd package
-  is NOT READY, exit 0, the package named), and on READY dispatches
-  `release-promote.yml --ref v<version>`, gated behind that workflow existing
-  (slice 2). Every run is a schedule run of the default branch's copy of the file, so
+  is NOT READY, exit 0, the package named). Dispatch also requires the workflow
+  to exist, no visible run for the version, and the verified promote boundary.
+  Every run is a schedule run of the default branch's copy of the file, so
   `github.sha` is always a main sha. **The poll's outputs are
   never an input to what gets promoted** — the privileged job re-derives everything
   it acts on. (`test/unit/release-promote-poll-workflow.test.ts`.)

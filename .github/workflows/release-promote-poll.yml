@@ -1,9 +1,5 @@
 name: Release promote poll
-# flair#1928 slice 1 — the UNPRIVILEGED poll. It answers ONE question per pending
-# release: does the `release-attempt` marker for `v<version>` exist, and is every
-# lockstep package `<name>@<version>` public (ALL-form: one not-yet-approved
-# package means NOT READY)? On READY it DISPATCHES `release-promote.yml` on the tag
-# ref; on NOT READY it exits 0 and logs the pending package.
+# flair#1928 slice 1 — the UNPRIVILEGED poll of pending releases.
 #
 # It holds NO NPM CREDENTIAL: no environment, no repo secret. It runs on the
 # automatic GITHUB_TOKEN with `actions: write`, `contents: read` and

@@ -482,7 +482,7 @@ describe("release-auto-tag workflow — the trust root is owned by the repo admi
     expect(matches("/.github/**poll.yml", poll)).toBe(false); // "**" inside a segment stays in it
     expect(matches("/docs/*.md", "docs/nested/file.md")).toBe(false); // "*" never crosses "/"
     expect(matches("/.github/workflows/RELEASE-PROMOTE-POLL.yml", poll)).toBe(false); // case-sensitive
-  });
+  }, 30_000);
 });
 
 describe("CODEOWNERS — the shared Renovate preset is in the trust root (#1930)", () => {

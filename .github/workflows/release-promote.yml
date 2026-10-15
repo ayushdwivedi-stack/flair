@@ -133,11 +133,8 @@ jobs:
           echo "  resolved version ${BASH_REMATCH[1]} from $REF_NAME"
 
       - name: Verify the tag is on origin/main, pin origin/main and move the workspace to it
-        # A tag can point at any commit; require it to be on main, so a promote
-        # documents a commit on main, subject to main's review rules. Then pin
-        # origin/main (the canary runs this same commit) and move the workspace to
-        # it, so the one script this job runs, the flair tarball hasher, comes from
-        # trusted main.
+        # Require the tag commit to be on main, subject to main's review rules.
+        # Pin origin/main and select it before running the tarball hasher.
         id: trusted
         run: |
           set -euo pipefail
