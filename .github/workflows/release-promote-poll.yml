@@ -30,8 +30,9 @@ name: Release promote poll
 #   - the poll's own token reports current_user_can_bypass=never on the immutable ruleset;
 #   - the release-promote environment has exactly the tag deployment pattern v*.
 # Other actors' rule exceptions are not visible to the poll.
-# Before adding NPM_TOKEN, Nathan audits the creation actors and other actors' rule
-# exceptions (docs/releasing.md, "The promote boundary"). Required reviewers are optional.
+# Before the npm credential is added to the release environment, Nathan audits the
+# creation actors and other actors' rule exceptions (docs/releasing.md, "The promote
+# boundary"). Required reviewers are optional.
 # On the normal staged-release path, npm approval is the human action when no
 # environment reviewers are configured; the poll checks public tarballs matching
 # the certified package-set digest, not an approval record.
