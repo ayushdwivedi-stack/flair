@@ -203,7 +203,7 @@ describe("canary-verdict — refuses a malformed promote", () => {
   });
 });
 
-describe("canary-verdict — npm package names", () => {
+describe("canary-verdict — shell-safe name allowlist", () => {
   function runWithName(name: string, emit: boolean) {
     const root = mkdtempSync(join(tmpdir(), "flair-canary-name-"));
     tmpDirs.push(root);
@@ -218,17 +218,18 @@ describe("canary-verdict — npm package names", () => {
   }
 
   test.each([".fixture", "Fixture", "z fixture", "fixture\nname", "@scope/fixture\n", "@scope/", "a".repeat(215)])(
-    "refuses package name %j before output", (name) => {
+    "refuses name %j outside the shell-safe name allowlist before output", (name) => {
       for (const emit of [false, true]) {
         const r = runWithName(name, emit);
         expect(r.status).toBe(2);
-        expect(r.stderr).toContain("canary-verdict.sh: DID NOT RUN — package name");
+        expect(r.stderr).toContain("lockstep-packages: DID NOT RUN — package name must match the shell-safe name allowlist");
+        expect(r.stderr).toContain("canary-verdict.sh: DID NOT RUN — package names could not be checked against the shell-safe name allowlist");
         expect(r.stdout).toBe("");
       }
     },
   );
 
-  test.each(["@scope/fixture-name", "fixture-name", "a".repeat(214)])("emits package name %j", (name) => {
+  test.each(["@scope/fixture-name", "fixture-name", "a".repeat(214)])("emits name %j from the shell-safe name allowlist", (name) => {
     const r = runWithName(name, true);
     expect(r.status).toBe(0);
     expect(r.stderr).toBe("");

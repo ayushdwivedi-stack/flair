@@ -148,7 +148,7 @@ SKEW_AWAIT_S=120
 
 # The ONE source for the lockstep set (never a second list here).
 if ! PACKAGE_NAMES="$(node scripts/ci/lockstep-packages.mjs --validate-names)"; then
-  echo "canary-verdict.sh: DID NOT RUN — package names could not be validated" >&2
+  echo "canary-verdict.sh: DID NOT RUN — package names could not be checked against the shell-safe name allowlist" >&2
   exit 2
 fi
 PACKAGES=()
@@ -292,7 +292,7 @@ for _p in ${PACKAGES[*]}; do
   # flair#1928: a NEWER release already holds latest => ${VERSION} is superseded.
   # Refuse BEFORE the first move, so a re-run of an older version does not move
   # latest back past a newer version seen at this pre-move read (a move made
-  # between this read and the moves is not covered). Equal is allowed (a re-run converges); a prerelease of the
+  # between this read and the moves is not covered). Equal is allowed; a prerelease of the
   # same major.minor.patch is older than the release.
   _cur_core="\${_cur%%-*}"
   _cur_maj="\${_cur_core%%.*}"; _cur_rest="\${_cur_core#*.}"

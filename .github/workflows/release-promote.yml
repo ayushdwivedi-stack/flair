@@ -22,8 +22,11 @@ name: Release promote
 # repository settings, which the poll (the default branch's copy) verifies through
 # the API before it dispatches (docs/releasing.md, "The promote boundary"):
 #   - the tag rulesets `release-tags-create` (only its configured creation actors may create a
-#     `v*` tag) and `release-tags-immutable` (no `v*` tag can be moved, force-
-#     updated or deleted), both active;
+#     `v*` tag) and `release-tags-immutable` (update, non-fast-forward and deletion
+#     rules on v* and adk-flair-v*; the promotion token cannot update or delete
+#     those tags), both active;
+#     other actors' exceptions are administered by repository admins and are
+#     not visible to this check;
 #   - the `release-promote` environment holding `NPM_TOKEN`, with a deployment
 #     policy of exactly the tag pattern `v*` (required reviewers optional).
 #

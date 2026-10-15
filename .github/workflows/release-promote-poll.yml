@@ -29,8 +29,11 @@ name: Release promote poll
 # file, and this poll (the default branch's copy, never a tag's) verifies both
 # through the API before it dispatches anything:
 #   - the tag rulesets: `release-tags-create` (creating `refs/tags/v*` is
-#     restricted to its configured creation actors) and `release-tags-immutable` (no v* tag
-#     can be updated, force-moved or deleted), both active;
+#     restricted to its configured creation actors) and `release-tags-immutable`
+#     (update, non-fast-forward and deletion rules on v* and adk-flair-v*;
+#     the promotion token cannot update or delete those tags), both active;
+#     other actors' exceptions are administered by repository admins and are
+#     not visible to this check;
 #   - the `release-promote` environment that holds the npm token, with a
 #     deployment policy of exactly the tag pattern `v*`, so the token is only
 #     available to runs on a tag that only the creation ruleset's configured
@@ -130,6 +133,14 @@ jobs:
             fi
             if ! jq -e --argjson need "$3" '.target == "tag" and (.conditions.ref_name.include // [] | index("refs/tags/v*") != null) and (.conditions.ref_name.exclude // [] | length == 0) and ([.rules[]?.type] as $have | all($need[]; . as $t | $have | index($t) != null))' "${rs}" >/dev/null; then
               echo "tag ruleset $1 ($2) does not apply $3 to refs/tags/v*" >> "${REASONS}"
+            fi
+            if [ "$1" = "${TAG_IMMUTABLE_RULESET}" ]; then
+              if ! jq -e '.conditions.ref_name.include // [] | index("refs/tags/adk-flair-v*") != null' "${rs}" >/dev/null; then
+                echo "tag ruleset $1 ($2) does not cover refs/tags/adk-flair-v*" >> "${REASONS}"
+              fi
+              if ! jq -e '.current_user_can_bypass == "never"' "${rs}" >/dev/null; then
+                echo "tag ruleset $1 ($2) must report current_user_can_bypass=never for the promotion token" >> "${REASONS}"
+              fi
             fi
           }
           check_ruleset "${TAG_CREATE_RULESET}" release-tags-create '["creation"]'

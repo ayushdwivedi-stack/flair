@@ -296,41 +296,13 @@ current-`latest` reads, refusals and moves run only under the token). The manual
 below stays as the fallback; a failed run's recovery is
 [described below](#slice-2-flair1928--the-privileged-promote).
 
-- **On PASS**, the canary emits the complete, sha256-bound promote block as ONE
-  snippet to paste once, from a repo checkout on a machine logged into npm. It
-  verifies EVERY package's published-tarball sha256 first
-  (so a registry hiccup mid-paste touches no tag), then runs the `npm dist-tag
-  add` lines — `@tpsdev-ai/flair` LAST, so a partial paste never leaves the CLI
-  ahead of its client library — then the skew check. Under 2FA each `dist-tag add`
-  may prompt for an OTP separately, so capture one code and pass it to all of them
-  with `--otp`:
-
-  ```bash
-  set -e
-  OTP=123456   # fresh from your authenticator; valid for a short window
-
-  # 1. Preflight — every published tarball must hash to its recorded sha256.
-  test "$(node scripts/ci/registry-tarball-sha256.mjs <ver> @tpsdev-ai/flair-client)" = "<sha>"
-  test "$(node scripts/ci/registry-tarball-sha256.mjs <ver> @tpsdev-ai/flair-mcp)"    = "<sha>"
-  # … one line per lockstep package; @tpsdev-ai/flair last …
-  test "$(node scripts/ci/registry-tarball-sha256.mjs <ver> @tpsdev-ai/flair)"        = "<sha>"
-
-  # 2. Promote every lockstep package (`@tpsdev-ai/flair` LAST).
-  npm dist-tag add @tpsdev-ai/flair-client@<ver> latest --otp "$OTP"
-  npm dist-tag add @tpsdev-ai/flair-mcp@<ver> latest --otp "$OTP"
-  # … one line per lockstep package …
-  npm dist-tag add @tpsdev-ai/flair@<ver> latest --otp "$OTP"
-
-  # 3. Confirm the set converged.
-  node scripts/ci/registry-latest-skew.mjs <ver>
-  ```
-
-  The digest preflight refuses a changed package set before `latest` moves.
-  FAIL prints no promote block. Before the first move the
-  block also reads every package's current `latest` and refuses if any is already
-  NEWER than `<ver>` at that pre-move read: a superseded version is refused. Paste
-  **all** of the block or **none** — a partial paste is the skew this phase exists to
-  prevent.
+- **On PASS**, paste the complete block emitted by `scripts/ci/canary-verdict.sh`
+  in **Canary verdict — emit the promote or deprecate command**, from a repo
+  checkout on a machine logged into npm. Its package-set digest comparison and
+  current-`latest` reads finish before any move. A preflight failure moves no tags.
+  A failure after earlier moves can leave some tags moved. Re-runs repeat the
+  digest comparison and pre-move reads; equal versions are allowed, newer versions
+  are refused. The block attempts each move in order and stops on failure.
 
   The block runs under bash; `scripts/ci/canary-verdict.sh` is bash **3.2**-safe,
   so stock macOS `/bin/bash` runs it (and the emitted block) locally — no newer
@@ -437,12 +409,16 @@ version reaches the dispatch (a poll with nothing ready still succeeds).
 - **`release-tags-create`** (id `24044017`): target tags, include `refs/tags/v*`, no
   exclusions, rule **Restrict creations**. Only its configured creation actors may create a `v*` tag:
   repository admins, plus the release-tag App only if the auto-tagger is to create tags.
-- **`release-tags-immutable`** (id `23944797`): target tags, include `refs/tags/v*`, no
-  exclusions, rules **Restrict updates**, **Restrict deletions** and **Block force
-  pushes**, so a `v*` tag can never be moved to another commit.
+- **`release-tags-immutable`** (id `23944797`): target tags, include `refs/tags/v*`
+  and `refs/tags/adk-flair-v*`, no exclusions, rules **Restrict updates**,
+  **Restrict deletions** and **Block force pushes**. The poll requires that its
+  promotion token cannot update or delete those tags.
 
-The poll checks each pinned id for enforcement, target, pattern and rule types. Its token
-cannot read configured creation actors, so keeping that creation actor list is part of this setting. A
+The poll checks each pinned id for enforcement, target, patterns and rule types,
+and requires `current_user_can_bypass` to be `never` on the immutable ruleset.
+Other actors' exceptions are administered by repository admins and are not visible
+to this check. Its token cannot read configured creation actors, so keeping that
+creation actor list is part of this setting. A
 ruleset recreated under a new id fails closed until the pins in
 `release-promote-poll.yml` are updated.
 
@@ -451,8 +427,7 @@ by a repository admin before the first automated promote:
 
 - Environment name: **`release-promote`**.
 - **Deployment branches and tags:** Selected branches and tags, with exactly one rule:
-  the **tag** pattern **`v*`**. The secret is then available only to runs on a `v*` tag,
-  which only the ruleset's configured creation actors can create and nobody can move.
+  the **tag** pattern **`v*`**. The secret is available only to runs on a `v*` tag.
 - **Required reviewers:** not required. With none configured, the release has one
   human action, the npm 2FA approval. An operator may add reviewers; the poll accepts
   that, and each promote then waits for that approval after its canary.
@@ -608,10 +583,8 @@ log carries the commands for a human:
   still served a previous `latest` when the wait ended) prints the check's re-run command
   first and the RESTORE lines as the fallback.
 
-**What a re-run is safe for.** Re-running the same version's promote after a partial or
-failed move converges the set: the block re-derives the certified digest, a package
-already at `<ver>` is left as it is, and a package whose `latest` is newer at the
-block's pre-move read stops the run before any move, so `latest` does not go back past
-a newer release seen at that read. Not covered: two
+**Re-running the same version's promote.** The block re-derives the certified digest
+and permits equal versions. A newer `latest` at the pre-move read stops the run
+before any move. Not covered: two
 versions' promotes running at the same moment, or a move made by hand between the
 block's read and its moves; the read precedes the moves, it is not a lock.

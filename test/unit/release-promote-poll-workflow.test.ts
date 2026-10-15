@@ -302,7 +302,6 @@ const goodCreate = () => ({
   enforcement: "active",
   conditions: { ref_name: { exclude: [], include: ["refs/tags/v*"] } },
   rules: [{ type: "creation" }],
-  bypass_actors: null,
 });
 const goodImmutable = () => ({
   id: 23944797,
@@ -311,7 +310,7 @@ const goodImmutable = () => ({
   enforcement: "active",
   conditions: { ref_name: { exclude: [], include: ["refs/tags/v*", "refs/tags/adk-flair-v*"] } },
   rules: [{ type: "deletion" }, { type: "non_fast_forward" }, { type: "update" }],
-  bypass_actors: null,
+  current_user_can_bypass: "never",
 });
 function boundaryFixtures(over: Record<string, unknown | undefined> = {}): Record<string, unknown> {
   const all: Record<string, unknown | undefined> = {
@@ -346,7 +345,7 @@ function runBoundary(fixtures: Record<string, unknown>) {
 }
 
 describe("release-promote-poll — the promote boundary is verified before any dispatch", () => {
-  test("the pins name the environment the promote job uses and the two live v* tag rulesets", () => {
+  test("the pins name the environment the promote job uses and the two pinned v* tag rulesets", () => {
     expect(POLL_ENV.PROMOTE_ENV).toBe("release-promote");
     expect(POLL_ENV.TAG_CREATE_RULESET).toBe("24044017");
     expect(POLL_ENV.TAG_IMMUTABLE_RULESET).toBe("23944797");
@@ -403,6 +402,24 @@ describe("release-promote-poll — the promote boundary is verified before any d
       expect(r.ok, msg).toBe("false");
       expect(r.reason).toContain(msg);
     }
+  });
+
+  test.each(["always", "pull_requests", null, undefined, "unknown"])(
+    "immutable ruleset current_user_can_bypass=%j → refused", (permission) => {
+      const immutable: Record<string, unknown> = { ...goodImmutable(), current_user_can_bypass: permission };
+      if (permission === undefined) delete immutable.current_user_can_bypass;
+      const r = runBoundary(boundaryFixtures({ [IMMUT_PATH]: immutable }));
+      expect(r.status, r.log).toBe(0);
+      expect(r.ok).toBe("false");
+      expect(r.reason).toContain("must report current_user_can_bypass=never for the promotion token");
+    },
+  );
+
+  test("immutable ruleset requires adk-flair-v* coverage", () => {
+    const immutable = { ...goodImmutable(), conditions: { ref_name: { exclude: [], include: ["refs/tags/v*"] } } };
+    const r = runBoundary(boundaryFixtures({ [IMMUT_PATH]: immutable }));
+    expect(r.ok).toBe("false");
+    expect(r.reason).toContain("does not cover refs/tags/adk-flair-v*");
   });
 
   test("an inactive tag ruleset → refused, named", () => {
