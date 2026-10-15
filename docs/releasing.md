@@ -284,7 +284,7 @@ RESTORE lines. `flair` at `latest` 0.55.1 while `flair-client` / `flair-mcp` / t
 plugins sit at 0.54.2 is exactly the mismatch `flair#1383` detects at runtime —
 and 0.55.1's promote had to be assembled by hand, line by line, for this reason.
 
-With the promote boundary in place, a successful `release-promote` run does this phase
+With the tag rulesets configured as above, a successful `release-promote` run with `dry_run=false` does this phase
 too: it re-reads and validates the version (from the tag ref),
 the tag's ancestry, the release-attempt marker (from the deployments API) and the
 certified package-set digest (from the registry bytes), runs the canary above, and —
@@ -432,7 +432,8 @@ by a repository admin before the first automated promote:
   move a dist-tag on those packages.
 
 Before adding `NPM_TOKEN`, audit the creation actors, other actors' rule exceptions,
-and existing `v*` tags: each tag must carry a `release-promote.yml` reviewed on main.
+and existing `v*` tags: every existing tag that carries a `release-promote.yml` must carry
+a copy reviewed on main. Older tags that predate the workflow need nothing.
 
 The checks inside `release-promote.yml` and `canary.yml` are **defence in depth**, not
 the boundary. They compare the executed files with `origin/main`, run repository scripts
