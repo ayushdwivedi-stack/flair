@@ -25,7 +25,7 @@
 # prints a one-line note and no promote block, so a human is never asked to move
 # `latest` to a prerelease. The FAIL branch is unchanged.
 #
-# PASS emits ONE block the operator pastes once, in THREE phases: a preflight that
+# PASS emits ONE block the operator pastes once, in four phases: a preflight that
 # re-derives the package-set digest from the published tarballs and requires it to
 # equal the release run's digest (nothing moves if the check fails, so a registry
 # hiccup or a re-cut version DURING THE PREFLIGHT leaves no partial promote; a
@@ -147,10 +147,14 @@ is_release() {
 SKEW_AWAIT_S=120
 
 # The ONE source for the lockstep set (never a second list here).
+if ! PACKAGE_NAMES="$(node scripts/ci/lockstep-packages.mjs --validate-names)"; then
+  echo "canary-verdict.sh: DID NOT RUN — package names could not be validated" >&2
+  exit 2
+fi
 PACKAGES=()
 while IFS= read -r _line; do
   [ -n "$_line" ] && PACKAGES[${#PACKAGES[@]}]="$_line"
-done < <(node scripts/ci/lockstep-packages.mjs)
+done <<< "$PACKAGE_NAMES"
 if [ "${#PACKAGES[@]}" -eq 0 ]; then
   echo "canary-verdict.sh: DID NOT RUN — could not derive the lockstep package list (run from the repo root)" >&2
   exit 2

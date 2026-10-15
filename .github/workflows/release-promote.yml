@@ -21,7 +21,7 @@ name: Release promote
 # check written here, including the guard below. What stops that is two
 # repository settings, which the poll (the default branch's copy) verifies through
 # the API before it dispatches (docs/releasing.md, "The promote boundary"):
-#   - the tag rulesets `release-tags-create` (only its bypass actors may create a
+#   - the tag rulesets `release-tags-create` (only its configured creation actors may create a
 #     `v*` tag) and `release-tags-immutable` (no `v*` tag can be moved, force-
 #     updated or deleted), both active;
 #   - the `release-promote` environment holding `NPM_TOKEN`, with a deployment

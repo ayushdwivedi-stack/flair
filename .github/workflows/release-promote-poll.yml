@@ -29,12 +29,12 @@ name: Release promote poll
 # file, and this poll (the default branch's copy, never a tag's) verifies both
 # through the API before it dispatches anything:
 #   - the tag rulesets: `release-tags-create` (creating `refs/tags/v*` is
-#     restricted to its bypass actors) and `release-tags-immutable` (no v* tag
+#     restricted to its configured creation actors) and `release-tags-immutable` (no v* tag
 #     can be updated, force-moved or deleted), both active;
 #   - the `release-promote` environment that holds the npm token, with a
 #     deployment policy of exactly the tag pattern `v*`, so the token is only
-#     exposed to runs on a tag that only the creation ruleset's configured
-#     bypass actors could create (repository admins, plus the release-tag App
+#     available to runs on a tag that only the creation ruleset's configured
+#     creation actors could create (repository admins, plus the release-tag App
 #     if it is configured as one). Required reviewers are not required: with
 #     none configured, the npm approval is the one human action (Nathan's
 #     rule); if an operator adds them, that is accepted.

@@ -298,7 +298,7 @@ below stays as the fallback; a failed run's recovery is
 
 - **On PASS**, the canary emits the complete, sha256-bound promote block as ONE
   snippet to paste once, from a repo checkout on a machine logged into npm. It
-  runs in two phases: it verifies EVERY package's published-tarball sha256 first
+  verifies EVERY package's published-tarball sha256 first
   (so a registry hiccup mid-paste touches no tag), then runs the `npm dist-tag
   add` lines — `@tpsdev-ai/flair` LAST, so a partial paste never leaves the CLI
   ahead of its client library — then the skew check. Under 2FA each `dist-tag add`
@@ -435,14 +435,14 @@ version reaches the dispatch (a poll with nothing ready still succeeds).
 **1. The `v*` tag rulesets** (Settings → Rules → Rulesets). Both must stay **Active**:
 
 - **`release-tags-create`** (id `24044017`): target tags, include `refs/tags/v*`, no
-  exclusions, rule **Restrict creations**. Only its bypass actors may create a `v*` tag:
+  exclusions, rule **Restrict creations**. Only its configured creation actors may create a `v*` tag:
   repository admins, plus the release-tag App only if the auto-tagger is to create tags.
 - **`release-tags-immutable`** (id `23944797`): target tags, include `refs/tags/v*`, no
   exclusions, rules **Restrict updates**, **Restrict deletions** and **Block force
   pushes**, so a `v*` tag can never be moved to another commit.
 
 The poll checks each pinned id for enforcement, target, pattern and rule types. Its token
-cannot read bypass actors, so keeping that bypass list is part of this setting. A
+cannot read configured creation actors, so keeping that creation actor list is part of this setting. A
 ruleset recreated under a new id fails closed until the pins in
 `release-promote-poll.yml` are updated.
 
@@ -451,14 +451,13 @@ by a repository admin before the first automated promote:
 
 - Environment name: **`release-promote`**.
 - **Deployment branches and tags:** Selected branches and tags, with exactly one rule:
-  the **tag** pattern **`v*`**. The secret is then exposed only to runs on a `v*` tag,
-  which only the ruleset's bypass actors can create and nobody can move.
+  the **tag** pattern **`v*`**. The secret is then available only to runs on a `v*` tag,
+  which only the ruleset's configured creation actors can create and nobody can move.
 - **Required reviewers:** not required. With none configured, the release has one
   human action, the npm 2FA approval. An operator may add reviewers; the poll accepts
   that, and each promote then waits for that approval after its canary.
 - Secret: **`NPM_TOKEN`**, a granular npm access token with **read and write on the
-  lockstep packages** (`node scripts/ci/lockstep-packages.mjs` prints the list), 2FA-bypass
-  (automation), expiry ≤ 90 days with a rotation reminder. It needs exactly the scope to
+  lockstep packages** (`node scripts/ci/lockstep-packages.mjs` prints the list), automation access, expiry ≤ 90 days with a rotation reminder. It needs exactly the scope to
   move a dist-tag on those packages.
 
 Before creating the environment, audit the existing `v*` tags: none may carry a

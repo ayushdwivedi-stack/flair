@@ -90,7 +90,7 @@ describe("canary-verdict — PASS is bound to ONE package-set digest (A1c, #1671
     expect(block).toContain("NOT moved");
     expect(block).not.toContain("npm dist-tag rm");
 
-    // TWO PHASES: the (single) digest preflight comes before the promote loop.
+    // The digest preflight comes before the promote loop.
     const firstDigest = blockLines.findIndex((l) => l.includes('if [ "$_rehash" != "'));
     const firstPromote = blockLines.findIndex((l) => l.includes('if ! npm dist-tag add'));
     expect(firstDigest).toBeGreaterThanOrEqual(0);
@@ -200,6 +200,39 @@ describe("canary-verdict — refuses a malformed promote", () => {
     expect(r.status).toBe(2);
     expect(r.stderr).toContain("64-char hex");
     expect(r.stdout).not.toContain("npm dist-tag add");
+  });
+});
+
+describe("canary-verdict — npm package names", () => {
+  function runWithName(name: string, emit: boolean) {
+    const root = mkdtempSync(join(tmpdir(), "flair-canary-name-"));
+    tmpDirs.push(root);
+    mkdirSync(join(root, "scripts", "ci"), { recursive: true });
+    copyFileSync(SCRIPT, join(root, "scripts", "ci", "canary-verdict.sh"));
+    copyFileSync(LOCKSTEP_SCRIPT, join(root, "scripts", "ci", "lockstep-packages.mjs"));
+    writeFileSync(join(root, "package.json"), JSON.stringify({ name, version: "1.2.3" }));
+    mkdirSync(join(root, "packages", "fixture"), { recursive: true });
+    writeFileSync(join(root, "packages", "fixture", "package.json"), JSON.stringify({ name: "fixture-valid", version: "1.2.3" }));
+    return spawnSync("bash", [join(root, "scripts", "ci", "canary-verdict.sh"), "pass", "1.2.3", RUN_URL, "--package-set-digest", CERTIFIED_DIGEST,
+      ...(emit ? ["--emit", "bash"] : [])], { cwd: root, encoding: "utf8" });
+  }
+
+  test.each([".fixture", "Fixture", "z fixture", "fixture\nname", "@scope/fixture\n", "@scope/", "a".repeat(215)])(
+    "refuses package name %j before output", (name) => {
+      for (const emit of [false, true]) {
+        const r = runWithName(name, emit);
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain("canary-verdict.sh: DID NOT RUN — package name");
+        expect(r.stdout).toBe("");
+      }
+    },
+  );
+
+  test.each(["@scope/fixture-name", "fixture-name", "a".repeat(214)])("emits package name %j", (name) => {
+    const r = runWithName(name, true);
+    expect(r.status).toBe(0);
+    expect(r.stderr).toBe("");
+    expect(r.stdout).toContain(`for _p in ${[name, "fixture-valid"].sort().join(" ")}; do`);
   });
 });
 
