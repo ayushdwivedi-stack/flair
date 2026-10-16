@@ -171,7 +171,7 @@ describe("release-promote-poll — round 2: derivation, payload version, all pag
 describe("release-promote-poll — visible-run check (#1928 slice 2)", () => {
   const runScript = () => (job("poll").steps ?? []).map((s) => s.run ?? "").join("\n");
 
-  test("the READY dispatch is gated on a run already existing for the version, read fail-closed", () => {
+  test("the READY dispatch checks non-dry-run attempts and refuses an unreadable run list", () => {
     const script = runScript();
     expect(script).toContain("release-promote.yml/runs");
     expect(script).toContain("not dispatching again");
@@ -206,13 +206,14 @@ describe("release-promote-poll — visible-run check (#1928 slice 2)", () => {
   }
   const page = (...runs: unknown[]) => ({ total_count: 999, workflow_runs: runs });
 
-  test("BEHAVIOURAL: the run-name / head-branch predicate identifies a version's run", () => {
-    // A run for THIS version, by run-name or by head branch → true (do not dispatch again).
-    expect(already([page({ display_title: "release-promote v1.2.3", head_branch: "v1.2.3" })])).toBe("true");
-    expect(already([page({ display_title: "other", head_branch: "v1.2.3" })])).toBe("true");
-    expect(already([page({ display_title: "release-promote v1.2.3", head_branch: null })])).toBe("true");
-    // No visible match for this version → false.
-    expect(already([page({ display_title: "release-promote v1.2.2", head_branch: "v1.2.2" })])).toBe("false");
+  test("ALREADY matches only queued, in-progress or successful non-dry-run titles", () => {
+    for (const state of [{ status: "queued" }, { status: "in_progress" }, { status: "completed", conclusion: "success" }]) {
+      expect(already([page({ display_title: "release-promote v1.2.3", head_branch: null, ...state })])).toBe("true");
+      expect(already([page({ display_title: "release-promote v1.2.3 (dry run)", head_branch: "v1.2.3", ...state })])).toBe("false");
+      expect(already([page({ display_title: "other", head_branch: "v1.2.3", ...state })])).toBe("false");
+      expect(already([page({ display_title: "release-promote v1.2.2", head_branch: "v1.2.2", ...state })])).toBe("false");
+    }
+    expect(already([page({ display_title: "release-promote v1.2.3", status: "completed", conclusion: "failure" })])).toBe("false");
     expect(already([page()])).toBe("false");
   });
 
@@ -220,7 +221,7 @@ describe("release-promote-poll — visible-run check (#1928 slice 2)", () => {
     const p1 = page(
       ...Array.from({ length: 100 }, (_, i) => ({ display_title: `release-promote v0.0.${i}`, head_branch: `v0.0.${i}` })),
     );
-    const p2 = page({ display_title: "release-promote v1.2.3", head_branch: "v1.2.3" });
+    const p2 = page({ display_title: "release-promote v1.2.3", head_branch: "v1.2.3", status: "in_progress" });
     expect(already([p1, p2])).toBe("true");
     // …and two pages with no match anywhere are ONE "false", not one value per page.
     expect(already([p1, page({ display_title: "release-promote v1.2.2", head_branch: "v1.2.2" })])).toBe("false");
@@ -457,7 +458,7 @@ function setDigest(version: string, pkgs: string[]): string {
   return createHash("sha256").update(rows.join("")).digest("hex");
 }
 /** Run the real "Poll and dispatch" step in a fixture tree; returns the dispatches it made. */
-function runPoll(markers: unknown[], boundary: { ok: string; reason?: string }) {
+function runPoll(markers: unknown[], boundary: { ok: string; reason?: string }, runs: unknown[] = []) {
   const dir = mkdtempSync(join(tmpdir(), "poll-run-"));
   try {
     mkdirSync(join(dir, "scripts", "ci"), { recursive: true });
@@ -476,7 +477,7 @@ function runPoll(markers: unknown[], boundary: { ok: string; reason?: string }) 
       {
         [`repos/${R}/deployments`]: markers,
         [`repos/${R}/actions/workflows/release-promote.yml`]: { id: 1 },
-        [`repos/${R}/actions/workflows/release-promote.yml/runs`]: { total_count: 0, workflow_runs: [] },
+        [`repos/${R}/actions/workflows/release-promote.yml/runs`]: { total_count: runs.length, workflow_runs: runs },
       },
       `if [ "$1" = "workflow" ] && [ "$2" = "run" ]; then echo "$*" >> ${JSON.stringify(dispatches)}; exit 0; fi
 if [ "$1" = "api" ] && [[ "$*" == *"environment=promoted"* ]]; then echo '[]'; exit 0; fi`,
@@ -509,6 +510,50 @@ const PKGS = ["@tpsdev-ai/flair-client", "@tpsdev-ai/flair"];
 const marker = (version: string) => ({ ref: `v${version}`, payload: { version, package_set_digest: setDigest(version, PKGS) } });
 
 describe("release-promote-poll — each version is dispatched at most once per poll", () => {
+  test.each(["queued", "in_progress", "completed"])("a manual dry run (%s) does not suppress the real dispatch", (status) => {
+    const r = runPoll([marker("1.2.3")], { ok: "true" }, [{
+      display_title: "release-promote v1.2.3 (dry run)", head_branch: "v1.2.3", status, conclusion: status === "completed" ? "success" : null,
+    }]);
+    expect(r.status, r.log).toBe(0);
+    expect(r.dispatches).toEqual(["workflow run release-promote.yml --ref v1.2.3 -f dry_run=false"]);
+  });
+
+  test.each(["queued", "in_progress", "completed"])("a real promotion (%s; success when completed) suppresses dispatch", (status) => {
+    const r = runPoll([marker("1.2.3")], { ok: "true" }, [{
+      display_title: "release-promote v1.2.3", head_branch: "v1.2.3", status, conclusion: status === "completed" ? "success" : null,
+    }]);
+    expect(r.status, r.log).toBe(0);
+    expect(r.dispatches).toEqual([]);
+    expect(r.log).toContain("not dispatching again");
+    expect(r.log).not.toContain("requires human review");
+  });
+
+  test.each(["failure", "cancelled", "timed_out", "action_required", "neutral", "skipped", "stale", null])(
+    "a completed real attempt (%s) requires human review without redispatch", (conclusion) => {
+      const r = runPoll([marker("1.2.3")], { ok: "true" }, [{
+        display_title: "release-promote v1.2.3", head_branch: "v1.2.3", status: "completed", conclusion,
+      }]);
+      expect(r.status, r.log).toBe(0);
+      expect(r.dispatches).toEqual([]);
+      expect(r.log).toContain("a human must inspect the run before retrying");
+    },
+  );
+
+  test("an unrecognised title on the tag branch does not establish promotion mode", () => {
+    const r = runPoll([marker("1.2.3")], { ok: "true" }, [{
+      display_title: "other", head_branch: "v1.2.3", status: "in_progress",
+    }]);
+    expect(r.status, r.log).toBe(0);
+    expect(r.dispatches).toEqual(["workflow run release-promote.yml --ref v1.2.3 -f dry_run=false"]);
+  });
+
+  test.each(["waiting", "pending", "requested", "unknown", null])("a real attempt with status %s requires human review", (status) => {
+    const r = runPoll([marker("1.2.3")], { ok: "true" }, [{ display_title: "release-promote v1.2.3", status }]);
+    expect(r.status, r.log).toBe(0);
+    expect(r.dispatches).toEqual([]);
+    expect(r.log).toContain("a human must inspect the run before retrying");
+  });
+
   test("duplicate marker rows for one version dispatch it once", () => {
     const r = runPoll([marker("1.2.3"), marker("1.2.3"), marker("1.2.3")], { ok: "true" });
     expect(r.status, r.log).toBe(0);

@@ -76,9 +76,8 @@ on:
         default: true
         type: boolean
 
-# The poll tells "has this version already had a promote run?" by this run-name.
-# Keep it, and the poll's match on it, in step: `release-promote v<version>`.
-run-name: release-promote ${{ github.ref_name }}
+# The poll matches the non-dry-run title.
+run-name: release-promote ${{ github.ref_name }}${{ inputs.dry_run && ' (dry run)' || '' }}
 
 # Default to NOTHING. Each job opts into exactly what it needs.
 permissions: {}

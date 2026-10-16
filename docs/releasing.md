@@ -228,17 +228,16 @@ rulesets and the `release-promote` environment with its `NPM_TOKEN`), this phase
 for you. The unprivileged
 [`release-promote-poll`](../.github/workflows/release-promote-poll.yml) poll requires
 a valid `release-attempt` marker, public tarballs for every lockstep package matching
-the certified package-set digest, no visible run for the version, and passing
-[settings checks](#the-promote-boundary-flair1928) before dispatching the privileged
+the certified package-set digest, no visible non-dry-run attempt for the version, and
+passing [settings checks](#the-promote-boundary-flair1928) before dispatching the privileged
 [`release-promote`](../.github/workflows/release-promote.yml) workflow on the version's
 tag ref, and that workflow calls the
 [`post-publish canary`](../.github/workflows/canary.yml) — the same one below; its
 definition resolves at the tag and its workspace runs the default branch's scripts at a
-pinned commit — before it promotes anything. The poll does not redispatch a version
-whose run is visible in the run list, and dispatches each version at most once per
-poll, so a version whose failed run (a red canary, a refusal) is visible in the run
-list is not dispatched again. Re-running it is an operator step: dispatch the promote
-by hand on the TAG ref, which re-runs its canary too (replace `v1.2.3` with the release tag):
+pinned commit — before it promotes anything. The poll ignores dry runs and dispatches
+each version at most once per poll. A visible non-dry-run attempt prevents redispatch;
+a failed attempt logs that a human must inspect it. Re-running it is an operator step
+(replace `v1.2.3` with the release tag):
 
 ```bash
 gh workflow run release-promote.yml --ref v1.2.3 -f dry_run=false
@@ -292,7 +291,8 @@ on PASS — runs the promote block below, which it obtains as executable text fr
 `scripts/ci/canary-verdict.sh` (`--emit bash`, the same block a human would paste). A
 manual dispatch of `release-promote` defaults `dry_run` to `true`: it validates through
 block generation and prints the block, but does not test the move (the block's
-current-`latest` reads, refusals and moves run only under the token). The manual path
+current-`latest` reads, refusals and moves run only under the token). Its title ends
+with `(dry run)` and it does not suppress the poll's real promotion. The manual path
 below stays as the fallback; a failed run's recovery is
 [described below](#slice-2-flair1928--the-privileged-promote).
 
@@ -443,7 +443,8 @@ only for a tag whose copy of the workflow is the reviewed one.
 Until the environment exists, the poll dispatches nothing; if it exists without its
 `NPM_TOKEN`, the token step refuses with a named message and moves nothing. A manual
 run of `release-promote` with `dry_run` left at its default (`true`) needs no token: it
-validates through block generation without testing the move.
+validates through block generation without testing the move or suppressing automatic
+promotion.
 
 ### GitHub `adk-flair-publish` environment
 
@@ -512,7 +513,7 @@ the four pieces the privileged promote job (slice 2) stands on; it holds no npm 
   refused). It requires EVERY lockstep package `<name>@<version>` to be public and
   to re-derive the certified package-set digest (ALL-form: one missing/odd package
   is NOT READY, exit 0, the package named). Dispatch also requires the workflow
-  to exist, no visible run for the version, and passing settings checks.
+  to exist, no visible non-dry-run attempt for the version, and passing settings checks.
   Every run is a schedule run of the default branch's copy of the file, so
   `github.sha` is always a main sha. **The poll's outputs are
   never an input to what gets promoted** — the privileged job re-derives everything
@@ -556,13 +557,13 @@ inside the workflow, each a test in `test/unit/release-promote-workflow.test.ts`
   pinned to the canary's exact version (11.19.1), installed from a job directory and
   verified with `npm --version` before the registry reads and tag moves that follow;
   another version is a refusal.
-- **No redispatch of a visible run; at most once per poll.** The poll identifies a
-  version's run by the run-name `release-promote v<version>` (or its tag head branch),
-  across every page of the run list, and does not redispatch a version whose run is
-  visible there. Within one poll it dispatches each version at most once, whatever the
-  number of marker rows. A failed or uninterpretable run-list read is an error, never a
-  dispatch. It is a list-then-dispatch check, not a reservation: a run that is not yet
-  visible in the list is not seen.
+- **Non-dry-run attempts; at most once per poll.** Across all run-list pages, the
+  poll matches the title `release-promote v<version>`, without the `(dry run)` suffix.
+  Queued, in-progress or successfully completed runs prevent dispatch. Other matching
+  runs require human review without automatic redispatch. Within one poll it
+  dispatches each version at most once, whatever the number of marker rows. A failed
+  or uninterpretable run-list read is an error. This is a list-then-dispatch check,
+  not a reservation.
 
 **When the promote block fails.** Nothing is restored automatically (a restore cannot
 be told apart from clobbering a newer legitimate `latest`); the job fails and the run

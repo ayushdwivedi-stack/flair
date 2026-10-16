@@ -286,8 +286,8 @@ describe("release-promote — every re-derivation fails closed", () => {
     expect(dryStep?.if).toContain("inputs.dry_run == true");
   });
 
-  test("the run-name lets the poll identify a version's run", () => {
-    expect(wf["run-name"]).toBe("release-promote ${{ github.ref_name }}");
+  test("the run-name distinguishes dry runs from real promotions", () => {
+    expect(wf["run-name"]).toBe("release-promote ${{ github.ref_name }}${{ inputs.dry_run && ' (dry run)' || '' }}");
   });
 });
 
