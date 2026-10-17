@@ -520,8 +520,8 @@ describe("flair#2407 — a supplied embedding is replaced when redaction changes
     expect(summaryBody.embedding).toEqual(SUPPLIED);
   });
 
-  it("a supplied vector is kept when redaction changes nothing, or changes only `summary`", async () => {
-    const m = makeMemory(agentCtx(AGENT));
+  it("an administrator's supplied vector is kept when redaction changes nothing, or changes only `summary`", async () => {
+    const m = makeMemory(agentCtx(AGENT, true));
     const clean: any = await m.post({ agentId: AGENT, content: "a plain note about the deploy job", embedding: SUPPLIED, embeddingModel: "client-model" });
     const summaryOnly: any = await m.post({
       agentId: AGENT, content: "another plain note about the deploy job", summary: `uses ${SLACK_TOKEN}`, embedding: SUPPLIED, embeddingModel: "client-model",
@@ -534,6 +534,144 @@ describe("flair#2407 — a supplied embedding is replaced when redaction changes
     }
     expect(summaryOnly.redactedValues).toBe(1);
   });
+
+  it("a non-admin POST discards the supplied vector even when redaction changes nothing", async () => {
+    const m = makeMemory(agentCtx(AGENT));
+    const res: any = await m.post({ agentId: AGENT, content: "a plain note about the deploy job", embedding: SUPPLIED, embeddingModel: "client-model" });
+
+    const stored = await (BaseMemory as any).get(res.id);
+    expect(stored.embedding).toEqual(FAKE_EMBEDDING);
+    expect(stored.embeddingModel).toBe("mock-embedding-model");
+    expect(stored.embedding).not.toEqual(SUPPLIED);
+  });
+});
+
+describe("non-admin supplied embedding values", () => {
+  const cases = [
+    ["string", "x"],
+    ["object", { "0": 1 }],
+    ["null element", [null]],
+    ["empty array", []],
+    ["null", null],
+    ["vector", [0, 0, 0, 1]],
+  ] as const;
+
+  it("normalizes an empty embedding and preserves null before the discard helper", async () => {
+    const { hasSuppliedEmbedding, discardSuppliedVector, suppliesEmbeddingModel } = await import("../../resources/memory-supplied-vector.ts");
+    const { normalizeEmptyEmbedding } = await import("../../resources/memory-embedding-value.ts");
+    for (const embedding of [null, []]) {
+      const body = { embedding, embeddingModel: null };
+      normalizeEmptyEmbedding(body);
+      expect(hasSuppliedEmbedding(body.embedding)).toBe(false);
+      expect(discardSuppliedVector(body, { kind: "agent", agentId: AGENT, isAdmin: false }, { vector: false, stamp: suppliesEmbeddingModel(body) })).toBe(true);
+      expect(body.embedding).toBeNull();
+      expect(body).not.toHaveProperty("embeddingModel");
+    }
+  });
+
+  it("returns false when the supplied flags name absent fields", async () => {
+    const { discardSuppliedVector } = await import("../../resources/memory-supplied-vector.ts");
+    const body = {};
+    expect(discardSuppliedVector(body, { kind: "agent", agentId: AGENT, isAdmin: false }, { vector: true, stamp: true })).toBe(false);
+    expect(body).toEqual({});
+  });
+
+  it("returns true when it removes a present field", async () => {
+    const { discardSuppliedVector } = await import("../../resources/memory-supplied-vector.ts");
+    for (const body of [{ embedding: [1] }, { embeddingModel: undefined }]) {
+      expect(discardSuppliedVector(body, { kind: "agent", agentId: AGENT, isAdmin: false }, { vector: true, stamp: true })).toBe(true);
+      expect(body).not.toHaveProperty("embedding");
+      expect(body).not.toHaveProperty("embeddingModel");
+    }
+  });
+
+  for (const method of ["post", "put", "patch"] as const) {
+    for (const [label, embedding] of cases) {
+      it(`${method} handles ${label} embedding from a non-admin caller`, async () => {
+        const id = "supplied-embedding";
+        const m = makeMemory(agentCtx(AGENT));
+        const text = "new scheduling note";
+        if (method === "patch") {
+          memoryStore.set(id, {
+            id, agentId: AGENT, content: "old scheduling note", createdAt: new Date().toISOString(),
+            embedding: FAKE_EMBEDDING, embeddingModel: "mock-embedding-model",
+          });
+          m._targetId = id;
+        }
+        const result = await m[method]({ id, agentId: AGENT, content: text, embedding: structuredClone(embedding) });
+        expect(result instanceof Response && result.status >= 400).toBe(false);
+        const stored = memoryStore.get(id);
+        expect(stored.content).toBe(text);
+        if (method === "patch" && (embedding === null || (Array.isArray(embedding) && embedding.length === 0))) {
+          expect(stored.embedding).toBeNull();
+          expect(embedInputs).toEqual([]);
+        } else {
+          expect(stored.embedding).toEqual(FAKE_EMBEDDING);
+          expect(stored.embeddingModel).toBe("mock-embedding-model");
+          expect(embedInputs).toContain(text);
+        }
+      });
+    }
+  }
+});
+
+describe("flair#2573 — a vector or stamp counts as caller-supplied only when it differs from the stored row's", () => {
+  const STORED = [0, 0, 0, 1];
+  const seedRow = (id: string) => memoryStore.set(id, {
+    id, agentId: AGENT, content: "stored note about the deploy job", createdAt: new Date().toISOString(),
+    embedding: STORED, embeddingModel: "foreign-stamp",
+  });
+
+  it("suppliedVectorFlags compares against the stored row; a create supplies everything present", async () => {
+    const { suppliedVectorFlags } = await import("../../resources/memory-supplied-vector.ts");
+    const stored = { embedding: STORED, embeddingModel: "foreign-stamp" };
+    expect(suppliedVectorFlags({ embedding: [...STORED], embeddingModel: "foreign-stamp" }, stored)).toEqual({ vector: false, stamp: false });
+    expect(suppliedVectorFlags({ embedding: [...STORED], embeddingModel: "other" }, stored)).toEqual({ vector: false, stamp: true });
+    expect(suppliedVectorFlags({ embedding: [1, 1, 1, 1], embeddingModel: "foreign-stamp" }, stored)).toEqual({ vector: true, stamp: false });
+    expect(suppliedVectorFlags({ embedding: [...STORED], embeddingModel: "foreign-stamp" }, null)).toEqual({ vector: true, stamp: true });
+    expect(suppliedVectorFlags({ embedding: new Float32Array(STORED) }, stored)).toEqual({ vector: false, stamp: false });
+  });
+
+  for (const method of ["put", "patch"] as const) {
+    it(`a non-admin ${method} re-sending the stored vector and stamp keeps both with no re-embed`, async () => {
+      seedRow("carried");
+      const m: any = makeMemory(agentCtx(AGENT));
+      m._targetId = "carried";
+      const body: any = { id: "carried", agentId: AGENT, content: "stored note about the deploy job", embedding: [...STORED], embeddingModel: "foreign-stamp" };
+      const result = await m[method](body);
+      expect(result instanceof Response && result.status >= 400).toBe(false);
+      const stored = memoryStore.get("carried");
+      expect(stored.embedding).toEqual(STORED);
+      expect(stored.embeddingModel).toBe("foreign-stamp");
+      expect(embedInputs).toEqual([]);
+    });
+
+    it(`a non-admin ${method} re-sending the stored vector with a different stamp keeps the stored stamp`, async () => {
+      seedRow("restamp");
+      const m: any = makeMemory(agentCtx(AGENT));
+      m._targetId = "restamp";
+      const body: any = { id: "restamp", agentId: AGENT, content: "stored note about the deploy job", embedding: [...STORED], embeddingModel: "mock-embedding-model" };
+      const result = await m[method](body);
+      expect(result instanceof Response && result.status >= 400).toBe(false);
+      const stored = memoryStore.get("restamp");
+      expect(stored.embedding).toEqual(STORED);
+      expect(stored.embeddingModel).toBe("foreign-stamp");
+    });
+
+    it(`a non-admin ${method} with a vector that differs from the stored one is discarded`, async () => {
+      seedRow("differs");
+      const m: any = makeMemory(agentCtx(AGENT));
+      m._targetId = "differs";
+      const other = [1, 1, 1, 1];
+      const body: any = { id: "differs", agentId: AGENT, content: "stored note about the deploy job", embedding: other, embeddingModel: "foreign-stamp" };
+      const result = await m[method](body);
+      expect(result instanceof Response && result.status >= 400).toBe(false);
+      const stored = memoryStore.get("differs");
+      expect(stored.embedding).not.toEqual(other);
+      // A PUT re-embeds the text; a PATCH that changes no text keeps the stored vector.
+      expect(stored.embedding).toEqual(method === "put" ? FAKE_EMBEDDING : STORED);
+    });
+  }
 });
 
 describe("flair#2407 — a deduplicated feed write reports the count in its response only", () => {

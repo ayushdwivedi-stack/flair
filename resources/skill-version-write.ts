@@ -9,6 +9,7 @@ import { SKILL_TAG, enforceSkillDurability, skillEmbedText, skillMetadataHasDupl
 import { stripUndeclaredMemoryAttributes } from "./memory-declared-attributes.js";
 import { skillWriteSource } from "./skill-write-policy.js";
 import type { AgentAuthVerdict } from "./agent-auth.js";
+import { keepsSuppliedVector } from "./memory-supplied-vector.js";
 import { FORBIDDEN } from "./record-type-kit.js";
 import { PRIVATE_VISIBILITY, SHARED_VISIBILITY } from "./memory-visibility.js";
 import { maybeThrowSkillWriteFault } from "./skill-write-fault.js";
@@ -76,12 +77,10 @@ export async function closedSkillPayloadReadable(
 }
 
 /**
- * Build the successor Memory row for a superseded skill. It carries the
- * predecessor's fields (a partial body merges over them), a fresh physical id,
- * the carried `skillSubjectId`, `supersedes`, a fresh incarnation token, and no
- * closed-row markers. Declared attributes only.
+ * Build the successor Memory row for a superseded skill. Retains declared and explicitly allowed fields.
  */
 export function buildSkillSuccessorRow(args: {
+  auth: AgentAuthVerdict;
   base: any;
   predecessorRow: Record<string, any> | null;
   successorId: string;
@@ -89,8 +88,13 @@ export function buildSkillSuccessorRow(args: {
   supersedes: string | null;
   now: string;
 }): Record<string, any> {
-  const { base, predecessorRow, successorId, subjectId, supersedes, now } = args;
+  const { auth, base, predecessorRow, successorId, subjectId, supersedes, now } = args;
   const row: Record<string, any> = predecessorRow ? { ...predecessorRow, ...base } : { ...base };
+  if (!keepsSuppliedVector(auth)) {
+    for (const field of ["embedding", "embeddingModel"]) {
+      if (!Object.prototype.hasOwnProperty.call(base, field)) delete row[field];
+    }
+  }
   row.id = successorId;
   row.skillSubjectId = subjectId;
   if (supersedes) row.supersedes = supersedes;
@@ -138,7 +142,7 @@ export function skillWriteConflict(error: string): Response {
   return Response.json({ error }, { status: 409 });
 }
 
-export async function prepareSkillBody(content: any, stored: Record<string, any> | null) {
+export async function prepareSkillBody(content: any, stored: Record<string, any> | null, auth: AgentAuthVerdict) {
   let predecessor: any = null;
   if (typeof content.supersedes === "string" && content.supersedes.length > 0) {
     // flair#2307: a failed read of the `supersedes` target refuses the write
@@ -179,6 +183,12 @@ export async function prepareSkillBody(content: any, stored: Record<string, any>
   // is never kept. A Feed successor stores this value; Memory.post()/put() keep
   // it when they store the carried vector, and otherwise set their own.
   const sourceHasVector = Array.isArray(source.embedding) && source.embedding.length > 0;
+  // Non-admin writes keep a carried vector's stored stamp. Administrator and
+  // trusted in-process writes may replace it and may supply their own vector.
+  if (!keepsSuppliedVector(auth) && content.embedding === undefined && sourceHasVector && textUnchanged) {
+    if (source.embeddingModel === undefined) delete effective.embeddingModel;
+    else effective.embeddingModel = source.embeddingModel;
+  }
   effective.embeddedContentHash = sourceHasVector && content.embedding === undefined && textUnchanged
     ? (source.embeddedContentHash ?? null)
     : null;

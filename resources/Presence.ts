@@ -755,7 +755,7 @@ export class Presence extends (databases as any).flair.Presence {
 
   /**
    * PUT/DELETE are not part of the agent heartbeat contract (writes go through
-   * POST, which carries its own Ed25519 auth). GET is intentionally public and
+   * POST, which carries its own Ed25519 auth). GET is gated in get() (verified reader by default) and
    * allowCreate=true lets POST self-auth — but those bypasses must NOT extend to
    * PUT/DELETE. The non-rejecting gate would otherwise let anonymous PUT/DELETE
    * straight to Harper's default handler (the leak this closes). Require a verified
