@@ -29,10 +29,10 @@ export interface PresenceWireRecord {
 export const PRESENCE_SEND_FLAG_ENV = "FLAIR_FEDERATION_PRESENCE_SEND";
 
 /** The allowance the receiver grants an inbound Presence stamp ahead of its own
- *  clock. The send side applies the same value so such a row never enters a
- *  batch. A unit test asserts it equals the receiver's
- *  PRESENCE_FUTURE_ALLOWANCE_MS (resources/presence-receipt.ts), which src/
- *  cannot import. */
+ *  clock. The send side applies the same value to its scan time, so a row
+ *  stamped further ahead is left out of the batch. A unit test asserts it equals
+ *  the receiver's PRESENCE_FUTURE_ALLOWANCE_MS (resources/presence-receipt.ts),
+ *  which src/ cannot import. */
 export const PRESENCE_SEND_FUTURE_ALLOWANCE_MS = 5 * 60 * 1000;
 
 /** How far behind the stored watermark a pass re-scans. A heartbeat stamped
