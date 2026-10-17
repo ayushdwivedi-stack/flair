@@ -6,7 +6,9 @@
   `updatedAt`, so its rows are selected by their own `lastHeartbeatAt` /
   `activityUpdatedAt` cursor against a per-table watermark kept on the local
   `Peer` row (`presenceLastSyncAt`); only rows whose `originatorInstanceId` is
-  this instance are sent, and only a confirmed batch advances the watermark. An
+  this instance are sent, and only a confirmed batch advances the watermark,
+  which never passes the time of the scan — a row dated more than 5 minutes
+  ahead is not sent. An
   admin `put()` that changes a declared field without advancing either
   timestamp waits for the agent's next heartbeat. With the flag off the sender
   behaves exactly as before.

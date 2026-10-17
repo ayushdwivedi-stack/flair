@@ -984,6 +984,11 @@ export async function runFederationSyncOnce(opts: any): Promise<{ pushed: number
     // failure returns before the watermark is persisted, so the rows re-offer.
     let presenceAdvanceMs: number | null = null;
     if (presenceSendEnabled()) {
+      // The receiver refuses a Presence stamp more than 5 minutes ahead of its
+      // own clock (resources/presence-receipt.ts, which src/ cannot import), so
+      // the same allowance keeps such a row out of the batch here.
+      const PRESENCE_SEND_FUTURE_ALLOWANCE_MS = 5 * 60 * 1000;
+      const presenceScanAtMs = Date.now();
       let presenceRows: any[];
       try {
         const presenceRes = await fetch(`${opsEndpoint}/`, {
@@ -1021,6 +1026,11 @@ export async function runFederationSyncOnce(opts: any): Promise<{ pushed: number
           presenceBatchBytes = 0;
         };
         for (const row of toSend) {
+          const cursor = presenceCursorMs(row);
+          // A row dated more than the receiver's future allowance past this
+          // scan is left out of the batch: the receiver would refuse it, and
+          // its cursor must not count toward the watermark.
+          if (cursor != null && cursor > presenceScanAtMs + PRESENCE_SEND_FUTURE_ALLOWANCE_MS) continue;
           const payload = presenceWireRecord(row, instance.id);
           if (!payload) continue;
           const sr = { ...payload, signature: signBody(payload, secretKey) };
@@ -1030,8 +1040,9 @@ export async function runFederationSyncOnce(opts: any): Promise<{ pushed: number
           }
           presenceBatch.push(sr);
           presenceBatchBytes += srBytes;
-          const cursor = presenceCursorMs(row);
-          if (cursor != null && cursor > advanceMs) advanceMs = cursor;
+          // The watermark never passes the scan time: a row sent with a cursor
+          // ahead of the scan advances it only to the scan time.
+          if (cursor != null && Math.min(cursor, presenceScanAtMs) > advanceMs) advanceMs = Math.min(cursor, presenceScanAtMs);
         }
         if (presenceBatch.length > 0) await flushPresence();
         presenceAdvanceMs = advanceMs;

@@ -10,6 +10,8 @@
  *     pushed as a signed v:2 Presence record keyed on agentId;
  *   - a non-home row is never pushed;
  *   - a row at or below the per-table watermark is not re-sent;
+ *   - a far-future row is not sent and cannot advance the watermark past the
+ *     scan time;
  *   - a confirmed batch advances the watermark (the local Peer row's
  *     presenceLastSyncAt), and a failed batch does not.
  *
@@ -175,6 +177,52 @@ describe("federation sync push — Presence sender (flair#2578 slice 2)", () => 
     expect(updates.length).toBe(1);
     expect(updates[0].body.records[0].id).toBe(HUB);
     expect(updates[0].body.records[0].presenceLastSyncAt).toBe(new Date(newest).toISOString());
+  });
+
+  it("flag ON: a far-future row is not sent, and the watermark never passes the scan time", async () => {
+    process.env[PRESENCE_SEND_FLAG_ENV] = "1";
+    installMock({ presenceLastSyncAt: SINCE });
+    const now = Date.now();
+    const farFuture = now + 1e9; // far beyond the receiver's 5-minute future allowance
+    const normal = now - 1_000;
+    presenceRows = [
+      homeRow({ agentId: "agent-future", lastHeartbeatAt: farFuture }),
+      homeRow({ agentId: "agent-normal", lastHeartbeatAt: normal }),
+    ];
+    const result = await run();
+    const scanAfter = Date.now();
+    expect(result.error).toBeUndefined();
+
+    // The far-future row is left out of the batch entirely.
+    expect(presenceRecords().map((r) => r.id)).toEqual(["agent-normal"]);
+    // The watermark advanced to the sent row's cursor, never past the scan time.
+    const updates = presenceUpdates();
+    expect(updates.length).toBe(1);
+    const saved = Date.parse(updates[0].body.records[0].presenceLastSyncAt);
+    expect(Number.isFinite(saved)).toBe(true);
+    expect(saved).toBeLessThanOrEqual(scanAfter);
+    expect(saved).toBe(normal);
+
+    // Second run: only the normal row's heartbeat moved forward — to a stamp
+    // ahead of the clock, still inside the allowance. It is pushed, and the
+    // watermark advances only to the scan time, not to the row's future stamp.
+    installMock({ presenceLastSyncAt: updates[0].body.records[0].presenceLastSyncAt });
+    const movedForward = now + 60_000;
+    presenceRows = [
+      homeRow({ agentId: "agent-future", lastHeartbeatAt: farFuture }),
+      homeRow({ agentId: "agent-normal", lastHeartbeatAt: movedForward }),
+    ];
+    const result2 = await run();
+    const scanAfter2 = Date.now();
+    expect(result2.error).toBeUndefined();
+    expect(presenceRecords().map((r) => r.id)).toEqual(["agent-normal"]);
+
+    const updates2 = presenceUpdates();
+    expect(updates2.length).toBe(1);
+    const saved2 = Date.parse(updates2[0].body.records[0].presenceLastSyncAt);
+    expect(Number.isFinite(saved2)).toBe(true);
+    expect(saved2).toBeLessThanOrEqual(scanAfter2);
+    expect(saved2).toBeLessThan(movedForward);
   });
 
   it("flag ON: a failed batch does not advance the watermark", async () => {
