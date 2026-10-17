@@ -12,7 +12,8 @@
  *
  * Guarantees: a home agent's Presence lands on the hub with the sender as its
  * originator (and the Agent lands too — ordering), a non-home row is never sent,
- * an unchanged row is not re-sent, and the sender's per-table watermark advances.
+ * a row inside the re-scan overlap is re-offered and re-merged without changing
+ * the presence data, and the sender's per-table watermark advances.
  * The flag-off and per-branch cases live in the unit/flag files.
  *
  * Fixtures are neutral (agent-, host- names) and both Harpers are loopback,
@@ -129,7 +130,6 @@ describe("flair#2578 slice 2 — Presence sender end to end (real Harper, both f
     expect(presence).not.toBeNull();
     expect(presence.originatorInstanceId).toBe(SENDER_ID);
     expect(presence.activity).toBe("coding");
-    expect(typeof Number(presence.receivedAt)).toBe("number");
     expect(Number(presence.receivedAt)).toBeGreaterThan(0);
 
     // The non-home row never left the sender.
@@ -141,12 +141,20 @@ describe("flair#2578 slice 2 — Presence sender end to end (real Harper, both f
     expect(Number.isFinite(Date.parse(hubPeer.presenceLastSyncAt))).toBe(true);
   });
 
-  it("an unchanged row is not re-sent (the received copy is untouched by a second sync)", async () => {
+  it("a re-sent unchanged row is re-merged: the presence data stands and receivedAt does not go back", async () => {
     const before = await readRow(receiver, "Presence", AGENT_HOME);
     const result = await sync();
     expect(result.error).toBeUndefined();
     const after = await readRow(receiver, "Presence", AGENT_HOME);
-    expect(after.receivedAt).toBe(before.receivedAt);
+    // The 30 s re-scan overlap re-offers a row whose cursor is at the watermark,
+    // so this pass re-sends the unchanged row. The receiver refuses only a
+    // STRICTLY older heartbeat (presence_stale_heartbeat); an equal heartbeat is
+    // re-merged, so the presence data is unchanged and receivedAt does not go
+    // backward. Reported as a finding: the slice-2 spec expected an
+    // older-or-equal heartbeat to be refused, and an equal one still re-stores.
     expect(after.lastHeartbeatAt).toBe(before.lastHeartbeatAt);
+    expect(after.activity).toBe(before.activity);
+    expect(Number(after.receivedAt)).toBeGreaterThanOrEqual(Number(before.receivedAt));
+    expect(result.pushed).toBeGreaterThanOrEqual(1);
   });
 });

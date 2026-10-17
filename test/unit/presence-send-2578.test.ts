@@ -10,12 +10,18 @@
 import { describe, expect, it } from "bun:test";
 import {
   PRESENCE_SEND_FLAG_ENV,
+  PRESENCE_SEND_FUTURE_ALLOWANCE_MS,
+  PRESENCE_SEND_RETRYABLE_SKIP_REASONS,
   presenceCursorMs,
   presenceSendEnabled,
   presenceWatermarkMs,
   presenceWireRecord,
   selectPresenceRowsToSend,
 } from "../../src/federation/presence-send.js";
+// Test-only imports: src/ cannot import resources/ (packaging), so the two
+// sender-side mirrors are pinned to the receiver's own definitions here.
+import { PRESENCE_FUTURE_ALLOWANCE_MS } from "../../resources/presence-receipt.js";
+import { SKIP_REASON_CLASS } from "../../resources/federation-classify.js";
 
 const ME = "flair_spoke_a";
 
@@ -115,5 +121,19 @@ describe("presence-send — wire record", () => {
   it("is null without a usable agentId or cursor", () => {
     expect(presenceWireRecord({ lastHeartbeatAt: 1, originatorInstanceId: ME }, ME)).toBeNull();
     expect(presenceWireRecord({ agentId: "a", originatorInstanceId: ME }, ME)).toBeNull();
+  });
+});
+
+describe("presence-send — sender mirrors of receiver rules", () => {
+  it("the send-side future allowance equals the receiver's", () => {
+    expect(PRESENCE_SEND_FUTURE_ALLOWANCE_MS).toBe(PRESENCE_FUTURE_ALLOWANCE_MS);
+  });
+
+  it("the retryable skip-reason set equals the receiver's retryable subset", () => {
+    const receiverRetryable = Object.entries(SKIP_REASON_CLASS)
+      .filter(([, cls]) => cls === "retryable")
+      .map(([reason]) => reason)
+      .sort();
+    expect([...PRESENCE_SEND_RETRYABLE_SKIP_REASONS].sort()).toEqual(receiverRetryable);
   });
 });

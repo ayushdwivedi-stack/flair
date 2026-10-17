@@ -1,7 +1,7 @@
 - **Office-wide Presence, slice 2: a spoke can push its agents' presence,
   behind a default-off flag.**
   `FLAIR_FEDERATION_PRESENCE_SEND` (default off) makes `flair federation sync`
-  push the `Presence` rows of agents homed on this instance to its hub, after
+  push this instance's `Presence` rows to its hub, after
   the `Memory`, `Soul`, `Agent` and `Relationship` tables. `Presence` has no
   `updatedAt`, so its rows are selected by their own `lastHeartbeatAt` /
   `activityUpdatedAt` cursor against a per-table watermark kept on the local

@@ -45,6 +45,9 @@ import {
   presenceSendEnabled,
   presenceWatermarkMs,
   presenceWireRecord,
+  PRESENCE_SEND_FUTURE_ALLOWANCE_MS,
+  PRESENCE_SEND_OVERLAP_MS,
+  PRESENCE_SEND_RETRYABLE_SKIP_REASONS,
   selectPresenceRowsToSend,
 } from "../federation/presence-send.js";
 import {
@@ -729,6 +732,24 @@ export function parseSyncBatchCounts(body: unknown, batchSize: number): { merged
   return { merged, skipped };
 }
 
+/** One receiver-authored refusal from a FederationSync batch: which record the
+ *  receiver refused and under which name. Only well-formed entries are kept; a
+ *  refused field that is absent or not an array of {table,id,reason} strings is
+ *  ignored (the sender acts on a retryable name, never on a shape it invented). */
+export function parseSyncBatchRefused(body: unknown): Array<{ table: string; id: string; reason: string }> {
+  if (body === null || typeof body !== "object" || Array.isArray(body)) return [];
+  const refused = (body as { refused?: unknown }).refused;
+  if (!Array.isArray(refused)) return [];
+  const out: Array<{ table: string; id: string; reason: string }> = [];
+  for (const entry of refused) {
+    if (entry === null || typeof entry !== "object") continue;
+    const { table, id, reason } = entry as { table?: unknown; id?: unknown; reason?: unknown };
+    if (typeof table !== "string" || typeof id !== "string" || typeof reason !== "string") continue;
+    out.push({ table, id, reason });
+  }
+  return out;
+}
+
 export async function runFederationSyncOnce(opts: any): Promise<{ pushed: number; skipped: number; error?: Error }> {
   const target = resolveTarget(opts);
   const baseUrl = target ? target.replace(/\/$/, "") : undefined;
@@ -795,7 +816,7 @@ export async function runFederationSyncOnce(opts: any): Promise<{ pushed: number
     // a healthy 50-record batch merges in <2s — so a trip means a real stall,
     // and we split-and-retry rather than wait it out.
     const BATCH_TIMEOUT_MS = 45_000;
-    async function sendBatch(batch: any[]): Promise<{ merged: number; skipped: number }> {
+    async function sendBatch(batch: any[]): Promise<{ merged: number; skipped: number; refused: Array<{ table: string; id: string; reason: string }> }> {
       if (!secretKey) secretKey = await loadInstanceSecretKey(instance.id, opts);
       const syncBody: Record<string, any> = { instanceId: instance.id, records: batch, lamportClock: Date.now() };
       const signedSyncBody = signBodyFresh(syncBody, secretKey);
@@ -809,7 +830,7 @@ export async function runFederationSyncOnce(opts: any): Promise<{ pushed: number
         const mid = Math.floor(batch.length / 2);
         const left = await sendBatch(batch.slice(0, mid));
         const right = await sendBatch(batch.slice(mid));
-        return { merged: left.merged + right.merged, skipped: left.skipped + right.skipped };
+        return { merged: left.merged + right.merged, skipped: left.skipped + right.skipped, refused: [...left.refused, ...right.refused] };
       };
 
       let syncRes: Response;
@@ -846,7 +867,7 @@ export async function runFederationSyncOnce(opts: any): Promise<{ pushed: number
           `Sync batch failed: invalid response (HTTP ${syncRes.status}, merged/skipped are not counts from 0 to ${batch.length})`,
         );
       }
-      return counts;
+      return { ...counts, refused: parseSyncBatchRefused(body) };
     }
 
     let totalBatches = 0;
@@ -980,14 +1001,14 @@ export async function runFederationSyncOnce(opts: any): Promise<{ pushed: number
     // select it. Home rows travel by their OWN per-table watermark on
     // lastHeartbeatAt / activityUpdatedAt, sent AFTER the generic tables so the
     // receiver's home binding (which reads the local Agent row) finds the agent.
-    // Only a successful batch advances the watermark: a scan, send or response
-    // failure returns before the watermark is persisted, so the rows re-offer.
+    // Only a successful, non-retryably-refused batch advances the watermark: a
+    // scan, send or response failure returns before the watermark is persisted,
+    // so the rows re-offer.
     let presenceAdvanceMs: number | null = null;
+    // The highest cursor the watermark may reach; lowered below any row the
+    // receiver refused for a retryable reason (F1).
+    let presenceCapMs = Number.POSITIVE_INFINITY;
     if (presenceSendEnabled()) {
-      // The receiver refuses a Presence stamp more than 5 minutes ahead of its
-      // own clock (resources/presence-receipt.ts, which src/ cannot import), so
-      // the same allowance keeps such a row out of the batch here.
-      const PRESENCE_SEND_FUTURE_ALLOWANCE_MS = 5 * 60 * 1000;
       const presenceScanAtMs = Date.now();
       let presenceRows: any[];
       try {
@@ -1011,7 +1032,14 @@ export async function runFederationSyncOnce(opts: any): Promise<{ pushed: number
         return { pushed: totalMerged, skipped: totalSkipped, error: err instanceof Error ? err : new Error(String(err)) };
       }
       const watermarkMs = presenceWatermarkMs(hub.presenceLastSyncAt);
-      const toSend = selectPresenceRowsToSend(presenceRows, instance.id, watermarkMs);
+      // Re-scan from the watermark minus a small overlap: a heartbeat stamped
+      // before this pass's scan time but committed after its SQL read is
+      // invisible to the pass that saves the watermark, so the overlap re-offers
+      // it next pass. A re-sent row is safe: the receiver refuses a STRICTLY
+      // older heartbeat as presence_stale_heartbeat, and an equal heartbeat
+      // re-merges (its receivedAt advances, the presence fields stand).
+      const scanFloorMs = Math.max(0, watermarkMs - PRESENCE_SEND_OVERLAP_MS);
+      const toSend = selectPresenceRowsToSend(presenceRows, instance.id, scanFloorMs);
       if (toSend.length > 0) {
         if (!secretKey) secretKey = await loadInstanceSecretKey(instance.id, opts);
         let presenceBatch: any[] = [];
@@ -1022,6 +1050,17 @@ export async function runFederationSyncOnce(opts: any): Promise<{ pushed: number
           totalMerged += result.merged;
           totalSkipped += result.skipped;
           totalBatches++;
+          // F1: a row the receiver refused for a reason a later re-offer can
+          // clear must stay above the watermark, so the next pass offers it
+          // again. Cap the watermark just below the oldest such row.
+          for (const refusal of result.refused) {
+            if (refusal.table !== "Presence") continue;
+            if (!PRESENCE_SEND_RETRYABLE_SKIP_REASONS.has(refusal.reason)) continue;
+            const sent = presenceBatch.find((r) => r.id === refusal.id);
+            if (!sent) continue;
+            const refusedCursor = Date.parse(sent.updatedAt);
+            if (Number.isFinite(refusedCursor)) presenceCapMs = Math.min(presenceCapMs, refusedCursor - 1);
+          }
           presenceBatch = [];
           presenceBatchBytes = 0;
         };
@@ -1045,7 +1084,7 @@ export async function runFederationSyncOnce(opts: any): Promise<{ pushed: number
           if (cursor != null && Math.min(cursor, presenceScanAtMs) > advanceMs) advanceMs = Math.min(cursor, presenceScanAtMs);
         }
         if (presenceBatch.length > 0) await flushPresence();
-        presenceAdvanceMs = advanceMs;
+        presenceAdvanceMs = Math.min(advanceMs, presenceCapMs);
       }
     }
 

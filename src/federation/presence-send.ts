@@ -28,6 +28,32 @@ export interface PresenceWireRecord {
 /** The send flag (default OFF). */
 export const PRESENCE_SEND_FLAG_ENV = "FLAIR_FEDERATION_PRESENCE_SEND";
 
+/** The allowance the receiver grants an inbound Presence stamp ahead of its own
+ *  clock. The send side applies the same value so such a row never enters a
+ *  batch. A unit test asserts it equals the receiver's
+ *  PRESENCE_FUTURE_ALLOWANCE_MS (resources/presence-receipt.ts), which src/
+ *  cannot import. */
+export const PRESENCE_SEND_FUTURE_ALLOWANCE_MS = 5 * 60 * 1000;
+
+/** How far behind the stored watermark a pass re-scans. A heartbeat stamped
+ *  before the scan time but committed after the SQL read is invisible to the
+ *  pass that saves the watermark; re-scanning from this overlap re-offers it on
+ *  the next pass. */
+export const PRESENCE_SEND_OVERLAP_MS = 30 * 1000;
+
+/** The receiver skip reasons a later re-offer of the same row can clear, so the
+ *  sender must not let its per-table watermark pass a row refused for one.
+ *  Mirrors the `retryable` subset of the receiver's SKIP_REASON_CLASS
+ *  (resources/federation-classify.ts), which src/ cannot import; a unit test
+ *  asserts the two sets are equal. */
+export const PRESENCE_SEND_RETRYABLE_SKIP_REASONS: ReadonlySet<string> = new Set([
+  "future_timestamp",
+  "unknown_originator_key",
+  "merge_target_changed",
+  "merge_error",
+  "presence_agent_not_replicated",
+]);
+
 /** Truthy: `1` / `true` / `yes` / `on`. Anything else — unset, empty, `false`,
  *  `0`, garbage — is OFF, so the default sends no Presence records. Same
  *  vocabulary as the receive flag (resources/presence-receipt). */
@@ -99,9 +125,10 @@ export function selectPresenceRowsToSend(
  * The unsigned wire record for one Presence row. This table keys on `agentId`,
  * so the record's `id` and `data.id` are the row's `agentId` (the shared batch
  * key check wants `data.id === record.id`) and `data.agentId` carries the same
- * value. `updatedAt` is the row's own cursor, so the receiver's future-timestamp
- * bound and the classifyRecord staleness check see a real time. Null when the
- * row has no usable `agentId` or cursor.
+ * value. `updatedAt` is the row's own cursor: the receiver's future-timestamp
+ * bound (classifyRecord's `future_timestamp`) is applied to it. classifyRecord's
+ * staleness check is `no_op_same_hash`, which needs a contentHash, so it never
+ * fires for this table. Null when the row has no usable `agentId` or cursor.
  */
 export function presenceWireRecord(
   row: Record<string, any>,
