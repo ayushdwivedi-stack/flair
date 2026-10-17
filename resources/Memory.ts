@@ -1813,8 +1813,10 @@ export class Memory extends (databases as any).flair.Memory {
   async post(content: any, context?: any) {
     // flair#2612: a POST body that is not a single JSON object — an array, null,
     // a string or a number — is refused here with a named 400 before any write
-    // path runs. Harper's collection create otherwise answers such a body with
-    // an unnamed 500.
+    // path runs. Without it, an array reaches Harper's collection create, which
+    // answers an unnamed 500 ("Can not create a record without an object"); null,
+    // a string or a number throws a TypeError inside post() itself, also an
+    // unnamed 500.
     const bodyDenial = guardObjectBody(content);
     if (bodyDenial) return bodyDenial;
     // flair#2141 S2: check the seed's fixed id against the operator-source

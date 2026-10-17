@@ -26,6 +26,8 @@ import { HARPER_STOP_BUDGET_MS, HarperInstance, startHarper, stopHarper } from "
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const REFUSAL = "body_must_be_object";
+// Memory refuses arrays, so the guard names a single JSON object only.
+const OBJECT_ONLY_MESSAGE = "the write body must be a JSON object";
 
 interface TestAgent { id: string; publicKey: string; secretKey: Uint8Array }
 function mkAgent(id: string): TestAgent {
@@ -107,7 +109,9 @@ describe("flair#2612 — a Memory POST body that is not a single JSON object is 
       : await send(agent, "POST", "/Memory", body);
     const text = await res.text();
     expect(res.status, `${label} → ${res.status}: ${text.slice(0, 300)}`).toBe(400);
-    expect(JSON.parse(text).error, `${label} error name: ${text.slice(0, 300)}`).toBe(REFUSAL);
+    const parsed = JSON.parse(text) as { error?: string; message?: string };
+    expect(parsed.error, `${label} error name: ${text.slice(0, 300)}`).toBe(REFUSAL);
+    expect(parsed.message, `${label} message: ${text.slice(0, 300)}`).toBe(OBJECT_ONLY_MESSAGE);
     const after = await memoryRowCount();
     expect(after, `${label} stored a row (before ${before}, after ${after})`).toBe(before);
   }
@@ -130,6 +134,25 @@ describe("flair#2612 — a Memory POST body that is not a single JSON object is 
 
   it("the administrator's array body is refused with the same named 400", async () => {
     await expectRefused("admin array", [{ id: `obj2612-adm-${randomUUID()}`, agentId: agent.id, content: "obj2612 admin array" }], true);
+  }, 60_000);
+
+  it("the refusal message names a JSON object only, never an array", async () => {
+    const res = await send(agent, "POST", "/Memory", [{ id: `obj2612-msg-${randomUUID()}`, agentId: agent.id, content: "obj2612 message" }]);
+    const text = await res.text();
+    expect(res.status, text.slice(0, 300)).toBe(400);
+    const parsed = JSON.parse(text) as { error?: string; message?: string };
+    expect(parsed.error, text.slice(0, 300)).toBe(REFUSAL);
+    expect(parsed.message, text.slice(0, 300)).toBe(OBJECT_ONLY_MESSAGE);
+  }, 60_000);
+
+  it("a POST with no body is refused with the named 400 and stores nothing", async () => {
+    const before = await memoryRowCount();
+    const res = await send(agent, "POST", "/Memory");
+    const text = await res.text();
+    expect(res.status, `no-body POST → ${res.status}: ${text.slice(0, 300)}`).toBe(400);
+    expect(JSON.parse(text).error, text.slice(0, 300)).toBe(REFUSAL);
+    const after = await memoryRowCount();
+    expect(after, `no-body POST stored a row (before ${before}, after ${after})`).toBe(before);
   }, 60_000);
 
   it("a single-object POST from an agent still stores", async () => {

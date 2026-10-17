@@ -908,3 +908,37 @@ describe("what each malformed id or body gets", () => {
     }
   }
 });
+
+describe("the body-guard message follows the caller's allowArrayObjects", () => {
+  // OrgEvent refuses an array at POST, PATCH and a single-record PUT
+  // (`allowArrayObjects` unset), and admits an array of records at a collection
+  // PUT (`allowArrayObjects: true`, resources/OrgEvent.ts). The refusal message
+  // says so: the array-admitting path keeps the collection-write wording it has
+  // today, and the refusing paths name a JSON object only.
+  const OBJECT_ONLY = "the write body must be a JSON object";
+  const COLLECTION = "the write body must be a JSON object, or an array of them for a collection write";
+
+  it("a POST whose body is not an object names a JSON object only", async () => {
+    const res = await sendRaw(agent, "POST", "/OrgEvent", '"abc"');
+    const text = await res.text();
+    expect(res.status, text.slice(0, 300)).toBe(400);
+    expect((JSON.parse(text) as { message: string }).message, text.slice(0, 300)).toBe(OBJECT_ONLY);
+  }, 30_000);
+
+  it("a PATCH whose body is not an object names a JSON object only", async () => {
+    const id = `oect-msg-patch-${randomUUID()}`;
+    await createOwn(agent, id);
+    const res = await sendRaw(agent, "PATCH", `/OrgEvent/${id}`, "42");
+    const text = await res.text();
+    expect(res.status, text.slice(0, 300)).toBe(400);
+    expect((JSON.parse(text) as { message: string }).message, text.slice(0, 300)).toBe(OBJECT_ONLY);
+  }, 30_000);
+
+  it("a PUT whose caller admits arrays keeps the collection-write wording", async () => {
+    const id = `oect-msg-put-${randomUUID()}`;
+    const res = await sendRaw(agent, "PUT", `/OrgEvent/${id}`, '"abc"');
+    const text = await res.text();
+    expect(res.status, text.slice(0, 300)).toBe(400);
+    expect((JSON.parse(text) as { message: string }).message, text.slice(0, 300)).toBe(COLLECTION);
+  }, 30_000);
+});
