@@ -73,15 +73,15 @@ export function unitTempBase(platform: NodeJS.Platform, env: NodeJS.ProcessEnv):
 /** The CI job limit the lane has to report inside (`timeout-minutes: 22`). */
 export const CI_JOB_LIMIT_MS = 22 * 60_000;
 /**
- * Reserved after the lane for the job's own steps: the runner's end-of-lane
- * guards and summary (measured at 4 ms over three runs, 2026-10-17) and the
- * Darwin skip-count step that follows the lane (`bun
+ * Reserved after the lane for the job's post-lane steps: the runner's
+ * end-of-lane guards and summary (measured at 4 ms over three runs, 2026-10-17)
+ * and the Darwin skip-count step that follows the lane (`bun
  * scripts/check-darwin-gated-tests.mjs`, measured 23–25 s over three runs), with
- * spare — 53 s measured across all the job's outside-lane steps (2026-09-29),
- * 67 s spare.
+ * spare.
  *
- * The setup steps no longer need it: `laneBudgetMsFromJobStart` subtracts their
- * measured time directly when the job records its start (flair#2619).
+ * Pre-lane setup is not part of this reserve: `laneBudgetMsFromJobStart`
+ * subtracts its measured time directly when the job records its start
+ * (flair#2619).
  */
 export const CI_OUTSIDE_LANE_MS = 120_000;
 /**
@@ -330,6 +330,33 @@ function parseShardArgs(args: readonly string[]): { index: number; of: number } 
   }
   if (index < 1 || index > of) throw new Error(`--shard must be 1..${of}, got ${index}. ${UNIT_LANE_USAGE}`);
   return { index, of };
+}
+
+/**
+ * What a lane invocation runs under (flair#2619): the limits the lane applies
+ * and the banner sentence naming its lane budget. `laneBudgetMsFromJobStart`
+ * sizes the budget from the job's recorded start; a keep-going invocation whose
+ * recorded start leaves no budget gets the `0` signal `runUnitSteps` reports as
+ * "budget exhausted before start". The main block calls this once.
+ */
+export function laneRunSetup(
+  invocation: UnitLaneInvocation,
+  env: NodeJS.ProcessEnv,
+  nowMs: number,
+): { limits?: Readonly<UnitLaneLimits>; mode: string } {
+  const derivedLaneBudgetMs = invocation.keepGoing
+    ? laneBudgetMsFromJobStart(env, nowMs)
+    : undefined;
+  const limits: Readonly<UnitLaneLimits> | undefined = invocation.limits
+    ? { ...invocation.limits, laneBudgetMs: derivedLaneBudgetMs ?? 0 }
+    : undefined;
+  const laneLimit = derivedLaneBudgetMs === undefined
+    ? "no lane budget left (the job is already spent)"
+    : `the lane after ${seconds(derivedLaneBudgetMs)}`;
+  const mode = invocation.keepGoing
+    ? `keep-going: every step runs and failures are summed at the end; a step is killed after ${seconds(STEP_TIMEOUT_MS)} (root unit tests: ${seconds(ROOT_STEP_TIMEOUT_MS)}) and ${laneLimit}`
+    : "fail-fast: stops at the first failing step; steps are not time-limited";
+  return { limits, mode };
 }
 
 /**
@@ -693,18 +720,7 @@ if (import.meta.main) {
       if (node.error || node.status !== 0) throw new Error("Node.js is required on PATH for builds and subprocess tests (see package.json engines).");
       // The lane budget follows this job's real elapsed time when its first step
       // recorded a start; without one, the fixed budget stands (flair#2619).
-      const derivedLaneBudgetMs = invocation.keepGoing
-        ? laneBudgetMsFromJobStart(process.env, Date.now())
-        : undefined;
-      const limits: Readonly<UnitLaneLimits> | undefined = invocation.limits
-        ? { ...invocation.limits, laneBudgetMs: derivedLaneBudgetMs ?? 0 }
-        : undefined;
-      const laneLimit = derivedLaneBudgetMs === undefined
-        ? "no lane budget left (the job is already spent)"
-        : `the lane after ${seconds(derivedLaneBudgetMs)}`;
-      const mode = invocation.keepGoing
-        ? `keep-going: every step runs and failures are summed at the end; a step is killed after ${seconds(STEP_TIMEOUT_MS)} (root unit tests: ${seconds(ROOT_STEP_TIMEOUT_MS)}) and ${laneLimit}`
-        : "fail-fast: stops at the first failing step; steps are not time-limited";
+      const { limits, mode } = laneRunSetup(invocation, process.env, Date.now());
       const shardNote = invocation.shard
         ? `; shard ${invocation.shard.index}/${invocation.shard.of} of the shared unit lane (the shared setup steps run in every shard; the rest are this shard's test-bearing steps, flair#2311)`
         : "";

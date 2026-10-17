@@ -16,6 +16,7 @@ import {
   STEP_TIMEOUT_MS,
   ciRequestsKeepGoing,
   laneBudgetMsFromJobStart,
+  laneRunSetup,
   parseUnitLaneArgs,
   runUnitSteps as runUnitStepsWithRuntime,
   unitEnvironment,
@@ -579,6 +580,49 @@ describe("shared unit lane", () => {
     expect(existsSync(marker)).toBe(false);
     expect(errors).toContain("budget exhausted before start");
     expect(errors).toContain("ran 0 of 2 steps, 0 failed, 2 not run");
+  });
+
+  test("the entrypoint applies the derived lane budget and names it in the banner (flair#2619)", () => {
+    const now = Date.UTC(2026, 9, 17, 15, 0, 0);
+    const invocation = parseUnitLaneArgs(["--keep-going"], {});
+
+    // A start 300 s ago: the banner names the derived budget and the lane runs
+    // under it.
+    const started = laneRunSetup(invocation, { [JOB_START_ENV]: String(now / 1000 - 300) }, now);
+    expect(started.limits?.laneBudgetMs).toBe(KEEP_GOING_LANE_BUDGET_MS - 300_000);
+    expect(started.mode).toContain("and the lane after 900 s");
+    const startedDir = fixture();
+    const startedMarker = join(startedDir, "ran");
+    const { result: startedCode } = captureErrors(() => runUnitSteps(
+      [{ name: "quick step", cwd: startedDir, args: ["-e", `require("node:fs").writeFileSync(${JSON.stringify(startedMarker)}, "x")`], files: [] }],
+      nodeBin(),
+      startedDir,
+      { keepGoing: true, limits: started.limits },
+    ));
+    expect(startedCode).toBe(0);
+    expect(existsSync(startedMarker)).toBe(true);
+
+    // No record: the fixed budget stands, and the banner names it.
+    const absent = laneRunSetup(invocation, {}, now);
+    expect(absent.limits?.laneBudgetMs).toBe(KEEP_GOING_LANE_BUDGET_MS);
+    expect(absent.mode).toContain("and the lane after 1200 s");
+
+    // A start near the job limit leaves nothing: the applied budget is the 0
+    // `runUnitSteps` reports as exhausted before start, and no step runs.
+    const spent = now - (KEEP_GOING_LANE_BUDGET_MS - LANE_MIN_BUDGET_MS + 1000);
+    const exhausted = laneRunSetup(invocation, { [JOB_START_ENV]: String(spent / 1000) }, now);
+    expect(exhausted.limits?.laneBudgetMs).toBe(0);
+    const spentDir = fixture();
+    const spentMarker = join(spentDir, "ran");
+    const { result: spentCode, errors } = captureErrors(() => runUnitSteps(
+      [{ name: "must not run", cwd: spentDir, args: ["-e", `require("node:fs").writeFileSync(${JSON.stringify(spentMarker)}, "x")`], files: [] }],
+      nodeBin(),
+      spentDir,
+      { keepGoing: true, limits: exhausted.limits },
+    ));
+    expect(spentCode).toBe(1);
+    expect(existsSync(spentMarker)).toBe(false);
+    expect(errors).toContain("budget exhausted before start");
   });
 
   test("the test-unit job records its start first and bounds its install step (flair#2619)", () => {
