@@ -1001,9 +1001,9 @@ export async function runFederationSyncOnce(opts: any): Promise<{ pushed: number
     // select it. Home rows travel by their OWN per-table watermark on
     // lastHeartbeatAt / activityUpdatedAt, sent AFTER the generic tables so the
     // receiver's home binding (which reads the local Agent row) finds the agent.
-    // Only a successful, non-retryably-refused batch advances the watermark: a
-    // scan, send or response failure returns before the watermark is persisted,
-    // so the rows re-offer.
+    // Only a successful batch advances the watermark: a scan, send or response
+    // failure returns before the watermark is persisted, so the rows re-offer;
+    // a retryable refusal caps how far it advances (F1).
     let presenceAdvanceMs: number | null = null;
     // The highest cursor the watermark may reach; lowered below any row the
     // receiver refused for a retryable reason (F1).
