@@ -157,10 +157,10 @@ export interface UnitLaneLimits {
   /** The limit for a step that sets no `timeoutMs` of its own. */
   stepTimeoutMs: number;
   /**
-   * A whole-lane budget. Unset means none. 0 (or less) is the signal from
-   * `laneBudgetMsFromJobStart` that the job's recorded start left no lane budget
-   * (flair#2619): the lane reports "budget exhausted before start" and runs no
-   * step.
+   * A whole-lane budget. Unset means none. 0 (or less) is the signal
+   * `laneRunSetup` passes when `laneBudgetMsFromJobStart` finds the job's
+   * recorded start left no lane budget (flair#2619): the lane reports "budget
+   * exhausted before start" and runs no step.
    */
   laneBudgetMs?: number;
 }
@@ -522,9 +522,9 @@ export function runUnitSteps(
   process.env.TMPDIR = laneTempRoot;
   process.env.FLAIR_UNIT_TEMP_ROOT = laneTempRoot;
   const laneBudgetMs = limits?.laneBudgetMs;
-  // A lane budget of 0 (or less) is `laneBudgetMsFromJobStart`'s signal that the
-  // job's recorded start left no lane budget (flair#2619): nothing runs and every
-  // step is reported under this distinct reason.
+  // A lane budget of 0 (or less) is the signal `laneRunSetup` passes when
+  // `laneBudgetMsFromJobStart` finds the job's recorded start left no lane budget
+  // (flair#2619): nothing runs and every step is reported under this distinct reason.
   const exhaustedBeforeStart = laneBudgetMs !== undefined && laneBudgetMs <= 0;
   const deadline = exhaustedBeforeStart ? 0 : laneBudgetMs === undefined ? Infinity : Date.now() + laneBudgetMs;
   const budgetRanOut = exhaustedBeforeStart

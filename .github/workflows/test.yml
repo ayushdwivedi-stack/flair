@@ -233,9 +233,9 @@ jobs:
           restore-keys: |
             bun-cache-${{ runner.os }}-
       # A hung install must fail as a named step, not eat the job (flair#2619):
-      # bound it below the job's own limit. 5 min, the bound the tarball smoke job
-      # already puts on the same install (smoke.yml); the local cold install this
-      # tree measured 8 s.
+      # bound it below the job's own limit. 5 min, the per-attempt bound smoke.yml's
+      # golden-path job puts on the same install (smoke.yml retries up to 3 times;
+      # this step does not); the local cold install this tree measured 8 s.
       - name: "Install dependencies"
         timeout-minutes: 5
         run: sfw bun install --frozen-lockfile
