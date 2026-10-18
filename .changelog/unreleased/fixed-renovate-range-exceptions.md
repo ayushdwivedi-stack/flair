@@ -1,0 +1,1 @@
+- **Renovate no longer forces pins for engine, peer, or PEP 621 runtime dependency ranges.** Docker digest pin updates join the Docker group.
