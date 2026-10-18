@@ -115,7 +115,7 @@ export class FeedMemories extends Resource {
       }
     }
 
-    const preparedSkill = await prepareSkillBody(content, existingRecord);
+    const preparedSkill = await prepareSkillBody(content, existingRecord, auth);
     if (preparedSkill instanceof Response) return preparedSkill;
     content = preparedSkill.content;
     let redactedValues = redactMemoryWrite(content).count;
@@ -229,6 +229,7 @@ export class FeedMemories extends Resource {
           if (predecessor && (!addressed || content.supersedes !== addressed.supersedes) && head?.id !== predecessor.id) return skillWriteConflict("skill_predecessor_stale");
           if (addressed && head?.id !== addressed.id) return skillWriteConflict("skill_target_stale");
           const successor = buildSkillSuccessorRow({
+            auth,
             base: { ...content, agentId: head?.agentId ?? agentId }, predecessorRow: head, successorId, subjectId,
             supersedes: head ? String(head.id) : null, now,
           });
