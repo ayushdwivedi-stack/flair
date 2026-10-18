@@ -524,7 +524,7 @@ export function runUnitSteps(
   const laneBudgetMs = limits?.laneBudgetMs;
   // A lane budget of 0 (or less) is the signal `laneRunSetup` passes when
   // `laneBudgetMsFromJobStart` finds the job's recorded start left no lane budget
-  // (flair#2619): nothing runs and every step is reported under this distinct reason.
+  // (flair#2619): nothing runs and the lane fails under this distinct reason.
   const exhaustedBeforeStart = laneBudgetMs !== undefined && laneBudgetMs <= 0;
   const deadline = exhaustedBeforeStart ? 0 : laneBudgetMs === undefined ? Infinity : Date.now() + laneBudgetMs;
   const budgetRanOut = exhaustedBeforeStart
@@ -619,11 +619,8 @@ export function runUnitSteps(
   const shardTimings: Array<{ index: number; of: number; ms: number }> = [];
   let completed = 0;
   for (const [index, step] of steps.entries()) {
-    if (step.shard && !step.files.length) {
-      console.log(`\n${step.name}: empty shard; skipped`);
-      completed++;
-      continue;
-    }
+    // Check the deadline before skipping an empty shard, so an exhausted lane
+    // runs no step (flair#2619).
     const remaining = deadline - Date.now();
     if (remaining < 1) {
       // The budget is spent before this step could start: it and every later
@@ -632,11 +629,16 @@ export function runUnitSteps(
       console.error(`\nUnit lane: ${budgetRanOut}; ${notRun.length} step${notRun.length === 1 ? "" : "s"} not run.`);
       if (!keepGoing) {
         runGuards();
-        console.error(`Unit lane failed: ${budgetRanOut} before ${step.name}. ${completed}/${steps.length} steps completed.`);
+        console.error(`Unit lane failed: ${budgetRanOut}${exhaustedBeforeStart ? "" : ` before ${step.name}`}. ${completed}/${steps.length} steps completed.`);
         return finish(1);
       }
       for (const skipped of notRun) stepFailures.push({ kind: "not-run", name: skipped.name, detail: budgetRanOut });
       break;
+    }
+    if (step.shard && !step.files.length) {
+      console.log(`\n${step.name}: empty shard; skipped`);
+      completed++;
+      continue;
     }
     console.log(`\n${step.name}${step.files.length ? ` (${step.files.length} files)` : ""}`);
     const stepStartedMs = Date.now();

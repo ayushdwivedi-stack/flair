@@ -582,6 +582,28 @@ describe("shared unit lane", () => {
     expect(errors).toContain("ran 0 of 2 steps, 0 failed, 2 not run");
   });
 
+  test("an exhausted lane runs no step even when the plan holds only empty shards (flair#2619)", () => {
+    const dir = fixture();
+    const empty = [1, 2].map(index => ({
+      name: `empty shard ${index}/2`,
+      cwd: dir,
+      args: [],
+      files: [],
+      shard: { index, of: 2 },
+    }));
+    const limits = { stepTimeoutMs: STEP_TIMEOUT_MS, laneBudgetMs: 0 };
+    const keepGoingRun = captureErrors(() => captureLogs(() => runUnitSteps(empty, nodeBin(), dir, { keepGoing: true, limits })));
+    expect(keepGoingRun.result.result).toBe(1);
+    expect(keepGoingRun.errors).toContain("budget exhausted before start");
+    expect(keepGoingRun.errors).toContain("ran 0 of 2 steps, 0 failed, 2 not run");
+    expect(keepGoingRun.result.logs).not.toContain("empty shard; skipped");
+    expect(keepGoingRun.result.logs).not.toContain("Unit lane passed");
+    const failFastRun = captureErrors(() => captureLogs(() => runUnitSteps(empty, nodeBin(), dir, { limits })));
+    expect(failFastRun.result.result).toBe(1);
+    expect(failFastRun.errors).toContain("Unit lane failed: budget exhausted before start. 0/2 steps completed.");
+    expect(failFastRun.result.logs).not.toContain("Unit lane passed");
+  });
+
   test("the entrypoint applies the derived lane budget and names it in the banner (flair#2619)", () => {
     const now = Date.UTC(2026, 9, 17, 15, 0, 0);
     const invocation = parseUnitLaneArgs(["--keep-going"], {});
