@@ -1,1 +1,1 @@
-- **Renovate no longer forces pins for engine, peer, or PEP 621 runtime dependency ranges.** Docker digest pin updates join the Docker group.
+- **Renovate stops forcing pins for engine, peer, and PEP 621 `project.dependencies` ranges.** Dockerfile and Compose digest-pin proposals join the Docker group.
