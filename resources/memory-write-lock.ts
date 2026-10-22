@@ -184,6 +184,32 @@ export function memoryLockKey(id: string | number): string[] {
   return [MEMORY_LOCK_NAMESPACE, String(id)];
 }
 
+/** Contexts whose caller already holds the Memory id locks for the write they
+ *  are about to perform (flair#2478 slice 1 part 2). A nested writer receives
+ *  the caller's transaction context: archive/restore passes it to Memory.put(),
+ *  manual promotion passes it to Memory.put() and the verdict stamp, so those
+ *  nested writes run inside the outer lock instead of taking the same key again
+ *  (a second `tryLock` on a key this thread holds would wait out the budget and
+ *  answer `memory_busy`). */
+const LOCK_HELD = Symbol.for("flair.memoryWriteLockHeld");
+
+/** Mark `context` as running under the caller's Memory id locks. The flag is a
+ *  global-registry symbol on the context object, so the resource modules that
+ *  receive the same transaction context see it even when Harper loads each
+ *  resource file as its own module instance. */
+export function markMemoryLockHeld(context: unknown): void {
+  if (context !== null && (typeof context === "object" || typeof context === "function")) {
+    (context as Record<symbol, unknown>)[LOCK_HELD] = true;
+  }
+}
+
+/** Did the caller already take the Memory id locks for this write? */
+export function memoryLockHeld(context: unknown): boolean {
+  return context !== null && (typeof context === "object" || typeof context === "function")
+    ? (context as Record<symbol, unknown>)[LOCK_HELD] === true
+    : false;
+}
+
 /** Record that `id`'s last owned write settled with an unknown outcome. Cleared
  *  only by process restart — there is no production clear path. */
 export function markMemoryWriteOutcomeUnknown(id: string | number): void {
