@@ -289,6 +289,7 @@ describe("flair#2764 — built CLI: flair rem nightly run-once lists the bounded
     cliListener = await startListener((line) => {
       if (line === "GET /Health") return { status: 200, body: "[]" };
       if (line === `GET /Memory?agentId=${AGENT_ID}`) return { status: 503, body };
+      if (line === `GET /Soul?agentId=${AGENT_ID}`) return { status: 200, body: "[]" };
       return { status: 404, body: `no route for ${line}` };
     });
   }, 120_000);
@@ -305,11 +306,12 @@ describe("flair#2764 — built CLI: flair rem nightly run-once lists the bounded
       if (debug) env.FLAIR_DEBUG = "1";
       const result = await runCli(["rem", "nightly", "run-once", "--agent", AGENT_ID, "--dry-run"], env);
       const detail = `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
-      expect(cliListener.seen, detail).toEqual(["GET /Health", `GET /Memory?agentId=${AGENT_ID}`]);
+      expect(cliListener.seen, detail).toEqual(["GET /Health", `GET /Memory?agentId=${AGENT_ID}`, `GET /Soul?agentId=${AGENT_ID}`]);
       const lines = result.stdout.split("\n");
       const errorsAt = lines.indexOf("Errors:");
       expect(errorsAt, detail).toBeGreaterThan(-1);
-      expect(lines[errorsAt + 1], detail).toBe(`  - snapshot: HTTP 503: store down ${"z".repeat(189)}...`);
+      expect(lines, detail).toContain(`Memories:   unknown (HTTP 503: store down ${"z".repeat(189)}...)`);
+      expect(lines[errorsAt + 1], detail).toBe(`  - memory-count: HTTP 503: store down ${"z".repeat(189)}...`);
       expect(result.stdout, detail).not.toContain("z".repeat(190));
       const debugLine = `[flair] GET /Memory answered HTTP 503; response body: ${JSON.stringify(body)}`;
       if (debug) expect(result.stderr.split("\n"), detail).toContain(debugLine);
