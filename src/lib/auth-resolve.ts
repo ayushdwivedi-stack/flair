@@ -89,16 +89,110 @@ import { resolveHome } from "./home.js";
  *     case — distinguishes "we had nothing to send" from "we sent
  *     something and it was rejected", which is exactly the signal
  *     `authedRequest` uses to decide whether tier 5 (the floor) applies.
+ *   - `body` (flair#2764): the response body as received, set by
+ *     `fromResponse`. The message carries only `describeHttpFailure`'s
+ *     bounded reason; code that classifies by the server's text reads the
+ *     body through `apiErrorBody`.
  */
 export class ApiHttpError extends Error {
   readonly status: number;
   readonly noCredentials: boolean;
-  constructor(status: number, message: string, noCredentials = false) {
+  readonly body: string | undefined;
+  constructor(status: number, message: string, noCredentials = false, body?: string) {
     super(message);
     this.name = "ApiHttpError";
     this.status = status;
     this.noCredentials = noCredentials;
+    this.body = body;
   }
+
+  /** The error for a non-2xx response, built from its body text. */
+  static fromResponse(status: number, body: string): ApiHttpError {
+    return new ApiHttpError(status, describeHttpFailure(status, body), false, body);
+  }
+}
+
+/** The most characters of server text an ApiHttpError message carries (flair#2764). */
+export const SERVER_TEXT_MAX_CHARS = 200;
+
+/**
+ * Server text as one line: each run of whitespace (line breaks included)
+ * becomes one space and the ends are trimmed, other control characters are
+ * removed, and text longer than SERVER_TEXT_MAX_CHARS characters is cut there
+ * and ends in "...".
+ */
+export function boundServerText(text: string): string {
+  const kept: string[] = [];
+  let space = false;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0)!;
+    if (/\s/.test(ch) || cp === 0x85) {
+      space = kept.length > 0;
+      continue;
+    }
+    if (cp <= 0x1f || (cp >= 0x7f && cp <= 0x9f)) continue;
+    if (space) {
+      kept.push(" ");
+      space = false;
+    }
+    kept.push(ch);
+    if (kept.length > SERVER_TEXT_MAX_CHARS) {
+      return `${kept.slice(0, SERVER_TEXT_MAX_CHARS).join("").trimEnd()}...`;
+    }
+  }
+  return kept.join("");
+}
+
+/**
+ * The message of an ApiHttpError built from a response body (flair#2764):
+ * `HTTP <status>`, then the body's named error when the body is a JSON object
+ * with an `error`, else `code`, else `message` string that boundServerText
+ * leaves non-empty; otherwise an excerpt of the body. Either one passes
+ * through boundServerText.
+ */
+export function describeHttpFailure(status: number, body: string): string {
+  let reason = "";
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    parsed = undefined;
+  }
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    for (const key of ["error", "code", "message"]) {
+      const value = (parsed as Record<string, unknown>)[key];
+      if (typeof value === "string") reason = boundServerText(value);
+      if (reason) break;
+    }
+  }
+  if (!reason) reason = boundServerText(body);
+  return reason ? `HTTP ${status}: ${reason}` : `HTTP ${status}`;
+}
+
+/**
+ * The full response body an ApiHttpError carries, for code that classifies a
+ * failure by the server's text; undefined for any other error (flair#2764).
+ */
+export function apiErrorBody(err: unknown): string | undefined {
+  return err instanceof ApiHttpError ? err.body : undefined;
+}
+
+/**
+ * With FLAIR_DEBUG set (any non-empty value), write the body of a failed
+ * response to stderr as one JSON string (flair#2764). `sendJsonRequest` calls
+ * it where it builds the error from the body. `env` and `write` are injectable
+ * for tests.
+ */
+export function emitHttpErrorBodyDebug(
+  method: string,
+  path: string,
+  status: number,
+  body: string,
+  env: Record<string, string | undefined> = process.env,
+  write: (s: string) => void = (s) => { process.stderr.write(s); },
+): void {
+  if (!env.FLAIR_DEBUG) return;
+  write(`[flair] ${method} ${path} answered HTTP ${status}; response body: ${JSON.stringify(body)}\n`);
 }
 
 // ─── Admin-pass file handling ───────────────────────────────────────────────
@@ -542,7 +636,8 @@ export async function sendJsonRequest(
         : "Set FLAIR_ADMIN_PASS (remote targets have no local admin-pass fallback).";
       throw new ApiHttpError(403, `HTTP 403: no credentials sent. ${hint}`, /* noCredentials */ true);
     }
-    throw new ApiHttpError(res.status, text || `HTTP ${res.status}`);
+    emitHttpErrorBodyDebug(method, url.pathname, res.status, text);
+    throw ApiHttpError.fromResponse(res.status, text);
   }
   if (!text) return { ok: true };
   return JSON.parse(text);

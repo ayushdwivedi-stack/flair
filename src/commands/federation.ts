@@ -29,6 +29,7 @@ import {
   rewriteFederationPairLocalAccessError,
 } from "../lib/federation-pair-access.js";
 import {
+  apiErrorBody,
   defaultAdminPassPath,
   isLocalBase,
   resolveAdminPassFromSources,
@@ -625,11 +626,11 @@ export function isFederationStatusAuthFailure(err: unknown): boolean {
     const status = (err as { status?: unknown }).status;
     if (status === 401 || status === 403) return true;
   }
-  const m = err instanceof Error
+  const m = apiErrorBody(err) || (err instanceof Error
     ? err.message
     : String(typeof err === "object" && err && "message" in err
       ? (err as { message?: unknown }).message ?? err
-      : err);
+      : err));
   return m.includes("missing_or_invalid_authorization") || /(?:^|\D)401(?:\D|$)/.test(m);
 }
 
@@ -645,11 +646,11 @@ export function isFederationStatusAuthRemedy(err: unknown): boolean {
   if (typeof err === "object" && "status" in err && (err as { status?: unknown }).status === 401) {
     return true;
   }
-  const m = err instanceof Error
+  const m = apiErrorBody(err) || (err instanceof Error
     ? err.message
     : String(typeof err === "object" && err && "message" in err
       ? (err as { message?: unknown }).message ?? err
-      : err);
+      : err));
   return m.includes("missing_or_invalid_authorization") || /(?:^|\D)401(?:\D|$)/.test(m);
 }
 

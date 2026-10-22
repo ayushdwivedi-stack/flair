@@ -59,6 +59,7 @@ import { dirname, resolve } from "node:path";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import { createSnapshot } from "./snapshot.js";
 import { resolveHome } from "../lib/home.js";
+import { apiErrorBody, boundServerText } from "../lib/auth-resolve.js";
 
 export const REM_PAUSE_FLAG = resolve(resolveHome(), ".flair", "rem.paused");
 export const REM_NIGHTLY_LOG = resolve(resolveHome(), ".flair", "logs", "rem-nightly.jsonl");
@@ -485,20 +486,20 @@ function asArray(raw: unknown): any[] {
 
 /**
  * Best-effort extraction of a readable message out of a thrown API error.
- * `apiCall` implementations (see `api()` in src/cli.ts) throw
- * `Error(responseBodyText)` for non-2xx HTTP responses — /ReflectMemories's
+ * `api()` (src/cli.ts) throws an ApiHttpError whose `body` is the response
+ * text for a non-2xx HTTP response with a body (flair#2764) — /ReflectMemories's
  * 503 (no backend configured) and 502 (distillation_failed) bodies are JSON
  * `{ error: string, detail?: string }`. Unwraps that shape into a single
- * string so distinct failure modes read distinctly in the audit log instead
- * of as a raw JSON blob; falls back to the raw input for network errors or
- * any other shape.
+ * bounded line so distinct failure modes read distinctly in the audit log
+ * instead of as a raw JSON blob; falls back to the error's message for network
+ * errors or any other shape.
  */
 function describeApiError(err: unknown): string {
   const message = typeof err === "string" ? err : (err as any)?.message ?? String(err);
   try {
-    const parsed = JSON.parse(message);
+    const parsed = JSON.parse(apiErrorBody(err) || message);
     if (parsed && typeof parsed === "object" && typeof parsed.error === "string") {
-      return parsed.detail ? `${parsed.error}: ${parsed.detail}` : parsed.error;
+      return boundServerText(parsed.detail ? `${parsed.error}: ${parsed.detail}` : parsed.error);
     }
   } catch {
     // Not a JSON error body — network error, plain string, etc.
@@ -507,7 +508,7 @@ function describeApiError(err: unknown): string {
 }
 
 function structuredApiError(err: unknown): string | null {
-  const message = typeof err === "string" ? err : (err as { message?: unknown })?.message;
+  const message = apiErrorBody(err) || (typeof err === "string" ? err : (err as { message?: unknown })?.message);
   if (typeof message !== "string") return null;
   try {
     const body = JSON.parse(message);
@@ -958,7 +959,7 @@ export async function runNightlyCycle(opts: RunnerOpts): Promise<RunnerResult> {
             distillAborted = true;
             break;
           }
-          errors.push(`distillation[${tag}]: ${describeApiError(err?.message ?? err)}`);
+          errors.push(`distillation[${tag}]: ${describeApiError(err)}`);
         }
       }
       // `candidates` is defined (even if empty) whenever distillation was
@@ -1002,7 +1003,7 @@ export async function runNightlyCycle(opts: RunnerOpts): Promise<RunnerResult> {
           if (isRemAbortedFailure(err)) {
             pushSkipOnce("distillation: aborted by operator (rem_aborted)");
             distillAborted = true;
-          } else errors.push(`distillation: ${describeApiError(err?.message ?? err)}`);
+          } else errors.push(`distillation: ${describeApiError(err)}`);
         }
       }
     }
@@ -1073,7 +1074,7 @@ export async function runNightlyCycle(opts: RunnerOpts): Promise<RunnerResult> {
             distillAborted = true;
             break;
           }
-          errors.push(`distillation[${tag}]: ${describeApiError(err?.message ?? err)}`);
+          errors.push(`distillation[${tag}]: ${describeApiError(err)}`);
         }
       }
       continuitySessions = distilled;
@@ -1112,7 +1113,7 @@ export async function runNightlyCycle(opts: RunnerOpts): Promise<RunnerResult> {
           autoPromoted = { promoted: promotedCount, skipped: skippedCount, incomplete: incompleteCount, unconfirmed: unconfirmedCount };
         }
       } catch (err: any) {
-        errors.push(`auto-promote: ${describeApiError(err?.message ?? err)}`);
+        errors.push(`auto-promote: ${describeApiError(err)}`);
       }
     }
   }
@@ -1183,7 +1184,7 @@ export async function runNightlyCycle(opts: RunnerOpts): Promise<RunnerResult> {
         errors.push("dedup: unexpected /MemoryDedupStats response shape");
       }
     } catch (err: any) {
-      errors.push(`dedup: ${describeApiError(err?.message ?? err)}`);
+      errors.push(`dedup: ${describeApiError(err)}`);
     }
   }
 
