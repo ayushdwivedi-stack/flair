@@ -65,14 +65,14 @@ afterAll(async () => {
 async function failWith(
   path: string,
   reply: Reply,
-  opts: { authHeader?: string; isLocal?: boolean } = { authHeader: "Basic fixture" },
+  opts: { authHeader?: string; isLocal?: boolean; signedOnly?: { keysDir: string } } = { authHeader: "Basic fixture" },
 ): Promise<ApiHttpError> {
   replies.set(`GET ${path}`, reply);
   const url = new URL(path, `http://127.0.0.1:${listener.port}`);
   expect(url.host).toBe(`127.0.0.1:${listener.port}`);
   let caught: unknown;
   try {
-    await sendJsonRequest(url, "GET", undefined, opts.authHeader, opts.isLocal ?? true);
+    await sendJsonRequest(url, "GET", undefined, opts.authHeader, opts.isLocal ?? true, { signedOnly: opts.signedOnly });
   } catch (err) {
     caught = err;
   }
@@ -103,6 +103,13 @@ describe("flair#2764 — the reason a failed request prints", () => {
     const err = await failWith("/large", { status: 500, body });
     expect(err.message).toBe(`HTTP 500: ${"a".repeat(150)} ${"b".repeat(49)}...`);
     expect(err.body).toBe(body);
+  });
+
+  test("a zero-length error response prints the status alone, and the error's body is empty", async () => {
+    const err = await failWith("/empty", { status: 500, body: "" });
+    expect(err.message).toBe("HTTP 500");
+    expect(err.body).toBe("");
+    expect(err.noCredentials).toBe(false);
   });
 
   test("a body with newlines and control characters prints one clean line", async () => {
@@ -145,19 +152,23 @@ describe("flair#2764 — the reason a failed request prints", () => {
     ]);
   });
 
-  test("the no-credentials 403 keeps main's hint text byte for byte", async () => {
-    const reply = { status: 403, body: JSON.stringify({ error: "forbidden" }) };
-    const local = await failWith("/no-creds-local", reply, { isLocal: true });
-    expect(local.message).toBe(
-      "HTTP 403: no credentials sent. Set FLAIR_ADMIN_PASS, or run `flair init` to provision ~/.flair/admin-pass or an agent key.",
-    );
-    const remote = await failWith("/no-creds-remote", reply, { isLocal: false });
-    expect(remote.message).toBe(
-      "HTTP 403: no credentials sent. Set FLAIR_ADMIN_PASS (remote targets have no local admin-pass fallback).",
-    );
-    for (const err of [local, remote]) {
-      expect(err.status).toBe(403);
-      expect(err.noCredentials).toBe(true);
+  test("the no-credentials 403 keeps main's hint text byte for byte, with a JSON body and a zero-length body", async () => {
+    const cases: Array<[string, { isLocal: boolean; signedOnly?: { keysDir: string } }, string]> = [
+      ["local", { isLocal: true }, "HTTP 403: no credentials sent. Set FLAIR_ADMIN_PASS, or run `flair init` to provision ~/.flair/admin-pass or an agent key."],
+      ["remote", { isLocal: false }, "HTTP 403: no credentials sent. Set FLAIR_ADMIN_PASS (remote targets have no local admin-pass fallback)."],
+      [
+        "signed-only",
+        { isLocal: true, signedOnly: { keysDir: "/fixture/keys" } },
+        "HTTP 403: no credentials sent. This request can send only an Ed25519 agent signature; the admin password is not sent on this path. Provide the key of an agent registered on the target instance at /fixture/keys/<agent-id>.key.",
+      ],
+    ];
+    for (const [shape, body] of [["json", JSON.stringify({ error: "forbidden" })], ["empty", ""]] as const) {
+      for (const [name, opts, expected] of cases) {
+        const err = await failWith(`/no-creds-${name}-${shape}`, { status: 403, body }, opts);
+        expect(err.message, `${name}, ${shape} body`).toBe(expected);
+        expect(err.status).toBe(403);
+        expect(err.noCredentials).toBe(true);
+      }
     }
   });
 });
