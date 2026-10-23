@@ -24,7 +24,10 @@
  * admin:<adminPass>`, default {@link STUB_ADMIN_PASS}) and answers 401 to any
  * other request. `signed` also accepts an `Authorization` header that starts
  * with `TPS-Ed25519 `, answers 403 to a request with no `Authorization`
- * header, and 401 to any other request.
+ * header, and 401 to any other request. The admin-only
+ * `/AdminMemoryCandidates` route serves only the admin credential: in `signed`
+ * mode it answers a `TPS-Ed25519 ` request 403, as Harper answers a verified
+ * non-admin agent, and any other request 401.
  */
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -59,6 +62,7 @@ export interface StubSeed {
    * also accepts a `TPS-Ed25519 ` signature, and answers a request with no
    * `Authorization` header at all with 403, as a gated resource does: that is
    * the answer the shared resolver's agent-key fallback engages on.
+   * `/AdminMemoryCandidates` is the exception (see the module comment).
    */
   auth?: "admin-basic" | "signed";
 }
@@ -95,13 +99,22 @@ const authKind = (req) => {
   if (h.startsWith("Basic ")) return "basic";
   return h.startsWith("TPS-Ed25519 ") ? "signature" : "other";
 };
-// The status a request gets: 403 only for a credential-less request to a
-// signed-accepting instance, which is what the resolver's fallback reads.
+// The status a request outside the admin route gets: 403 only for a
+// credential-less request to a signed-accepting instance, which is what the
+// resolver's fallback reads.
 const refusal = (req) => {
   const h = req.headers.get("authorization");
   if (h === expectedAuth) return 0;
   if (seed.auth === "signed" && h?.startsWith("TPS-Ed25519 ")) return 0;
   if (seed.auth === "signed" && !h) return 403;
+  return 401;
+};
+// The admin route's status: a signature in signed mode stands for a verified
+// non-admin agent, which Harper refuses 403.
+const adminRouteRefusal = (req) => {
+  const h = req.headers.get("authorization");
+  if (h === expectedAuth) return 0;
+  if (seed.auth === "signed" && h?.startsWith("TPS-Ed25519 ")) return 403;
   return 401;
 };
 // Neither step can throw, so every request reaches its log line.
@@ -127,14 +140,14 @@ async function httpFetch(req) {
   const url = new URL(req.url);
   const text = await readText(req);
   log({ endpoint: "http", method: req.method, path: url.pathname, auth: authKind(req) });
-  const refused = refusal(req);
+  const [table, rawId] = url.pathname.split("/").filter(Boolean);
+  const refused = table === "AdminMemoryCandidates" ? adminRouteRefusal(req) : refusal(req);
   if (refused) return new Response(refused === 403 ? "forbidden" : "unauthorized", { status: refused });
   const body = parseJson(text);
   if (req.method === "PUT" && body === undefined) return new Response("malformed body", { status: 400 });
   if (seed.redirectWritesTo && (req.method === "PUT" || req.method === "DELETE")) {
     return new Response(null, { status: 307, headers: { location: seed.redirectWritesTo + url.pathname } });
   }
-  const [table, rawId] = url.pathname.split("/").filter(Boolean);
   if (table === "AdminMemoryCandidates") {
     const agent = decodeURIComponent(rawId ?? "");
     const requested = Number(url.searchParams.get("limit") ?? 200);

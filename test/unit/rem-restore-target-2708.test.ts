@@ -242,6 +242,27 @@ describe("flair#2708 — rem restore target (CLI)", () => {
     expect(b.requests().filter((r) => r.auth !== undefined)).toEqual([]);
   }, 60_000);
 
+  test("a signed stub answers a signed request to the admin candidate route 403 and serves an admin request", async () => {
+    const b = await startInstance({ ...driftedSeed(), auth: "signed" });
+    const route = `${b.httpUrl}/AdminMemoryCandidates/${AGENT_ID}`;
+    const signature = { Authorization: `TPS-Ed25519 ${AGENT_ID}:0:nonce:signature` };
+
+    const signed = await fetch(route, { headers: signature, signal: AbortSignal.timeout(5_000) });
+    const anonymous = await fetch(route, { signal: AbortSignal.timeout(5_000) });
+    const admin = await fetch(route, {
+      headers: { Authorization: `Basic ${btoa(`admin:${STUB_ADMIN_PASS}`)}` },
+      signal: AbortSignal.timeout(5_000),
+    });
+    // The same signature still reads a signed-accepting route.
+    const memory = await fetch(`${b.httpUrl}/Memory?agentId=${AGENT_ID}`, { headers: signature, signal: AbortSignal.timeout(5_000) });
+
+    expect(signed.status).toBe(403);
+    expect(anonymous.status).toBe(401);
+    expect(admin.status).toBe(200);
+    expect(await admin.json()).toEqual({ candidates: [{ id: "c-1" }], hasMore: false });
+    expect(memory.status).toBe(200);
+  }, 60_000);
+
   test("the same --apply dry run on a loopback target sends the admin credential from FLAIR_ADMIN_PASS", async () => {
     const b = await startInstance();
     const { home, date } = await makeHome();

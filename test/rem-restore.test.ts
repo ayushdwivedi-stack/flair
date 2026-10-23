@@ -178,7 +178,9 @@ describe("applySnapshot — dry-run", () => {
       dryRun: true,
     });
     expect(r.status).toBe("failed");
-    expect(r.errors).toEqual(["fetch-current: GET /AdminMemoryCandidates returned an unexpected response shape"]);
+    expect(r.errors).toEqual([
+      "fetch-current: GET /AdminMemoryCandidates returned an unexpected response shape: candidates is not an array. No target rows were deleted or written.",
+    ]);
   });
 });
 
@@ -462,9 +464,77 @@ describe("applySnapshot — real restore", () => {
     expect(r.errors).toHaveLength(1);
     expect(r.errors[0]).toContain("GET /AdminMemoryCandidates");
     expect(r.errors[0]).toContain("Flair server 0.63.0");
-    expect(r.errors[0]).toContain("Nothing was deleted or written.");
+    expect(r.errors[0]).toContain("No target rows were deleted or written.");
     expect(calls.filter((c) => ["DELETE", "PUT", "POST", "PATCH"].includes(c.method))).toEqual([]);
   });
+
+  it("refuses listCandidates: false on a live restore before any request", async () => {
+    const snapshotPath = await makeTestSnapshot();
+    const { api, calls } = recordingApi({
+      "GET:/Memory": () => [{ id: "mem-1", agentId: "test-agent" }],
+      "GET:/Soul": () => [{ id: "soul-1", agentId: "test-agent" }],
+      "GET:/AdminMemoryCandidates": () => ({ candidates: [{ id: "cand-1" }], hasMore: false }),
+    });
+    const soul = recordingApi();
+
+    const r = await applySnapshot({
+      agentId: "test-agent",
+      snapshotPath,
+      flairVersion: "0.0.0-test",
+      apiCall: api,
+      soulApiCall: soul.api,
+      listCandidates: false,
+      preRestoreSnapshotRoot: snapshotRoot,
+      tmpRootOverride: testRoot,
+    });
+
+    expect(calls.filter((c) => ["DELETE", "PUT", "POST", "PATCH"].includes(c.method))).toEqual([]);
+    expect(soul.calls).toEqual([]);
+    expect(calls).toEqual([]);
+    expect(r.status).toBe("failed");
+    expect(r.errors).toEqual([
+      "listCandidates: false is accepted only with dryRun: a live restore lists leftover MemoryCandidate rows before any delete. No request was sent to the target.",
+    ]);
+    expect(r.preRestoreSnapshotPath).toBeUndefined();
+  });
+
+  const malformedListings: Array<[string, unknown, string]> = [
+    ["a missing hasMore", { candidates: [{ id: "cand-1" }] }, "unexpected response shape: hasMore is missing or not a boolean"],
+    ["a non-boolean hasMore", { candidates: [{ id: "cand-1" }], hasMore: "false" }, "unexpected response shape: hasMore is missing or not a boolean"],
+    ["an entry without an id", { candidates: [{ id: "cand-1" }, {}], hasMore: false }, "unexpected response shape: candidates[1].id is not a non-empty string"],
+    ["a non-string id", { candidates: [{ id: 7 }], hasMore: false }, "unexpected response shape: candidates[0].id is not a non-empty string"],
+    ["hasMore true (the route has no paging)", { candidates: [{ id: "cand-1" }], hasMore: true }, "more than 500 leftover MemoryCandidate rows"],
+  ];
+  for (const [name, body, message] of malformedListings) {
+    it(`refuses a candidate listing with ${name} before any delete or write`, async () => {
+      const snapshotPath = await makeTestSnapshot();
+      const { api, calls } = recordingApi({
+        "GET:/Memory": () => [{ id: "mem-1", agentId: "test-agent" }],
+        "GET:/Soul": () => [{ id: "soul-1", agentId: "test-agent" }],
+        "GET:/AdminMemoryCandidates": () => body,
+      });
+      const soul = recordingApi();
+
+      const r = await applySnapshot({
+        agentId: "test-agent",
+        snapshotPath,
+        flairVersion: "0.0.0-test",
+        apiCall: api,
+        soulApiCall: soul.api,
+        preRestoreSnapshotRoot: snapshotRoot,
+        tmpRootOverride: testRoot,
+      });
+
+      expect(calls.filter((c) => ["DELETE", "PUT", "POST", "PATCH"].includes(c.method))).toEqual([]);
+      expect(soul.calls).toEqual([]);
+      expect(r.status).toBe("failed");
+      expect(r.errors).toHaveLength(1);
+      expect(r.errors[0]).toStartWith("fetch-candidates: ");
+      expect(r.errors[0]).toContain(message);
+      expect(r.errors[0]).toMatch(/no target rows were deleted or written/i);
+      expect(r.deleted).toEqual({ memories: 0, souls: 0, candidates: 0 });
+    });
+  }
 });
 
 describe("applySnapshot — post-restore verification (detects silent write drift)", () => {

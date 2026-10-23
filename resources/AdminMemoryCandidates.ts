@@ -80,8 +80,9 @@ export class AdminMemoryCandidates extends Resource {
         candidates.push({ id: row.id });
       }
     } catch (err: any) {
+      console.error("AdminMemoryCandidates: MemoryCandidate query failed", err);
       return new Response(
-        JSON.stringify({ error: "memory_candidate_query_failed", message: err?.message ?? String(err) }),
+        JSON.stringify({ error: "memory_candidate_query_failed", message: "the MemoryCandidate query failed" }),
         { status: 500, headers: JSON_HEADERS },
       );
     }

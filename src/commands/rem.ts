@@ -1423,8 +1423,7 @@ export function register(program: Command): void {
           console.error(`Error: ${err.message}`);
           process.exit(1);
         }
-        // Candidates are only reachable through the operations API (Harper
-        // has no REST search_by_conditions route), so the dry-run candidate
+        // The candidate listing route is admin-only, so the dry-run candidate
         // count needs admin creds too. Dry-run treats reading the ambient
         // local admin-password file as best-effort (an unusable file leaves
         // it without an admin credential), while --apply requires creds (Soul

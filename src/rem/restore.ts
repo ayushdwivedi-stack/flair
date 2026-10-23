@@ -73,7 +73,8 @@ export interface RestoreOpts {
    * When false, the dry run does not list leftover candidates. Only a dry run
    * without an admin credential sets this: `GET /AdminMemoryCandidates` is
    * admin-only, so a signed-only dry run cannot read it. A live restore always
-   * lists (the CLI requires the admin credential).
+   * lists (the CLI requires the admin credential); one given `false` is
+   * refused before any request.
    */
   listCandidates?: boolean;
   /**
@@ -164,27 +165,41 @@ function olderServerCandidateRoute(err: unknown): boolean {
  * uses for its deletes and writes, so the listing and those operations reach
  * one endpoint. The route returns ids only; restore needs nothing else.
  */
-async function listAgentCandidates(apiCall: ApiCall, agentId: string): Promise<any[]> {
+async function listAgentCandidates(apiCall: ApiCall, agentId: string): Promise<Array<{ id: string }>> {
   const body = await apiCall(
     "GET",
     `/AdminMemoryCandidates/${encodeURIComponent(agentId)}?limit=${CANDIDATE_LIST_LIMIT}`,
   );
-  if (!body || typeof body !== "object" || !Array.isArray((body as any).candidates)) {
-    throw new Error("GET /AdminMemoryCandidates returned an unexpected response shape");
+  const defect = candidateListDefect(body);
+  if (defect) {
+    throw new Error(`GET /AdminMemoryCandidates returned an unexpected response shape: ${defect}. No target rows were deleted or written.`);
   }
-  if ((body as any).hasMore === true) {
+  // The route has no paging parameter, so a partial listing is refused.
+  if (body.hasMore === true) {
     throw new Error(
-      `the target holds more than ${CANDIDATE_LIST_LIMIT} leftover MemoryCandidate rows for agent ${agentId}; nothing was deleted or written`,
+      `the target holds more than ${CANDIDATE_LIST_LIMIT} leftover MemoryCandidate rows for agent ${agentId}; no target rows were deleted or written`,
     );
   }
-  return (body as any).candidates;
+  return body.candidates;
+}
+
+/** What is wrong with a candidate-route body, or null for `{ candidates: [{ id }], hasMore }`. */
+function candidateListDefect(body: any): string | null {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return "the body is not an object";
+  if (!Array.isArray(body.candidates)) return "candidates is not an array";
+  for (const [i, entry] of body.candidates.entries()) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return `candidates[${i}] is not an object`;
+    if (typeof entry.id !== "string" || entry.id.length === 0) return `candidates[${i}].id is not a non-empty string`;
+  }
+  if (typeof body.hasMore !== "boolean") return "hasMore is missing or not a boolean";
+  return null;
 }
 
 /** The operator message for a target that predates the admin candidate route. */
 function olderServerCandidateMessage(err: ApiHttpError): string {
   return `restore lists leftover MemoryCandidate rows through GET /AdminMemoryCandidates on the restore target, and the target answered HTTP ${err.status}. `
     + `That route is part of Flair server ${CANDIDATE_LIST_MIN_SERVER_VERSION}; upgrade the target to ${CANDIDATE_LIST_MIN_SERVER_VERSION} or newer, then retry. `
-    + "Nothing was deleted or written.";
+    + "No target rows were deleted or written.";
 }
 
 function parseJsonlSafe(text: string): any[] {
@@ -222,6 +237,15 @@ export async function applySnapshot(opts: RestoreOpts): Promise<RestoreResult> {
     retried: { memories: [] },
     errors,
   };
+
+  if (!opts.dryRun && opts.listCandidates === false) {
+    errors.push(
+      "listCandidates: false is accepted only with dryRun: a live restore lists leftover MemoryCandidate rows before any delete. "
+        + "No request was sent to the target.",
+    );
+    result.status = "failed";
+    return result;
+  }
 
   if (!existsSync(opts.snapshotPath)) {
     errors.push(`snapshot does not exist: ${opts.snapshotPath}`);
@@ -336,18 +360,16 @@ export async function applySnapshot(opts: RestoreOpts): Promise<RestoreResult> {
   // are not in the snapshot, but refuseLearnedSoulWrite matches claim text,
   // so a leftover row 403s Soul PUT after operator auth succeeds. A failed
   // candidate listing stops the restore before any delete.
-  let currentCandidates: any[] = [];
-  if (opts.listCandidates !== false) {
-    try {
-      currentCandidates = await listAgentCandidates(opts.apiCall, opts.agentId);
-    } catch (err: any) {
-      errors.push(
-        `fetch-candidates: ${olderServerCandidateRoute(err) ? olderServerCandidateMessage(err) : err?.message ?? String(err)}`,
-      );
-      result.status = "failed";
-      rmSync(tmp, { recursive: true, force: true });
-      return result;
-    }
+  let currentCandidates: Array<{ id: string }>;
+  try {
+    currentCandidates = await listAgentCandidates(opts.apiCall, opts.agentId);
+  } catch (err: any) {
+    errors.push(
+      `fetch-candidates: ${olderServerCandidateRoute(err) ? olderServerCandidateMessage(err) : err?.message ?? String(err)}`,
+    );
+    result.status = "failed";
+    rmSync(tmp, { recursive: true, force: true });
+    return result;
   }
   for (const m of currentMem) {
     if (!m?.id) continue;
