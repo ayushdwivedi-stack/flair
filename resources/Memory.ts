@@ -4185,22 +4185,30 @@ function checkedWriteIds(verb: "put" | "patch", input: CheckedMemoryWriteInput):
 
 function enterCheckedWrite(verb: "put" | "patch", held: MemoryWriteLockToken, tx: LockedMemoryTransaction, input: CheckedMemoryWriteInput): Promise<MemoryWriteReceipt> {
   let admission: LockedWriteAdmission;
+  let snapshot: CheckedMemoryWriteInput;
   try {
     if (!input || typeof input.id !== "string" || input.id.length === 0 ||
       input.content === null || typeof input.content !== "object" || Array.isArray(input.content)) {
       throw new TypeError("a checked Memory write names a string id and an object body");
     }
-    admission = admitLockedMemoryWrite(held, tx, memoryWriteLockStore(), checkedWriteIds(verb, input));
+    // One snapshot, taken before admission, decides the write set and is the
+    // write: a later change to the caller's input reaches neither.
+    snapshot = Object.freeze({
+      id: input.id,
+      content: { ...input.content },
+      confirmFields: Object.freeze([...(input.confirmFields ?? [])]),
+    });
+    admission = admitLockedMemoryWrite(held, tx, memoryWriteLockStore(), checkedWriteIds(verb, snapshot));
   } catch (error) {
     return Promise.reject(error);
   }
-  return admission.track(input.id, async (stage) => {
+  return admission.track(snapshot.id, async (stage) => {
     const getResource = (Memory as any).getResource;
     if (typeof getResource !== "function") throw new Error("flair: Memory.getResource is unavailable; a checked Memory write is refused");
-    const resource = await getResource.call(Memory, { id: input.id }, admission.context, { hasContent: true, type: "update", method: verb });
+    const resource = await getResource.call(Memory, { id: snapshot.id }, admission.context, { hasContent: true, type: "update", method: verb });
     const entry = Object.freeze({});
-    checkedEntries.set(entry, { admission, confirmFields: Object.freeze([...(input.confirmFields ?? [])]), stage, used: false });
-    const body = { ...input.content };
+    checkedEntries.set(entry, { admission, confirmFields: snapshot.confirmFields!, stage, used: false });
+    const body = snapshot.content;
     return verb === "put" ? resource.putLocked(body, undefined, [], entry) : resource.patchLocked(body, undefined, entry);
   });
 }

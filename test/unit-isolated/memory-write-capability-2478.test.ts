@@ -14,6 +14,7 @@ import {
   type MemoryWriteLockToken,
 } from "../../resources/memory-write-lock.ts";
 import {
+  LockedScopeRefusedError,
   admitLockedMemoryWrite,
   withLockedMemoryTransaction,
   type LockedMemoryTransaction,
@@ -245,6 +246,29 @@ describe("the locked transaction scope (flair#2478 part 3a)", () => {
     await expect(run).rejects.toThrow("scope failure");
     expect(ctx.log).toEqual(["scope-failed:locked", "aborted"]);
     expect(store.held.size).toBe(0);
+  });
+
+  test("the lock rejects with a refusal of a scope it did not await, before the commit or at its confirmation", async () => {
+    for (const when of ["before the commit", "at the confirmation"]) {
+      const store = fakeStore();
+      const ctx: any = { log: [] as string[] };
+      const refused = Response.json({ error: "probe_refusal" }, { status: 409 });
+      const run = withMemoryWriteLock(store, ["a"], async (held) => {
+        void withLockedMemoryTransaction(held, ctx, async (tx) => {
+          await sleep(20);
+          if (when === "before the commit") return refused;
+          const admission = admitLockedMemoryWrite(held, tx, store, ["a"]);
+          void admission.track("a", async (stage) => ((await stage()) ? refused : undefined));
+          return "work";
+        });
+        return "callback";
+      });
+      const err = await run.catch((error) => error);
+      expect(err, when).toBeInstanceOf(LockedScopeRefusedError);
+      expect(err.response, when).toBe(refused);
+      expect(ctx.log, when).toEqual([when === "before the commit" ? "aborted" : "committed"]);
+      expect(store.held.size).toBe(0);
+    }
   });
 
   test("a scope needs a live token: none, forged or revoked is refused, and one scope at a time", async () => {

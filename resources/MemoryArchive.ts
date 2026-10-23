@@ -26,8 +26,9 @@
  * allowVerified() gate in test/integration/gate4-authgate.test.ts).
  *
  * The write of a non-skill row (flair#2478 part 3a): after the read above,
- * the archive takes the per-id Memory write lock for the id (and the
- * `supersedes` target the PUT body closes) under phase `archive-basement` /
+ * the archive takes the per-id Memory write lock for the id (and for the row
+ * its `supersedes` names, which the PUT body closes after its commit on a
+ * best-effort basis: a failed close is logged) under phase `archive-basement` /
  * `archive-restore`, opens a locked transaction scope
  * (resources/memory-write-transaction.ts), re-reads the row inside it, and
  * writes through `putMemoryWithLock`. The scope commits, then
@@ -185,9 +186,10 @@ export class MemoryArchive extends Resource {
       });
     }
 
-    // flair#2478 part 3a: the lock set is the id and the `supersedes` target
-    // the PUT body closes, read from the basis. A row whose stored reference
-    // differs at the re-read is refused 409 below, before any write.
+    // flair#2478 part 3a: the lock set is the id and the row its `supersedes`
+    // names (the PUT body's best-effort close target), read from the basis. A
+    // row whose stored reference differs at the re-read is refused 409 below,
+    // before any write.
     const targetId = String(persistedBasis.id);
     const lockIds = [targetId];
     if (typeof persistedBasis.supersedes === "string") {

@@ -344,8 +344,9 @@ export function admitLockedScope(held: unknown): { settle(failure?: { error: unk
 
 /**
  * Close the acquisition to new scopes, wait for a scope still open to settle,
- * then revoke the token. With `propagate`, a failure of a scope that was still
- * open when the callback settled is thrown (the callback did not await it).
+ * then revoke the token. With `propagate`, a failure or refusal of a scope
+ * that was still open when the callback settled is thrown (the callback did
+ * not await it); a refusal arrives as a `LockedScopeRefusedError`.
  */
 async function settleAcquisition(held: MemoryWriteLockToken, propagate: boolean): Promise<void> {
   const state = tokens.get(held)!;

@@ -73,6 +73,16 @@ interface ScopeState {
 
 const scopes = new WeakMap<object, ScopeState>();
 
+/** The error a lock call rejects with when its callback returned while a
+ *  locked scope it did not await was still open, and that scope then ended
+ *  refused (resources/memory-write-lock.ts). Carries the refusal. */
+export class LockedScopeRefusedError extends Error {
+  constructor(readonly response: Response) {
+    super(`a locked memory transaction the lock callback did not await was refused (HTTP ${response.status})`);
+    this.name = "LockedScopeRefusedError";
+  }
+}
+
 /** Thrown inside the owned transaction to abort it with a refusal. */
 class LockedTransactionRefusal extends Error {
   constructor(readonly response: Response) {
@@ -94,7 +104,9 @@ export async function withLockedMemoryTransaction<T>(
   const admission = admitLockedScope(held);
   try {
     const outcome = await runScope(held, callerContext, work);
-    admission.settle();
+    // A refusal settles the scope as failed, so an acquisition whose callback
+    // did not await this scope rejects with it instead of reporting success.
+    admission.settle(outcome.kind === "refused" ? { error: new LockedScopeRefusedError(outcome.response) } : undefined);
     return outcome;
   } catch (error) {
     admission.settle({ error });
