@@ -95,11 +95,11 @@ describe("AttentionQuery e2e (real Harper)", () => {
     // ── Seed one matching record per source, authored by the TEAMMATE ──────
     // (the caller queries; every hit below is cross-agent unless noted).
     //
-    // NOTE (measured, not assumed): table-backed resources (WorkspaceState/
-    // Memory/OrgEvent/Relationship — every class shaped `extends
-    // (databases as any).flair.X`) accept writes at PUT /<Table>/<id>; HTTP
-    // POST /Memory additionally reaches Memory.post(), and flair-client's
-    // write()/update() use PUT. A bare `POST /WorkspaceState` (what the
+    // NOTE (measured, not assumed): WorkspaceState, Memory, OrgEvent and
+    // Relationship (each shaped `extends (databases as any).flair.X`) accept
+    // authorized writes at PUT /<Table>/<id>; HTTP POST /Memory additionally
+    // reaches Memory.post(), and flair-client's write()/update() use PUT. A
+    // bare `POST /WorkspaceState` (what the
     // shipped `flair workspace set` CLI command sent) was probed against this
     // same real Harper and returned 405 "does not have a post method
     // implemented to handle HTTP method POST" — a PRE-EXISTING gap in that
