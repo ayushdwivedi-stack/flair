@@ -242,7 +242,7 @@ describe("flair#2708 — rem restore target (CLI)", () => {
     expect(b.requests().filter((r) => r.auth !== undefined)).toEqual([]);
   }, 60_000);
 
-  test("a signed stub answers a signed request to the admin candidate route 403 and serves an admin request", async () => {
+  test("a signed stub answers a TPS-Ed25519 header on the admin candidate route 403 and serves an admin request", async () => {
     const b = await startInstance({ ...driftedSeed(), auth: "signed" });
     const route = `${b.httpUrl}/AdminMemoryCandidates/${AGENT_ID}`;
     const signature = { Authorization: `TPS-Ed25519 ${AGENT_ID}:0:nonce:signature` };
@@ -253,7 +253,7 @@ describe("flair#2708 — rem restore target (CLI)", () => {
       headers: { Authorization: `Basic ${btoa(`admin:${STUB_ADMIN_PASS}`)}` },
       signal: AbortSignal.timeout(5_000),
     });
-    // The same signature still reads a signed-accepting route.
+    // The stub checks no signature; the same header still reads a signed-accepting route.
     const memory = await fetch(`${b.httpUrl}/Memory?agentId=${AGENT_ID}`, { headers: signature, signal: AbortSignal.timeout(5_000) });
 
     expect(signed.status).toBe(403);

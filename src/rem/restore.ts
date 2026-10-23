@@ -70,11 +70,11 @@ export interface RestoreOpts {
   flairVersion: string;
   apiCall: ApiCall;
   /**
-   * When false, the dry run does not list leftover candidates. Only a dry run
-   * without an admin credential sets this: `GET /AdminMemoryCandidates` is
-   * admin-only, so a signed-only dry run cannot read it. A live restore always
-   * lists (the CLI requires the admin credential); one given `false` is
-   * refused before any request.
+   * When false, the dry run does not list leftover candidates. The CLI sets
+   * this only for a dry run without an admin credential:
+   * `GET /AdminMemoryCandidates` is admin-only, so a signed-only dry run cannot
+   * read it. A live restore always lists (the CLI requires the admin
+   * credential); one given `false` is refused before any request.
    */
   listCandidates?: boolean;
   /**
@@ -166,10 +166,17 @@ function olderServerCandidateRoute(err: unknown): boolean {
  * one endpoint. The route returns ids only; restore needs nothing else.
  */
 async function listAgentCandidates(apiCall: ApiCall, agentId: string): Promise<Array<{ id: string }>> {
-  const body = await apiCall(
-    "GET",
-    `/AdminMemoryCandidates/${encodeURIComponent(agentId)}?limit=${CANDIDATE_LIST_LIMIT}`,
-  );
+  let body: any;
+  try {
+    body = await apiCall(
+      "GET",
+      `/AdminMemoryCandidates/${encodeURIComponent(agentId)}?limit=${CANDIDATE_LIST_LIMIT}`,
+    );
+  } catch (err) {
+    // Only this GET's 404 is reported as a target that predates the route.
+    if (olderServerCandidateRoute(err)) throw new Error(olderServerCandidateMessage(err as ApiHttpError));
+    throw err;
+  }
   const defect = candidateListDefect(body);
   if (defect) {
     throw new Error(`GET /AdminMemoryCandidates returned an unexpected response shape: ${defect}. No target rows were deleted or written.`);
@@ -322,9 +329,7 @@ export async function applySnapshot(opts: RestoreOpts): Promise<RestoreResult> {
       result.restored.souls = souls.length;
       result.status = "dry-run";
     } catch (err: any) {
-      errors.push(
-        `fetch-current: ${olderServerCandidateRoute(err) ? olderServerCandidateMessage(err) : err?.message ?? String(err)}`,
-      );
+      errors.push(`fetch-current: ${err?.message ?? String(err)}`);
       result.status = "failed";
     }
     rmSync(tmp, { recursive: true, force: true });
@@ -364,9 +369,7 @@ export async function applySnapshot(opts: RestoreOpts): Promise<RestoreResult> {
   try {
     currentCandidates = await listAgentCandidates(opts.apiCall, opts.agentId);
   } catch (err: any) {
-    errors.push(
-      `fetch-candidates: ${olderServerCandidateRoute(err) ? olderServerCandidateMessage(err) : err?.message ?? String(err)}`,
-    );
+    errors.push(`fetch-candidates: ${err?.message ?? String(err)}`);
     result.status = "failed";
     rmSync(tmp, { recursive: true, force: true });
     return result;

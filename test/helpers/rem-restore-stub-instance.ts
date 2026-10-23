@@ -26,8 +26,9 @@
  * with `TPS-Ed25519 `, answers 403 to a request with no `Authorization`
  * header, and 401 to any other request. The admin-only
  * `/AdminMemoryCandidates` route serves only the admin credential: in `signed`
- * mode it answers a `TPS-Ed25519 ` request 403, as Harper answers a verified
- * non-admin agent, and any other request 401.
+ * mode it answers any `TPS-Ed25519 ` header 403 and any other request 401.
+ * That 403 is synthetic: the stub checks no signature, and any such header
+ * stands in for a verified non-admin agent.
  */
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -109,8 +110,9 @@ const refusal = (req) => {
   if (seed.auth === "signed" && !h) return 403;
   return 401;
 };
-// The admin route's status: a signature in signed mode stands for a verified
-// non-admin agent, which Harper refuses 403.
+// The admin route's status. Synthetic: in signed mode any "TPS-Ed25519 "
+// header stands in for a verified non-admin agent and is answered 403; no
+// signature is checked.
 const adminRouteRefusal = (req) => {
   const h = req.headers.get("authorization");
   if (h === expectedAuth) return 0;

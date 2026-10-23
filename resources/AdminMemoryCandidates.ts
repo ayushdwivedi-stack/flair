@@ -9,9 +9,9 @@
  * `limit` defaults to 200 and is capped at 500; `hasMore` reports whether the
  * agent holds more rows than this response carries.
  *
- * Admin-only: allowRead() is allowAdmin(), so an unauthenticated caller is
- * refused by the `/Admin*` path gate (401) and a verified non-admin agent is
- * refused with Harper's AccessViolation (403). The handler is read-only.
+ * Admin-only: allowRead() is allowAdmin(), so a request with no Authorization
+ * header is refused by the `/Admin*` path gate (401) and a verified non-admin
+ * agent is refused with Harper's AccessViolation (403). The handler is read-only.
  */
 import { Resource, databases } from "harper";
 import { allowAdmin } from "./agent-auth.js";

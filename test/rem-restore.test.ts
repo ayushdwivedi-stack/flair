@@ -182,6 +182,26 @@ describe("applySnapshot — dry-run", () => {
       "fetch-current: GET /AdminMemoryCandidates returned an unexpected response shape: candidates is not an array. No target rows were deleted or written.",
     ]);
   });
+
+  it("reports a /Memory 404 with its own message, not the candidate route's, when listing is off", async () => {
+    const snapshotPath = await makeTestSnapshot();
+    const { api, calls } = recordingApi({
+      "GET:/Memory": () => { throw new ApiHttpError(404, "memory route missing"); },
+    });
+    const r = await applySnapshot({
+      agentId: "test-agent",
+      snapshotPath,
+      flairVersion: "0.0.0-test",
+      apiCall: api,
+      preRestoreSnapshotRoot: snapshotRoot,
+      tmpRootOverride: testRoot,
+      dryRun: true,
+      listCandidates: false,
+    });
+    expect(r.status).toBe("failed");
+    expect(r.errors).toEqual(["fetch-current: memory route missing"]);
+    expect(calls.some((c) => c.path.startsWith("/AdminMemoryCandidates/"))).toBe(false);
+  });
 });
 
 describe("applySnapshot — agent-id mismatch", () => {
