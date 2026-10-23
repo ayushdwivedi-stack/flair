@@ -14,6 +14,12 @@
  *
  * The package-count floor it enforces lives in the reviewed budget file
  * (.github/install-weight-budget.json → minPackages), not in this script.
+ * The count it compares is the installed tree itself (countInstalledPackages:
+ * package directories under the global lib/node_modules — one holding a
+ * package.json with a name and version — nested and bundled copies included). npm's "added N
+ * packages" summary is printed for information only: harper >5.3.1 ships its
+ * dependencies as bundleDependencies, and npm's summary line does not count
+ * bundled copies, so the summary understates a healthy tree.
  *
  * Cause: 0.54.1's `bundleDependencies: ["@tpsdev-ai/flair-tool-descriptors"]`
  * (#1681) interacted with harper's own npm-shrinkwrap.json. npm's reify then
@@ -50,7 +56,7 @@
  *       never silently green. Mirrors check-install-weight.mjs.
  */
 
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -84,10 +90,10 @@ export function repoRoot() {
 }
 
 /**
- * Floor for npm's "added N packages" line, read from the reviewed budget file
- * (`.github/install-weight-budget.json` → `minPackages`) rather than a literal
- * in this script, so the number is reviewed with the rest of the ratchet instead
- * of moving in a diff nobody reads.
+ * Floor for the measured installed-package count, read from the reviewed budget
+ * file (`.github/install-weight-budget.json` → `minPackages`) rather than a
+ * literal in this script, so the number is reviewed with the rest of the ratchet
+ * instead of moving in a diff nobody reads.
  */
 export function readMinPackages(root = repoRoot()) {
   const raw = JSON.parse(readFileSync(join(root, BUDGET_REL), "utf8"));
@@ -103,9 +109,94 @@ export function treePaths(prefix) {
   const flair = join(prefix, "lib", "node_modules", "@tpsdev-ai", "flair");
   return {
     flair,
+    globalNodeModules: join(prefix, "lib", "node_modules"),
     harperJs: join(flair, "node_modules", "harper", "dist", "bin", "harper.js"),
     harperLoggingDir: join(flair, "node_modules", "harper", "dist", "utility", "logging"),
   };
+}
+
+/**
+ * Hard bounds for the tree walk. They do not depend on what is installed: a tree
+ * that exceeds either is a corrupt install, and the walk throws rather than
+ * reporting a lower count as a measurement.
+ */
+const MAX_TREE_DEPTH = 64;
+const MAX_TREE_ENTRIES = 250_000;
+
+/**
+ * Read a directory's package identity: `{name, version}` when its package.json
+ * parses and carries both, null otherwise. No existence check first — read and
+ * classify the failure, so the result cannot race a concurrent writer.
+ */
+function readPackageIdentity(dir) {
+  let raw;
+  try {
+    raw = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+  } catch {
+    return null;
+  }
+  if (typeof raw?.name !== "string" || raw.name === "") return null;
+  if (typeof raw?.version !== "string" || raw.version === "") return null;
+  return { name: raw.name, version: raw.version };
+}
+
+function listDir(dir, required) {
+  try {
+    return readdirSync(dir, { withFileTypes: true });
+  } catch (err) {
+    if (!required && err?.code === "ENOENT") return null;
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`could not read ${dir}: ${message}`);
+  }
+}
+
+/**
+ * Count the installed packages in a global `lib/node_modules` tree.
+ *
+ * A package is a directory holding a package.json with a non-empty name and
+ * version; `@scope/pkg` counts once (the scope directory itself has no
+ * package.json). Nested `node_modules` (regular hoisting) and a package's own
+ * bundled `node_modules` (harper's bundleDependencies) are walked, so the count
+ * reflects what is on disk rather than npm's "added N packages" summary, which
+ * omits bundled copies. Symlinks are not followed: a global install creates
+ * `.bin` symlinks, and following them would loop.
+ *
+ * Throws on an unreadable directory or a tree past the bounds above. A failed
+ * read is never reported as a smaller tree.
+ */
+export function countInstalledPackages(globalNodeModules) {
+  let entries = 0;
+  let packages = 0;
+
+  const walk = (dir, depth, required) => {
+    if (depth > MAX_TREE_DEPTH) {
+      throw new Error(`package tree is deeper than ${MAX_TREE_DEPTH} node_modules levels at ${dir}`);
+    }
+    const children = listDir(dir, required);
+    if (children === null) return;
+    for (const child of children) {
+      if (!child.isDirectory()) continue;
+      if (++entries > MAX_TREE_ENTRIES) {
+        throw new Error(`package tree under ${globalNodeModules} has more than ${MAX_TREE_ENTRIES} directories`);
+      }
+      const path = join(dir, child.name);
+      if (child.name === "node_modules") {
+        walk(path, depth + 1, false);
+        continue;
+      }
+      if (readPackageIdentity(path) !== null) {
+        packages += 1;
+        walk(join(path, "node_modules"), depth + 1, false);
+      } else {
+        // A scope directory (`@scope`) or a stray directory: its packages, if
+        // any, are one level down.
+        walk(path, depth + 1, false);
+      }
+    }
+  };
+
+  walk(globalNodeModules, 0, true);
+  return packages;
 }
 
 /** "added 543 packages" → 543; null when npm printed no such line. */
@@ -169,10 +260,16 @@ export function harperVersion(paths) {
  * Apply the four checks to a finished install. Pure — takes the captured log
  * and the on-disk tree, returns findings. Unit-tested in
  * test/unit/global-install-lockfile.test.ts.
+ *
+ * `added` (npm's summary line) is returned for reporting only; the floor is
+ * compared against `measured`, the count taken from the tree itself.
  */
 export function evaluateInstall({ log, paths, minPackages }) {
   if (!Number.isFinite(minPackages) || minPackages <= 0) {
     throw new Error("evaluateInstall requires a positive minPackages (see readMinPackages)");
+  }
+  if (typeof paths.globalNodeModules !== "string" || paths.globalNodeModules === "") {
+    throw new Error("evaluateInstall requires paths.globalNodeModules (see treePaths)");
   }
   const failures = [];
 
@@ -184,12 +281,12 @@ export function evaluateInstall({ log, paths, minPackages }) {
   }
 
   const added = parseAddedCount(log);
-  if (added === null) {
-    failures.push('install log has no "added N packages" line — cannot confirm the tree was created');
-  } else if (added < minPackages) {
+  const measured = countInstalledPackages(paths.globalNodeModules);
+  if (measured < minPackages) {
+    const reported = added === null ? "" : ` (npm reported "added ${added}")`;
     failures.push(
-      `added ${added} packages, below the ${minPackages} floor ` +
-        `(0.53.0 measured 543 on npm 10, 560 on npm 11) — dependency tree collapsed`,
+      `installed tree has ${measured} packages (package.json with a name and version under lib/node_modules), ` +
+        `below the ${minPackages} floor${reported} — dependency tree collapsed`,
     );
   }
 
@@ -203,17 +300,18 @@ export function evaluateInstall({ log, paths, minPackages }) {
     failures.push(`node harper.js version failed: ${harper.error}`);
   }
 
-  return { added, fsExtra, harper, failures, ok: failures.length === 0 };
+  return { added, measured, fsExtra, harper, failures, ok: failures.length === 0 };
 }
 
 function parseArgs(argv) {
-  const opts = { pkg: null, registryVersion: null, keep: false, prefix: null, minPackages: null };
+  const opts = { pkg: null, registryVersion: null, keep: false, prefix: null, minPackages: null, countRoot: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--package" || a === "--tarball") opts.pkg = argv[++i];
     else if (a === "--registry-version") opts.registryVersion = argv[++i];
     else if (a === "--prefix") opts.prefix = argv[++i];
     else if (a === "--min-packages") opts.minPackages = Number(argv[++i]);
+    else if (a === "--count-root") opts.countRoot = argv[++i];
     else if (a === "--keep") opts.keep = true;
     else if (a === "--help" || a === "-h") opts.help = true;
     else throw new Error(`unknown argument: ${a}`);
@@ -232,9 +330,25 @@ function main() {
   if (opts.help) {
     console.error(
       "usage: node scripts/check-global-install-lockfile.mjs --package <tarball|spec> [--prefix <dir>] [--keep]\n" +
-        "       node scripts/check-global-install-lockfile.mjs --registry-version <ver> [--prefix <dir>] [--keep]",
+        "       node scripts/check-global-install-lockfile.mjs --registry-version <ver> [--prefix <dir>] [--keep]\n" +
+        "       node scripts/check-global-install-lockfile.mjs --count-root <global lib/node_modules>",
     );
     process.exit(0);
+  }
+  if (opts.countRoot) {
+    // Same measured count the floor compares, for callers that own an existing
+    // global tree (scripts/ci/macos-launchd-upgrade-lane.sh).
+    if (opts.pkg || opts.registryVersion) {
+      console.error("DID NOT RUN: --count-root counts an existing tree; do not pass --package/--registry-version");
+      process.exit(2);
+    }
+    try {
+      console.log(countInstalledPackages(opts.countRoot));
+    } catch (err) {
+      console.error(`DID NOT RUN: ${err instanceof Error ? err.message : err}`);
+      process.exit(2);
+    }
+    return;
   }
   if (opts.pkg && opts.registryVersion) {
     console.error("DID NOT RUN: pass exactly one of --package / --registry-version, not both");
@@ -285,8 +399,8 @@ function main() {
       minPackages: opts.minPackages ?? readMinPackages(),
     });
     console.error(
-      `[global-install] added=${result.added ?? "(none)"} fs-extra=${result.fsExtra.ok ? "ok" : "FAIL"} ` +
-        `harper version=${result.harper.ok ? result.harper.version : "FAIL"}`,
+      `[global-install] npm-added=${result.added ?? "(no summary line)"} measured=${result.measured} packages ` +
+        `fs-extra=${result.fsExtra.ok ? "ok" : "FAIL"} harper version=${result.harper.ok ? result.harper.version : "FAIL"}`,
     );
     if (!result.ok) {
       console.error(`[global-install] FAILED ${result.failures.length} check(s):`);
@@ -294,7 +408,7 @@ function main() {
       if (opts.keep) console.error(`[global-install] tree kept at ${prefix}`);
       process.exit(1);
     }
-    console.error(`[global-install] OK — harper ${result.harper.version}, ${result.added} packages`);
+    console.error(`[global-install] OK — harper ${result.harper.version}, ${result.measured} measured packages`);
     if (opts.keep) console.error(`[global-install] tree kept at ${prefix}`);
   } finally {
     cleanup();

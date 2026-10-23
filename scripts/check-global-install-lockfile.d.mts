@@ -16,7 +16,7 @@ export function registryInstallSpec(version: string): string;
 export function repoRoot(): string;
 
 /**
- * Floor for npm's "added N packages" line, read from
+ * Floor for the measured installed-package count, read from
  * `.github/install-weight-budget.json` → `minPackages` (default: this script's
  * repo root). Throws when the field is missing or not positive.
  */
@@ -25,6 +25,8 @@ export function readMinPackages(root?: string): number;
 export interface TreePaths {
   /** `<prefix>/lib/node_modules/@tpsdev-ai/flair` */
   flair: string;
+  /** `<prefix>/lib/node_modules` — the root the package count walks */
+  globalNodeModules: string;
   /** harper's CLI entrypoint inside that tree */
   harperJs: string;
   /** harper's logging dir — where the fs-extra resolve probe starts */
@@ -44,7 +46,10 @@ export interface HarperCheck {
 }
 
 export interface InstallEvaluation {
+  /** npm's "added N packages" summary, reported only — never compared to the floor. */
   added: number | null;
+  /** Packages on disk: package.json with a name and version under lib/node_modules. */
+  measured: number;
   fsExtra: ResolveCheck;
   harper: HarperCheck;
   failures: string[];
@@ -52,6 +57,11 @@ export interface InstallEvaluation {
 }
 
 export function treePaths(prefix: string): TreePaths;
+/**
+ * Counts package directories under a global `lib/node_modules`, bundled copies
+ * included. Throws on an unreadable directory or a tree past its hard bounds.
+ */
+export function countInstalledPackages(globalNodeModules: string): number;
 export function parseAddedCount(log: string): number | null;
 export function hasDamagedLockfileWarning(log: string): boolean;
 /** `ok` is false unless the resolve lands inside `paths.flair` (no ambient hoist). */

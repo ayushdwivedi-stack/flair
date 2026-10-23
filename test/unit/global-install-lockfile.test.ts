@@ -22,6 +22,7 @@ import { nodeBin } from "../helpers/node-runtime.ts";
 import {
   BUDGET_REL,
   FLAIR_PACKAGE,
+  countInstalledPackages,
   evaluateInstall as evaluateInstallNative,
   hasDamagedLockfileWarning,
   parseAddedCount,
@@ -48,6 +49,13 @@ function evaluateInstall(options: Parameters<typeof evaluateInstallNative>[0]): 
 }
 /** The reviewed floor, read the same way CI reads it. */
 const MIN = readMinPackages(REPO);
+
+/**
+ * The four-check fixtures below are shaped for the resolve/entrypoint checks, not
+ * for the weight floor: they carry one package. Passing this floor keeps the
+ * floor out of those assertions; the floor itself is tested separately.
+ */
+const FIXTURE_FLOOR = 1;
 
 const fixtures: string[] = [];
 afterEach(() => {
@@ -94,6 +102,39 @@ function brokenPrefix() {
   return { prefix, paths };
 }
 
+/** Write `count` package directories into a prefix's global node_modules. */
+function addPackages(prefix: string, count: number, namePrefix = "pkg") {
+  const root = join(prefix, "lib", "node_modules");
+  mkdirSync(root, { recursive: true });
+  for (let i = 0; i < count; i++) {
+    const dir = join(root, `${namePrefix}-${i}`);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ name: `${namePrefix}-${i}`, version: "1.0.0" }));
+  }
+}
+
+/**
+ * A prefix shaped like harper 5.3.3's: harper's dependencies live in its own
+ * bundled `node_modules`, so npm's summary line counts one package (harper) where
+ * the disk holds five.
+ */
+function bundledPrefix() {
+  const prefix = mkdtempSync(join(tmpdir(), "flair-gi-bundled-"));
+  fixtures.push(prefix);
+  const harper = join(prefix, "lib", "node_modules", "harper");
+  mkdirSync(harper, { recursive: true });
+  writeFileSync(join(harper, "package.json"), JSON.stringify({ name: "harper", version: "5.3.3" }));
+  for (let i = 0; i < 3; i++) {
+    const dir = join(harper, "node_modules", `bundled-${i}`);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ name: `bundled-${i}`, version: "1.0.0" }));
+  }
+  const scoped = join(harper, "node_modules", "@scope", "bundled-scoped");
+  mkdirSync(scoped, { recursive: true });
+  writeFileSync(join(scoped, "package.json"), JSON.stringify({ name: "@scope/bundled-scoped", version: "1.0.0" }));
+  return { prefix, paths: treePaths(prefix) };
+}
+
 /**
  * A prefix whose fs-extra resolve lands OUTSIDE the installed tree: the copy sits
  * in an ancestor `node_modules`, exactly the ambient/hoisted shape that must not
@@ -136,6 +177,7 @@ describe("check-global-install-lockfile — parsing", () => {
   test("treePaths points at the flair package inside the global prefix", () => {
     const paths = treePaths("/tmp/prefix");
     expect(paths.flair).toBe("/tmp/prefix/lib/node_modules/@tpsdev-ai/flair");
+    expect(paths.globalNodeModules).toBe("/tmp/prefix/lib/node_modules");
     expect(paths.harperJs).toBe(join(paths.flair, "node_modules", "harper", "dist", "bin", "harper.js"));
     expect(paths.harperLoggingDir).toBe(join(paths.flair, "node_modules", "harper", "dist", "utility", "logging"));
   });
@@ -159,11 +201,17 @@ describe("the reviewed floor (flair#1683)", () => {
     expect(readMinPackages(REPO)).toBe(budget.minPackages);
   });
 
-  test("sits below the healthy baseline and above the broken shape", () => {
-    expect(MIN).toBeLessThan(492);
-    expect(MIN).toBeGreaterThan(50); // 0.54.1, npm 10
-    expect(MIN).toBeGreaterThan(44); // 0.54.1, npm 11 / macOS
-    expect(MIN).toBeGreaterThan(Math.floor(492 * 0.9)); // a 10% collapse must still trip it
+  // Measured with npm 11.19.1 (the canary pin) on 2026-10-23: this branch at
+  // d55695aa → 492; origin/main at 0c24e5ce (harper 5.3.1) → 520. npm 10.9.4
+  // measured 492 and 492.
+  const HEAD_MEASURED = 492;
+  const MAIN_MEASURED = 520;
+
+  test("sits below both measured trees and above the broken shape", () => {
+    expect(MIN).toBeLessThan(HEAD_MEASURED);
+    expect(MIN).toBeLessThan(MAIN_MEASURED);
+    expect(MIN).toBeGreaterThan(50); // 0.54.1's collapsed tree
+    expect(MIN).toBeGreaterThan(Math.floor(Math.min(HEAD_MEASURED, MAIN_MEASURED) * 0.9)); // a 10% collapse still trips it
   });
 
   test("a budget without the field is an error, never a silent zero floor", () => {
@@ -175,13 +223,51 @@ describe("the reviewed floor (flair#1683)", () => {
   });
 });
 
+describe("the count is measured from the tree, not npm's summary line", () => {
+  test("counts nested and bundled copies, scoped packages once each", () => {
+    const { prefix, paths } = bundledPrefix();
+    // harper + 3 bundled + @scope/bundled-scoped.
+    expect(countInstalledPackages(paths.globalNodeModules)).toBe(5);
+
+    // npm's summary counted one; the disk holds five. The floor must read the disk.
+    const result = evaluateInstall({ log: "added 1 package in 2s", paths, minPackages: 5 });
+    expect(result.added).toBe(1);
+    expect(result.measured).toBe(5);
+    expect(result.failures.join("\n")).not.toContain("dependency tree collapsed");
+  });
+
+  test("a malformed package.json is not a package, and is not an error", () => {
+    const prefix = mkdtempSync(join(tmpdir(), "flair-gi-malformed-"));
+    fixtures.push(prefix);
+    const root = join(prefix, "lib", "node_modules");
+    mkdirSync(join(root, "broken"), { recursive: true });
+    writeFileSync(join(root, "broken", "package.json"), "{not json");
+    mkdirSync(join(root, "nameless"), { recursive: true });
+    writeFileSync(join(root, "nameless", "package.json"), JSON.stringify({ version: "1.0.0" }));
+    expect(countInstalledPackages(root)).toBe(0);
+  });
+
+  test("a tree of ~50 packages is below the reviewed floor and fails", () => {
+    const prefix = mkdtempSync(join(tmpdir(), "flair-gi-collapse-"));
+    fixtures.push(prefix);
+    addPackages(prefix, 50);
+    const result = evaluateInstall({ log: HEALTHY_LOG, paths: treePaths(prefix), minPackages: MIN });
+    expect(result.measured).toBe(50);
+    const joined = result.failures.join("\n");
+    expect(joined).toContain("installed tree has 50 packages");
+    expect(joined).toContain(`below the ${MIN} floor`);
+    expect(joined).toContain("dependency tree collapsed");
+  });
+});
+
 describe("check-global-install-lockfile — the four checks", () => {
   test("a healthy install passes all four", () => {
     const { paths } = healthyPrefix();
-    const result = evaluateInstall({ log: HEALTHY_LOG, paths, minPackages: MIN });
+    const result = evaluateInstall({ log: HEALTHY_LOG, paths, minPackages: FIXTURE_FLOOR });
     expect(result.failures).toEqual([]);
     expect(result.ok).toBe(true);
     expect(result.added).toBe(543);
+    expect(result.measured).toBe(1);
     expect(result.harper.ok).toBe(true);
     expect(result.harper.version).toBe("5.2.8");
     expect(result.fsExtra.ok).toBe(true);
@@ -190,35 +276,42 @@ describe("check-global-install-lockfile — the four checks", () => {
 
   test("a 0.54.1-shaped install fails all four, each named", () => {
     const { paths } = brokenPrefix();
-    const result = evaluateInstall({ log: BROKEN_LOG, paths, minPackages: MIN });
+    const result = evaluateInstall({ log: BROKEN_LOG, paths, minPackages: FIXTURE_FLOOR });
     expect(result.ok).toBe(false);
     expect(result.failures).toHaveLength(4);
     const joined = result.failures.join("\n");
     expect(joined).toContain("invalid or damaged lockfile");
-    expect(joined).toContain(`added 50 packages, below the ${MIN} floor`);
+    expect(joined).toContain(`installed tree has 0 packages`);
+    expect(joined).toContain(`below the ${FIXTURE_FLOOR} floor`);
+    expect(joined).toContain('npm reported "added 50"');
     expect(joined).toContain("require.resolve('fs-extra')");
     expect(joined).toContain("node harper.js version failed");
   });
 
   test("a healthy tree with a damaged-lockfile log still fails (the log is evidence)", () => {
     const { paths } = healthyPrefix();
-    const result = evaluateInstall({ log: `${BROKEN_LOG.split("\n")[0]}\n\nadded 543 packages in 9s`, paths, minPackages: MIN });
+    const result = evaluateInstall({
+      log: `${BROKEN_LOG.split("\n")[0]}\n\nadded 543 packages in 9s`,
+      paths,
+      minPackages: FIXTURE_FLOOR,
+    });
     expect(result.ok).toBe(false);
     expect(result.failures).toHaveLength(1);
     expect(result.failures[0]).toContain("invalid or damaged lockfile");
   });
 
-  test("a missing 'added N packages' line is a failure, not a silent pass", () => {
+  test("a missing 'added N packages' line is information, not a failure — the tree decides", () => {
     const { paths } = healthyPrefix();
-    const result = evaluateInstall({ log: "npm ERR! something", paths, minPackages: MIN });
-    expect(result.ok).toBe(false);
-    expect(result.failures.join("\n")).toContain('no "added N packages" line');
+    const result = evaluateInstall({ log: "npm ERR! something", paths, minPackages: FIXTURE_FLOOR });
+    expect(result.added).toBeNull();
+    expect(result.measured).toBe(1);
+    expect(result.ok).toBe(true);
   });
 
   test("the package floor is configurable (local probing can tighten it)", () => {
     const { paths } = healthyPrefix();
     expect(evaluateInstall({ log: HEALTHY_LOG, paths, minPackages: 1000 }).failures.join("\n")).toContain(
-      "added 543 packages, below the 1000 floor",
+      "installed tree has 1 packages",
     );
   });
 
@@ -237,7 +330,7 @@ describe("resolveFromLoggingDir requires the hit to be inside the tree", () => {
     expect(resolved.resolved?.startsWith(ambient)).toBe(true);
     expect(resolved.error).toContain("outside the installed tree");
 
-    const result = evaluateInstall({ log: HEALTHY_LOG, paths, minPackages: MIN });
+    const result = evaluateInstall({ log: HEALTHY_LOG, paths, minPackages: FIXTURE_FLOOR });
     expect(result.fsExtra.ok).toBe(false);
     expect(result.failures.join("\n")).toContain("require.resolve('fs-extra')");
   });
@@ -249,7 +342,7 @@ describe("resolveFromLoggingDir requires the hit to be inside the tree", () => {
     // which one it is depends on whether an ancestor of os.tmpdir() has fs-extra.
     expect(resolved.ok).toBe(false);
     expect(resolved.error).toBeTruthy();
-    expect(evaluateInstall({ log: BROKEN_LOG, paths, minPackages: MIN }).failures.join("\n")).toContain(
+    expect(evaluateInstall({ log: BROKEN_LOG, paths, minPackages: FIXTURE_FLOOR }).failures.join("\n")).toContain(
       "require.resolve('fs-extra')",
     );
   });
