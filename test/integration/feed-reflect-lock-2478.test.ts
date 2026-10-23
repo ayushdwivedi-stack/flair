@@ -23,7 +23,9 @@
  *     has not committed;
  *   - feed-ingest-committed / feed-dedup-repair-committed /
  *     last-reflected-committed / reflect-sources-committed: the write committed
- *     and the lock is still held.
+ *     and the lock is still held;
+ *   - feed-ingest-verify: the feed write committed and the lock is still held,
+ *     before its read-back.
  *
  * The real-Harper write trace (test/helpers/embedding-writer-race.ts) asserts
  * each automatic writer's update names only its own field, and that the feed
@@ -201,6 +203,46 @@ describe("flair#2478 slice 3b — the feed ingest writer (real Harper)", () => {
     expect((await held).status).toBe(200);
     expect((await h.readRow(id))?.content).toBe("feed v2 held");
   }, 120_000);
+
+  it("an unconfirmed feed write marks the id outcome-unknown: a later owner PUT and a later feed write answer 503 write_outcome_unknown", async () => {
+    const id = "frl-feed-unconfirmed";
+    await seed(id);
+    h.arm("feed-ingest-verify");
+    const pending = feed(id, "feed v2 unconfirmed");
+    await h.assertPaused("feed-ingest-verify");
+    // A lock-bypassing write during the pause: the read-back sees a different row.
+    await h.rawUpdate(id, { content: "the ops write during the pause" });
+    await h.release("feed-ingest-verify");
+    const res = await pending;
+    const body = await res.json() as any;
+    expect(res.status, JSON.stringify(body)).toBe(409);
+    expect(body.error).toBe("feed_write_unconfirmed");
+    const stored = await h.readRow(id);
+    expect(stored?.content).toBe("the ops write during the pause");
+
+    await expectRefused(await put(owner, id, "owner put after the unknown outcome"), "write_outcome_unknown");
+    await expectRefused(await feed(id, "feed v3 after the unknown outcome"), "write_outcome_unknown");
+    expect(await h.readRow(id)).toEqual(stored);
+  }, 120_000);
+
+  it("an id marked outcome-unknown by an owner write refuses POST /FeedMemories with 503 write_outcome_unknown and leaves the stored row unchanged", async () => {
+    const id = "frl-feed-marked";
+    await seed(id);
+    h.arm("memory-patch-verify");
+    const held = h.signed(owner, "PATCH", memPath(id), { embedding: null, embeddingModel: null });
+    await h.assertPaused("memory-patch-verify");
+    writeFileSync(join(pauseDir, `arm.memory-get-fail.${id}`), "");
+    await h.release("memory-patch-verify");
+    const marked = await held;
+    const markedBody = await marked.json() as any;
+    expect(marked.status, JSON.stringify(markedBody)).toBe(503);
+    expect(markedBody.error).toBe("write_outcome_unknown");
+    const before = await h.readRow(id);
+
+    await expectRefused(await feed(id, "feed write to the marked id"), "write_outcome_unknown");
+    expect(await h.readRow(id)).toEqual(before);
+    expect(before?.content).toBe(`content of ${id}`);
+  }, 180_000);
 });
 
 describe("flair#2478 slice 3b — the feed dedup expiry repair (real Harper)", () => {
