@@ -729,6 +729,41 @@ describe("CLI — a real bun.lock: aliases, nested overrides and declaration lin
       registry.stop();
     }
   }, 60_000);
+
+  it("checks a workspace's range at the workspace's own resolution, not the hoisted one", async () => {
+    // The root takes fixture-dep ^1.0.0 and workspace ws-a takes ^2.0.0, so
+    // bun resolves two versions: one hoisted, one under the workspace's key.
+    const root = join(scratch, "real-lock-workspace");
+    mkdirSync(join(root, "packages", "ws-a"), { recursive: true });
+    writeFileSync(join(root, "packages", "ws-a", "package.json"), JSON.stringify({
+      name: "ws-a",
+      version: "0.0.0",
+      dependencies: { [FIXTURE_DEP]: "^2.0.0" },
+    }));
+    const lock = await bunGeneratedLock(root, {
+      name: "dep-ages-workspace-lock-fixture",
+      version: "0.0.0",
+      workspaces: ["packages/*"],
+      dependencies: { [FIXTURE_DEP]: "^1.0.0" },
+    }, { [FIXTURE_DEP]: { "1.0.0": {}, "1.0.5": {}, "2.0.0": {}, "2.0.5": {} } });
+    expect(lockResolutions(lock)).toMatchObject({
+      [FIXTURE_DEP]: `${FIXTURE_DEP}@1.0.5`,
+      [`ws-a/${FIXTURE_DEP}`]: `${FIXTURE_DEP}@2.0.5`,
+    });
+    const registry = registryWithTimes({ "1.0.5": OLD_TIME, "2.0.5": FRESH_TIME });
+    try {
+      const { exitCode, output } = await runGate(CLI_SCRIPT, {
+        FLAIR_CHECK_DEP_AGES_ROOT: root,
+        FLAIR_NPM_REGISTRY: registry.url,
+      });
+      expect(output).toContain(`${FIXTURE_DEP}@2.0.5    — published ${FRESH_DATE}`);
+      expect(output).toContain(`declared in packages/ws-a/package.json dependencies["${FIXTURE_DEP}"] (range "^2.0.0")`);
+      expect(output).not.toContain(`${FIXTURE_DEP}@1.0.5    —`);
+      expect(exitCode).toBe(1);
+    } finally {
+      registry.stop();
+    }
+  }, 60_000);
 });
 
 describe("CLI fail-closed exit — dead registry", () => {
