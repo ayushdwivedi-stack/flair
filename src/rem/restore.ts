@@ -71,10 +71,9 @@ export interface RestoreOpts {
   apiCall: ApiCall;
   /**
    * When false, the dry run does not list leftover candidates. The CLI sets
-   * this only for a dry run without an admin credential:
-   * `GET /AdminMemoryCandidates` is admin-only, so a signed-only dry run cannot
-   * read it. A live restore always lists (the CLI requires the admin
-   * credential); one given `false` is refused before any request.
+   * this only for a dry run without a resolved admin password. A live restore
+   * always lists (the CLI requires the admin password); one given `false` is
+   * refused before any request.
    */
   listCandidates?: boolean;
   /**
@@ -161,10 +160,11 @@ function isCandidateRoute404(err: unknown): boolean {
 }
 
 /**
- * One agent's leftover candidates, read through the same `apiCall` restore
- * uses for its deletes and writes, so the listing and those operations reach
- * one endpoint. Each candidate object carries only an id; the reply also
- * carries `hasMore`.
+ * One agent's leftover candidates, read through the `apiCall` restore uses
+ * for its Memory reads, deletes and writes, its Soul reads and its
+ * MemoryCandidate deletes. Soul deletes and writes use `soulApiCall` when one
+ * is given; the CLI binds both calls to the same target. Each candidate object
+ * carries only an id; the reply also carries `hasMore`.
  */
 async function listAgentCandidates(apiCall: ApiCall, agentId: string): Promise<Array<{ id: string }>> {
   let body: any;

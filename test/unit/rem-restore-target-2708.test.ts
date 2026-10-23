@@ -213,7 +213,7 @@ describe("flair#2708 — rem restore target (CLI)", () => {
     expect(b.requests().filter((r) => r.auth === "basic")).toEqual([]);
     expect(b.requests().some((r) => r.auth === "signature")).toBe(true);
     expect(b.requests().some((r) => r.endpoint === "http" && r.method === "GET" && r.path === "/Memory")).toBe(true);
-    // No candidate listing: that read needs the admin credential.
+    // No candidate listing: the CLI lists candidates only with an admin password.
     expect(b.requests().some((r) => r.path.startsWith("/AdminMemoryCandidates/"))).toBe(false);
   }, 60_000);
 

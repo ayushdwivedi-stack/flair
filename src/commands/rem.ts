@@ -154,7 +154,7 @@ export interface RestoreTarget {
   /**
    * Whether the target URL names a loopback host: 127.0.0.1, localhost or ::1
    * (written `[::1]` in a URL), or no FLAIR_URL is set. A dry run to a
-   * non-loopback target without an admin credential reads signed-only.
+   * non-loopback target without an admin password reads signed-only.
    */
   loopback: boolean;
 }
@@ -1420,8 +1420,8 @@ export function register(program: Command): void {
           console.error(`Error: ${err.message}`);
           process.exit(1);
         }
-        // The candidate listing route is admin-only, so the dry-run candidate
-        // count needs admin creds too. Dry-run treats reading the ambient
+        // The CLI lists candidates only with a resolved admin password, so the
+        // dry-run candidate count needs one too. Dry-run treats reading the ambient
         // local admin-password file as best-effort (an unusable file leaves
         // it without an admin credential), while --apply requires creds (Soul
         // rewrite) and fails loudly. A bad --admin-pass-file given explicitly
@@ -1445,7 +1445,7 @@ export function register(program: Command): void {
         // Every Memory, Soul and candidate read, delete and write goes to the
         // resolved base URL: the candidate listing is
         // GET /AdminMemoryCandidates/{agentId} on that same endpoint. Without
-        // an admin credential (a dry run only) there is no candidate listing.
+        // an admin password (a dry run only) there is no candidate listing.
         // Every REST call below refuses redirects, so it stays at that target.
         // With a resolved admin credential (a live replay always has one; an
         // --apply --dry-run may not), every Memory, Soul and MemoryCandidate

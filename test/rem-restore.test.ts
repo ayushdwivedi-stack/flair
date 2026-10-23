@@ -133,7 +133,7 @@ describe("applySnapshot — dry-run", () => {
     const { api, calls } = recordingApi({
       "GET:/Memory": () => current,
       "GET:/Soul": () => [{ id: "current-soul", agentId: "test-agent" }],
-      // Candidates are listed through the same apiCall the writes use, on the
+      // Candidates are listed through the apiCall the Memory writes use, on the
       // admin-only route `/AdminMemoryCandidates/{agentId}`.
       "GET:/AdminMemoryCandidates": () => ({ candidates: [{ id: "cand-1" }, { id: "cand-2" }], hasMore: false }),
     });

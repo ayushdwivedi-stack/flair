@@ -3,9 +3,9 @@
  * restore uses (flair#2755), against real Harpers.
  *
  * The route is `GET /AdminMemoryCandidates/{agentId}`. It returns the named
- * agent's candidate ids, refuses an unauthenticated caller (the `/Admin*` path
- * gate's 401) and a verified non-admin agent (AccessViolation 403), honours its
- * `limit`, and never returns another agent's rows.
+ * agent's candidate ids, refuses a request with no Authorization header (the
+ * `/Admin*` path gate's 401) and a verified non-admin agent (AccessViolation
+ * 403), honours its `limit`, and never returns another agent's rows.
  *
  * The restore test starts two instances that hold the same `flair.Instance`
  * row and different MemoryCandidate rows. The restore is aimed at one, with
@@ -182,7 +182,7 @@ describe("flair#2755 — admin-only candidate listing", () => {
     expect(page.candidates.every((c: any) => c.id.startsWith("c-a-"))).toBe(true);
   });
 
-  test("refuses an unauthenticated caller with the admin path gate's 401", async () => {
+  test("refuses a request with no Authorization header with the admin path gate's 401", async () => {
     const res = await fetch(`${adminHarper.httpURL}${path(AGENT_ID)}`);
     expect(res.status).toBe(401);
     expect(await res.text()).toBe("Authentication required.");

@@ -26,7 +26,8 @@
  * with `TPS-Ed25519 `, answers 403 to a request with no `Authorization`
  * header, and 401 to any other request. The admin-only
  * `/AdminMemoryCandidates` route serves only the admin credential: in `signed`
- * mode it answers any `TPS-Ed25519 ` header 403 and any other request 401.
+ * mode it answers a request with a `TPS-Ed25519 ` header 403, and any other
+ * request without the admin credential 401.
  * That 403 is synthetic: the stub checks no signature, and any such header
  * stands in for a verified non-admin agent.
  */
