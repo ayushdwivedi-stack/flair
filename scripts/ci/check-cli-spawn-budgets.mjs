@@ -198,6 +198,41 @@ function parseSourceFile(src, fileName = UNNAMED_SOURCE) {
 }
 
 /**
+ * Whether `fileName` selects a script kind in which TypeScript parses JSX
+ * (`.tsx` / `.jsx`).
+ */
+function isJsxFileName(fileName) {
+  const ext = /\.([^./\\]+)$/.exec(fileName)?.[1]?.toLowerCase();
+  return ext === "tsx" || ext === "jsx";
+}
+
+/**
+ * The source with every JSX TEXT node replaced by spaces, keeping its length and
+ * its newlines (flair#2808). JSX text is prose to the parser, not code: an
+ * apostrophe, quote or `//` in it otherwise opens a string or a comment in the
+ * text-based bracket walks and swallows the closing paren of the call or case
+ * around it. A JSX attribute's string value is a TypeScript string literal, which
+ * the literal masker already blanks (and `skipNonCode` already skips).
+ */
+function maskJsxText(src, fileName = UNNAMED_SOURCE) {
+  if (!isJsxFileName(fileName)) return src;
+  const sf = parseSourceFile(src, fileName);
+  const out = src.split("");
+  let masked = false;
+  const visit = (node) => {
+    if (node.kind === ts.SyntaxKind.JsxText) {
+      masked = true;
+      const start = node.getStart(sf);
+      for (let j = start; j < node.end && j < src.length; j++) if (src[j] !== "\n") out[j] = " ";
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return masked ? out.join("") : src;
+}
+
+/**
  * The source as TypeScript's parser reads it, with every comment and the text of
  * every string literal, template literal and regex literal replaced by spaces
  * (flair#2774). Newlines and length are kept, so every index still points at the
@@ -293,8 +328,9 @@ function skipNonCode(src, i) {
 /**
  * The source with every COMMENT body replaced by spaces (same length, so every
  * index still points at the same character). String and regex literals are left
- * alone — the CLI-entry and `timeout:` checks are literal text checks — but the
- * bracket walks skip their contents via `skipNonCode`.
+ * alone — the CLI-entry check reads their literal text — but the bracket walks
+ * skip their contents via `skipNonCode`. A spawn's deadline is not read here:
+ * it comes from the parsed options object literal (flair#2782).
  */
 function maskComments(src) {
   const out = src.split("");
@@ -631,11 +667,15 @@ function optionsDeadlineMs(arg) {
 
 /** All spawn-family calls in the file (node forms + Bun forms), with CLI-entry targeting. */
 export function findSpawnCalls(source, fileName = UNNAMED_SOURCE) {
-  const sf = parseSourceFile(source, fileName);
-  const scan = maskLiteralsAndComments(source, fileName, sf);
+  // JSX text is masked first, so both the literal masker's bracket walks and the
+  // text-based identifier scans see prose as spaces (flair#2808). Indices still
+  // point at the original source, which the call text is sliced from.
+  const jsxSafe = maskJsxText(source, fileName);
+  const sf = parseSourceFile(jsxSafe, fileName);
+  const scan = maskLiteralsAndComments(jsxSafe, fileName, sf);
   const callsByOpen = callExpressionsByOpenParen(sf);
-  const ids = cliEntryIdentifiers(source);
-  const aliases = aliasedSpawnFns(source);
+  const ids = cliEntryIdentifiers(jsxSafe);
+  const aliases = aliasedSpawnFns(jsxSafe);
   const constDecls = new Map();
   for (const m of scan.matchAll(/(?:^|\n)\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*/g)) {
     const after = m.index + m[0].length;
@@ -796,9 +836,9 @@ export function localHelpersThatSpawn(source, calls) {
 }
 
 /** `it()` / `test()` cases, with whether each reaches a CLI-entry spawn. */
-/** A wait deadline is the EXACT token `[1-9][0-9]*` (underscores allowed). An
- *  exponent (`1e999`), a trailing operator (`10000-10000`), `0`, or any other
- *  expression is NOT a positive integer → null (unbounded, flair#1825 round 6). */
+/** A spawn deadline is read from a `timeout: <numeric literal>` property of an
+ *  inline object literal options argument (flair#2782); `timeoutLiteralMs` decides
+ *  whether that literal is a positive integer. A non-literal value is no deadline. */
 // ONE strict literal for EVERY site (round 7 item 4): no leading zero, no
 // leading/trailing/double underscore, at most 15 digits so the value is finite
 // and safe. Anything else — `0`, `1__000`, `_1000`, `1e999`, `10000-10000`, a
@@ -1041,9 +1081,12 @@ function scopeOf(index, bodies, cases) {
 
 export function analyzeTestFile(source, fileName = UNNAMED_SOURCE) {
   const { calls, ids } = findSpawnCalls(source, fileName);
-  const helpers = localHelpersThatSpawn(source, calls);
-  const bodies = functionBodies(source);
-  const cases = findCases(source, calls, helpers, bodies);
+  // The case/helper walks match brackets in TEXT, so they read the source with
+  // JSX text masked too; every index still points at the original character.
+  const jsxSafe = maskJsxText(source, fileName);
+  const helpers = localHelpersThatSpawn(jsxSafe, calls);
+  const bodies = functionBodies(jsxSafe);
+  const cases = findCases(jsxSafe, calls, helpers, bodies);
   for (const call of calls) call.scope = scopeOf(call.index, bodies, cases);
   return { calls, ids, helpers, cases, bodies };
 }
