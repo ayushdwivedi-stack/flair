@@ -16,17 +16,20 @@
  *     suspension, so the scope knows of it even if `work` does not await it.
  *     A write settles as `staged` once its row is staged; its body then waits.
  *  2. When `work` settles, admission closes and every admitted write is
- *     drained. A rejection, a refusal returned by `work` (a `Response`), a
- *     refused write, or a checked-write admission capability refusal inside
- *     the scope aborts the transaction; nothing is committed, and a waiting
- *     body ends.
+ *     drained. Before the commit, a rejection of `work` or of an admitted
+ *     write, a refusal returned by `work` (a `Response`), a refused write, or
+ *     a checked-write admission capability refusal inside the scope aborts the
+ *     transaction; nothing is committed, and a waiting body ends.
  *  3. The transaction commits.
  *  4. Each staged write's body resumes, in admission order, for its
  *     post-commit confirmation, while the lock is still held (the acquisition
  *     waits for this scope to settle before it revokes the token and releases
  *     the keys).
  *  5. Only then is `committed` reported, with each write's confirmed answer.
- *     A confirmation that fails answers its refusal instead.
+ *     A confirmation runs after the commit, so its failure aborts nothing: a
+ *     confirmation that answers a refusal makes the scope report that
+ *     refusal, and one that throws makes the scope throw, with the write
+ *     already committed.
  */
 
 import {

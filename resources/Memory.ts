@@ -4192,10 +4192,14 @@ function enterCheckedWrite(verb: "put" | "patch", held: MemoryWriteLockToken, tx
       throw new TypeError("a checked Memory write names a string id and an object body");
     }
     // One snapshot, taken before admission, decides the write set and is the
-    // write: a later change to the caller's input reaches neither.
+    // write: a later change to the caller's input, nested values included,
+    // reaches neither. structuredClone, not a JSON round trip: a body read
+    // from a stored row can hold values JSON would not keep as they are (a
+    // typed-array vector, a Date), and a body it cannot clone is rejected here,
+    // before admission.
     snapshot = Object.freeze({
       id: input.id,
-      content: { ...input.content },
+      content: structuredClone(input.content),
       confirmFields: Object.freeze([...(input.confirmFields ?? [])]),
     });
     admission = admitLockedMemoryWrite(held, tx, memoryWriteLockStore(), checkedWriteIds(verb, snapshot));

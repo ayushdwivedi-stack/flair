@@ -137,6 +137,19 @@ describe("checked Memory writes under a held lock (flair#2478 part 3a)", () => {
     expect(harnessState.memoryStore.get("m2")).toEqual({ ...ROW, id: "m2", instanceToken: "token-m2" });
   });
 
+  it("put: a change to a nested array of the caller's input after the call does not reach the write", async () => {
+    const outcome = await withMemoryWriteLock(store, ["m1"], (held) =>
+      withLockedMemoryTransaction(held, ctx(), async (tx) => {
+        const input = { id: "m1", content: { ...ROW, content: "the checked edit", tags: ["note"] } as Record<string, any> };
+        const pending = putMemoryWithLock(held, tx, input);
+        // Lands after the call returned, before the write runs.
+        input.content.tags.push("changed");
+        return pending;
+      }));
+    expect((outcome as any).value.kind).toBe("committed");
+    expect(harnessState.memoryStore.get("m1").tags).toEqual(["note"]);
+  });
+
   it("a checked PUT refuses a skill body, an _reindex body and a body naming citations; a checked PATCH refuses a re-embed", async () => {
     const cases: Array<[Verb, Record<string, unknown>]> = [
       ["put", { ...ROW, tags: ["skill"], content: "a skill body" }],
