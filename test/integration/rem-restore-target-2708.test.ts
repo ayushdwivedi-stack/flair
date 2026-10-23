@@ -30,6 +30,20 @@ import { nodeBin } from "../helpers/node-runtime";
 import { createSnapshot } from "../../src/rem/snapshot.ts";
 
 const CLI = join(process.cwd(), "dist", "cli.js");
+/**
+ * This suite tests restore targeting, not how long an embedding call takes.
+ * The write path bounds an embedding call made under the memory write lock at
+ * MEMORY_LOCKED_PROVIDER_TIMEOUT_MS (20 s), and on a shared test host a slow
+ * provider can outlast that bound and report `memory_provider_timeout`, which
+ * reads like a targeting failure. This instance declares a wider bound; the
+ * override is read only under the fault-injection gate.
+ */
+const PROVIDER_BOUND_ENV = {
+  FLAIR_ENABLE_TEST_FAULT_INJECTION: "1",
+  FLAIR_MEMORY_LOCK_PROVIDER_TIMEOUT_MS: "60000",
+};
+/** The restore child's budget, above the provider bound: it gives a provider refusal additional headroom to reach the assertion; the whole restore can still exceed it. */
+const RESTORE_CHILD_TIMEOUT_MS = 90_000;
 const FETCH_LOG_PRELOAD = join(import.meta.dirname, "..", "helpers", "fetch-request-log-preload.ts");
 const AGENT_ID = "agent-a";
 const MEMORY_ID = "m-restored";
@@ -114,7 +128,8 @@ function runRestore(env: Record<string, string | undefined>, credential: string[
   const preload = fetchLog ? ["--import", pathToFileURL(FETCH_LOG_PRELOAD).href] : [];
   const child = Bun.spawn(
     [nodeBin({ env: childEnv as Record<string, string> }), ...preload, CLI, "rem", "restore", date, "--agent", AGENT_ID, "--apply", ...credential],
-    { env: childEnv as Record<string, string>, timeout: 60_000, stdout: "pipe", stderr: "pipe" },
+    // The deadline below is RESTORE_CHILD_TIMEOUT_MS, written as a number so the CLI spawn-budget gate can read it.
+    { env: childEnv as Record<string, string>, timeout: 90_000, stdout: "pipe", stderr: "pipe" },
   );
   return (async () => {
     const stdout = await new Response(child.stdout).text();
@@ -124,8 +139,16 @@ function runRestore(env: Record<string, string | undefined>, credential: string[
   })();
 }
 
+/** stdio for a failed restore, calling out a provider timeout when the output carries one. */
+function restoreFailure(result: { stdout: string; stderr: string }): string {
+  const output = `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
+  return /memory_provider_timeout/.test(output)
+    ? `${output}\nprovider timeout: output contains memory_provider_timeout; inspect the errors above for any additional failures`
+    : output;
+}
+
 beforeAll(async () => {
-  a = await startHarper();
+  a = await startHarper({ serverEnv: { ...PROVIDER_BOUND_ENV } });
   assertOwnInstance(a);
   home = mkdtempSync(join(tmpdir(), "flair-2708-real-"));
   mkdirSync(join(home, ".flair"), { recursive: true });
@@ -180,7 +203,7 @@ describe("flair#2708 — rem restore on a real instance", () => {
       snapshotStem,
     );
 
-    expect(result.code, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`).toBe(0);
+    expect(result.code, restoreFailure(result)).toBe(0);
     expect(result.stdout).toContain("Status:       completed");
     expect(result.stdout).toContain("Deleted:      2 memories, 1 souls, 1 candidates");
     expect(result.stdout).toContain("Restored:     1 memories, 1 souls");
@@ -212,7 +235,7 @@ describe("flair#2708 — rem restore on a real instance", () => {
       snapshotStem,
     );
 
-    expect(result.code, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`).toBe(0);
+    expect(result.code, restoreFailure(result)).toBe(0);
     expect(result.stdout).toContain("Status:       completed");
     expect(result.stdout).toMatch(/Deleted: +\d+ memories, 1 souls, \d+ candidates/);
     expect(await agentRows(a, "Memory", ["id", "content"])).toEqual([{ id: MEMORY_ID, content: "restored memory" }]);
