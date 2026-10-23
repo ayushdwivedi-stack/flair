@@ -262,10 +262,12 @@ esac
         return [name, statSync(path).isFile() ? readFileSync(path).toString("base64") : "<dir>"];
       });
       const before = snapshot();
+      // bun caches the transpiled output of a source file over 50 KB; the
+      // snapshot is for the gate's own writes, so that cache is switched off.
       const res = spawnSync(process.execPath, ["--import", join(root, "offline.mjs"), join(root, "scripts/audit-gate.mjs"), "--npm-install-prefix", adk ? join(root, "adk-prefix") : root, "--adk-npm-install-prefix", adk ? root : join(root, "adk-prefix")], {
         encoding: "utf8",
         timeout: 10_000,
-        env: { ...process.env, PATH: `${join(root, "bin")}:${process.env.PATH}`, HOME: join(root, "home"), TMPDIR: join(root, "tmp"), AUDIT_GATE_TODAY: "2026-10-01" },
+        env: { ...process.env, PATH: `${join(root, "bin")}:${process.env.PATH}`, HOME: join(root, "home"), TMPDIR: join(root, "tmp"), AUDIT_GATE_TODAY: "2026-10-01", BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0" },
       });
       return { res, wrote: JSON.stringify(snapshot()) !== JSON.stringify(before) };
     } finally {
@@ -1148,6 +1150,102 @@ describe("vendor-pinned nodes shipped in harper's bundle", () => {
         expect(problems).toContain(node);
         expect(problems).toContain("node_modules/fastify/package.json resolves outside harper's installed tree");
       },
+    );
+  });
+
+  // In each refusal below, the package.json resolves inside harper's tree and a
+  // directory on the way to it resolves outside.
+  const findMyWay = `${fastify}/node_modules/find-my-way`;
+  const vendored = "node_modules/harper/vendor";
+
+  it("refuses a node whose package directory resolves outside harper's tree", () => {
+    withBundlePrefix(
+      {
+        harper: { name: "harper", version: "5.3.3", bundleDependencies: ["fastify"] },
+        lock: { [findMyWay]: { version: "9.6.0", inBundle: true } },
+        packages: { [fastify]: "5.12.5", [`${vendored}/find-my-way`]: "9.6.0" },
+        links: {
+          "elsewhere/find-my-way/package.json": `${vendored}/find-my-way/package.json`,
+          [findMyWay]: "elsewhere/find-my-way",
+        },
+      },
+      (prefix) => {
+        const problems = vendorPinnedNodeProblems(advisory("find-my-way", findMyWay, "9.6.0"), prefix).join("\n");
+        expect(problems).toContain(findMyWay);
+        expect(problems).toContain("node_modules/fastify/node_modules/find-my-way resolves outside harper's installed tree");
+      },
+    );
+  });
+
+  it("refuses a node below a node_modules directory that resolves outside harper's tree", () => {
+    withBundlePrefix(
+      {
+        harper: { name: "harper", version: "5.3.3", bundleDependencies: ["fastify"] },
+        lock: { [findMyWay]: { version: "9.6.0", inBundle: true } },
+        packages: { [fastify]: "5.12.5", [`${vendored}/find-my-way`]: "9.6.0" },
+        links: {
+          "elsewhere/node_modules/find-my-way": `${vendored}/find-my-way`,
+          [`${fastify}/node_modules`]: "elsewhere/node_modules",
+        },
+      },
+      (prefix) => {
+        const problems = vendorPinnedNodeProblems(advisory("find-my-way", findMyWay, "9.6.0"), prefix).join("\n");
+        expect(problems).toContain(findMyWay);
+        expect(problems).toContain("node_modules/fastify/node_modules resolves outside harper's installed tree");
+      },
+    );
+  });
+
+  const fastUri = "node_modules/harper/node_modules/fast-uri";
+  const fastifyNeedsAvvio = { name: "fastify", version: "5.12.5", dependencies: { avvio: "^9.0.0" } };
+  const avvioNeedsFastUri = { name: "avvio", version: "9.1.0", dependencies: { "fast-uri": "^3.0.0" } };
+
+  it("refuses a node the closure walk reaches through a node_modules directory that resolves outside harper's tree", () => {
+    withBundlePrefix(
+      {
+        harper: { name: "harper", version: "5.3.3", bundleDependencies: ["fastify"] },
+        lock: { [fastUri]: { version: "3.1.0", inBundle: true } },
+        packages: { [fastUri]: "3.1.0", [fastify]: fastifyNeedsAvvio, [`${vendored}/avvio`]: avvioNeedsFastUri },
+        links: {
+          "elsewhere/node_modules/avvio": `${vendored}/avvio`,
+          [`${fastify}/node_modules`]: "elsewhere/node_modules",
+        },
+      },
+      (prefix) => {
+        const problems = vendorPinnedNodeProblems(advisory("fast-uri", fastUri, "3.1.0"), prefix).join("\n");
+        expect(problems).toContain(fastUri);
+        expect(problems).toContain("node_modules/fastify/node_modules resolves outside harper's installed tree");
+      },
+    );
+  });
+
+  it("refuses a node the closure walk reaches through a package directory that resolves outside harper's tree", () => {
+    withBundlePrefix(
+      {
+        harper: { name: "harper", version: "5.3.3", bundleDependencies: ["fastify"] },
+        lock: { [fastUri]: { version: "3.1.0", inBundle: true } },
+        packages: { [fastUri]: "3.1.0", [fastify]: fastifyNeedsAvvio, [`${vendored}/avvio`]: avvioNeedsFastUri },
+        links: {
+          "elsewhere/avvio/package.json": `${vendored}/avvio/package.json`,
+          [`${fastify}/node_modules/avvio`]: "elsewhere/avvio",
+        },
+      },
+      (prefix) => {
+        const problems = vendorPinnedNodeProblems(advisory("fast-uri", fastUri, "3.1.0"), prefix).join("\n");
+        expect(problems).toContain(fastUri);
+        expect(problems).toContain("node_modules/fastify/node_modules/avvio resolves outside harper's installed tree");
+      },
+    );
+  });
+
+  it("accepts a node the closure walk reaches through directories inside harper's tree", () => {
+    withBundlePrefix(
+      {
+        harper: { name: "harper", version: "5.3.3", bundleDependencies: ["fastify"] },
+        lock: { [fastUri]: { version: "3.1.0", inBundle: true } },
+        packages: { [fastUri]: "3.1.0", [fastify]: fastifyNeedsAvvio, [`${fastify}/node_modules/avvio`]: avvioNeedsFastUri },
+      },
+      (prefix) => expect(vendorPinnedNodeProblems(advisory("fast-uri", fastUri, "3.1.0"), prefix)).toEqual([]),
     );
   });
 
