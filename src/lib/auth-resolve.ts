@@ -95,14 +95,18 @@ import { resolveHome } from "./home.js";
  *     JSON body re-serialized with every string in it redacted after decoding,
  *     or withheld when it cannot be; any other body redacted as text; and any
  *     body withheld when that header names basic, bearer or tps-ed25519 but
- *     its credential could not be read. The message's reason is built from the
- *     unredacted text and redacted or withheld the same way
- *     (`describeHttpFailure`); its `HTTP <status>` prefix is not passed
- *     through redaction. Classifiers read the unredacted text through
- *     `apiErrorRawBody`; the rem formatters that derive display text from it
- *     pass that text through `boundErrorText`, which redacts or withholds it
- *     the same way. Within the scope below, each of those values becomes
- *     `[redacted]` in the server's text as displayed.
+ *     its credential could not be read. The message's reason is decided
+ *     separately (`describeHttpFailure`), from the unredacted text:
+ *     BODY_WITHHELD for any non-empty body when the header's credential could
+ *     not be read; otherwise the JSON body's named error, redacted, even when
+ *     `body` is withheld; otherwise an excerpt of the text, redacted, or
+ *     BODY_WITHHELD when displayBody withholds the body. Its `HTTP <status>`
+ *     prefix is not passed through redaction. Classifiers read the unredacted
+ *     text through `apiErrorRawBody`; the rem formatters that derive display
+ *     text from it pass that text through `boundErrorText`, which redacts it,
+ *     or withholds it when the header's credential could not be read. Within
+ *     the scope below, each of those values becomes `[redacted]` in the
+ *     server's text as displayed.
  * Scope: redaction removes the request's credential values from the text the
  * server supplied (literal, inside any JSON string, percent-encoded); text the
  * CLI writes itself (the `HTTP <status>: ` prefix, the debug line's labels, a

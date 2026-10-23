@@ -1,8 +1,11 @@
 /**
- * The Basic `Authorization` header grammar the auth middleware accepts
+ * The Basic `Authorization` header check the auth middleware uses
  * (flair#2764), in one place so the CLI's copy in src/lib/auth-resolve.ts can
- * be tested against it. Scheme names are case-insensitive (RFC 9110), and the
- * scheme is followed by exactly one space; the rest is base64.
+ * be tested against it. It is a prefix test only: `Basic` in any case (scheme
+ * names are case-insensitive, RFC 9110) followed by a space. Nothing after
+ * that space is validated: parseBasicAuthHeader decodes all of it with
+ * `Buffer.from(..., "base64")`, which does not reject characters outside the
+ * base64 alphabet, so further spaces or any other text pass the check.
  */
 export const BASIC_AUTH_HEADER_RE = /^Basic /i;
 
