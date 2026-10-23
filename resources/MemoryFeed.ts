@@ -336,9 +336,9 @@ export class FeedMemories extends Resource {
     // waits its budget and can answer `503 memory_busy`; a marked id answers
     // `503 write_outcome_unknown` at once; a store with no lock answers
     // `503 memory_lock_unavailable`. The write-back confirms its committed row
-    // as before; when its read-back of that row does not show the write (409
-    // `feed_write_unconfirmed`), it records the id outcome-unknown before the
-    // lock is released (flair#2806). An omitted id is generated; a
+    // as before; when its read-back of that row fails or does not show the
+    // write (409 `feed_write_unconfirmed`), it records the id outcome-unknown
+    // before the lock is released (flair#2806). An omitted id is generated; a
     // caller-supplied id can contend.
     // The skill branch above returns before this lock; its conversion is
     // deferred.
@@ -767,7 +767,12 @@ async function repairDeduplicatedExpiryLocked(ctx: unknown, match: any, id: stri
       markMemoryWriteOutcomeUnknown(id);
       throw err;
     }
-    if (!isDedupMatch(confirmed, match) || confirmed.expiresAt !== outcome.row.expiresAt) return feedDedupTargetChanged(id);
+    if (!isDedupMatch(confirmed, match) || confirmed.expiresAt !== outcome.row.expiresAt) {
+      // flair#2806: the update committed and this read does not show it on the
+      // matched row. Record the marker inside the lock, as for a failed read.
+      markMemoryWriteOutcomeUnknown(id);
+      return feedDedupTargetChanged(id);
+    }
     return stripInlinePointerFields(confirmed);
   }
   return feedDedupTargetChanged(id);
