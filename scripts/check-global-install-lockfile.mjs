@@ -14,12 +14,15 @@
  *
  * The package-count floor it enforces lives in the reviewed budget file
  * (.github/install-weight-budget.json → minPackages), not in this script.
- * The count it compares is the installed tree itself (countInstalledPackages:
- * package directories under the global lib/node_modules — one holding a
- * package.json with a name and version — nested and bundled copies included). npm's "added N
- * packages" summary is printed for information only: harper >5.3.1 ships its
- * dependencies as bundleDependencies, and npm's summary line does not count
- * bundled copies, so the summary understates a healthy tree.
+ * The count it compares is Flair's installed dependency graph (countFlairTree):
+ * starting from the installed @tpsdev-ai/flair package directory, each
+ * dependency named in a package's dependencies/optionalDependencies is resolved
+ * the way Node resolves it from that package's real directory, and each resolved
+ * package directory is counted once. Bundled copies under a package's own
+ * node_modules are reached that way; unrelated packages in the prefix are not.
+ * npm's "added N packages" summary is printed for information only: harper
+ * >5.3.1 ships its dependencies as bundleDependencies, and npm's summary line
+ * does not count bundled copies, so the summary understates a healthy tree.
  *
  * Cause: 0.54.1's `bundleDependencies: ["@tpsdev-ai/flair-tool-descriptors"]`
  * (#1681) interacted with harper's own npm-shrinkwrap.json. npm's reify then
@@ -51,15 +54,16 @@
  *
  * Exit codes:
  *   0 — every check passed
- *   1 — at least one check failed (the install is broken; details on stderr)
+ *   1 — at least one check failed (the install is broken, or npm exited nonzero
+ *       while leaving a tree; details on stderr)
  *   2 — DID NOT RUN (no --package, npm could not install at all, no tree) —
  *       never silently green. Mirrors check-install-weight.mjs.
  */
 
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
@@ -116,86 +120,149 @@ export function treePaths(prefix) {
 }
 
 /**
- * Hard bounds for the tree walk. They do not depend on what is installed: a tree
- * that exceeds either is a corrupt install, and the walk throws rather than
- * reporting a lower count as a measurement.
+ * Hard bounds for the graph walk. They do not depend on what is installed: a
+ * graph that exceeds either is a corrupt install, and the walk throws rather
+ * than reporting a lower count as a measurement.
  */
-const MAX_TREE_DEPTH = 64;
-const MAX_TREE_ENTRIES = 250_000;
+const MAX_GRAPH_DEPTH = 64;
+const MAX_GRAPH_PACKAGES = 250_000;
+
+function messageOf(err) {
+  return err instanceof Error ? err.message : String(err);
+}
 
 /**
  * Read a directory's package identity: `{name, version}` when its package.json
- * parses and carries both, null otherwise. No existence check first — read and
- * classify the failure, so the result cannot race a concurrent writer.
+ * parses and carries both. A missing, unreadable or malformed manifest throws,
+ * naming the path: a read failure must never lower the count (which would let a
+ * broken tree pass the floor).
  */
 function readPackageIdentity(dir) {
+  const manifestPath = join(dir, "package.json");
+  let text;
+  try {
+    text = readFileSync(manifestPath, "utf8");
+  } catch (err) {
+    throw new Error(`cannot read ${manifestPath}: ${messageOf(err)}`);
+  }
   let raw;
   try {
-    raw = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
-  } catch {
-    return null;
+    raw = JSON.parse(text);
+  } catch (err) {
+    throw new Error(`cannot parse ${manifestPath}: ${messageOf(err)}`);
   }
-  if (typeof raw?.name !== "string" || raw.name === "") return null;
-  if (typeof raw?.version !== "string" || raw.version === "") return null;
-  return { name: raw.name, version: raw.version };
+  if (typeof raw?.name !== "string" || raw.name === "") {
+    throw new Error(`${manifestPath} has no string name`);
+  }
+  if (typeof raw?.version !== "string" || raw.version === "") {
+    throw new Error(`${manifestPath} has no string version`);
+  }
+  for (const field of ["dependencies", "optionalDependencies"]) {
+    const value = raw[field];
+    if (value !== undefined && (value === null || typeof value !== "object" || Array.isArray(value))) {
+      throw new Error(`${manifestPath} has a malformed ${field} field`);
+    }
+  }
+  return raw;
 }
 
-function listDir(dir, required) {
-  try {
-    return readdirSync(dir, { withFileTypes: true });
-  } catch (err) {
-    if (!required && err?.code === "ENOENT") return null;
-    const message = err instanceof Error ? err.message : String(err);
-    throw new Error(`could not read ${dir}: ${message}`);
+/**
+ * The `node_modules` directory the installed Flair package sits in. Resolution
+ * stops at its parent so an ambient package above the install prefix can never
+ * be counted as one of Flair's dependencies.
+ */
+function enclosingNodeModules(flairDir) {
+  let dir = realpathSync(flairDir);
+  for (;;) {
+    if (dir.endsWith(`${sep}node_modules`)) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) {
+      throw new Error(`cannot find a node_modules root above ${flairDir}`);
+    }
+    dir = parent;
   }
 }
 
 /**
- * Count the installed packages in a global `lib/node_modules` tree.
- *
- * A package is a directory holding a package.json with a non-empty name and
- * version; `@scope/pkg` counts once (the scope directory itself has no
- * package.json). Nested `node_modules` (regular hoisting) and a package's own
- * bundled `node_modules` (harper's bundleDependencies) are walked, so the count
- * reflects what is on disk rather than npm's "added N packages" summary, which
- * omits bundled copies. Symlinks are not followed, so a linked entry cannot be
- * counted twice.
- *
- * Throws on an unreadable directory or a tree past the bounds above. A failed
- * read is never reported as a smaller tree.
+ * Resolve `name` the way Node does from `fromDir`: `<dir>/node_modules/<name>`
+ * for each ancestor directory, skipping directories already named node_modules.
+ * Stops after the parent of `root`, so the search stays inside the install.
+ * Returns the resolved real directory, or null when nothing is installed there.
  */
-export function countInstalledPackages(globalNodeModules) {
-  let entries = 0;
+function resolveDependencyDir(fromDir, name, root) {
+  const last = dirname(root);
+  let dir = fromDir;
+  for (;;) {
+    if (basename(dir) !== "node_modules") {
+      const candidate = join(dir, "node_modules", name);
+      let stat;
+      try {
+        stat = statSync(candidate);
+      } catch (err) {
+        if (err?.code !== "ENOENT" && err?.code !== "ENOTDIR") {
+          throw new Error(`cannot stat ${candidate}: ${messageOf(err)}`);
+        }
+      }
+      if (stat) {
+        if (!stat.isDirectory()) {
+          throw new Error(`dependency ${name} at ${candidate} is not a directory`);
+        }
+        return realpathSync(candidate);
+      }
+    }
+    if (dir === last) return null;
+    const parent = dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+/**
+ * Count Flair's installed dependency graph, starting at the installed
+ * @tpsdev-ai/flair package directory.
+ *
+ * The root package counts once, then every dependency named in a package's
+ * `dependencies` or `optionalDependencies` is resolved by Node's search from
+ * that package's real directory and counted once per resolved directory.
+ * Bundled copies are reached because they sit in `node_modules` under the
+ * package that declares them. Packages in the prefix that nothing in the graph
+ * depends on are never visited; nor is anything above the install prefix.
+ *
+ * A required dependency that does not resolve, and a resolved directory whose
+ * package.json is missing, unreadable or malformed, throws naming the path: a
+ * failed read is never reported as a smaller tree. An optional dependency that
+ * is not installed is skipped.
+ */
+export function countFlairTree(flairDir, root = enclosingNodeModules(flairDir)) {
+  const flairReal = realpathSync(flairDir);
+  const rootReal = realpathSync(root);
+  const seen = new Set();
   let packages = 0;
 
-  const walk = (dir, depth, required) => {
-    if (depth > MAX_TREE_DEPTH) {
-      throw new Error(`package tree is deeper than ${MAX_TREE_DEPTH} node_modules levels at ${dir}`);
+  const visit = (dir, depth) => {
+    if (depth > MAX_GRAPH_DEPTH) {
+      throw new Error(`dependency graph is deeper than ${MAX_GRAPH_DEPTH} packages at ${dir}`);
     }
-    const children = listDir(dir, required);
-    if (children === null) return;
-    for (const child of children) {
-      if (!child.isDirectory()) continue;
-      if (++entries > MAX_TREE_ENTRIES) {
-        throw new Error(`package tree under ${globalNodeModules} has more than ${MAX_TREE_ENTRIES} directories`);
+    if (seen.has(dir)) return;
+    seen.add(dir);
+    if (++packages > MAX_GRAPH_PACKAGES) {
+      throw new Error(`dependency graph under ${rootReal} has more than ${MAX_GRAPH_PACKAGES} packages`);
+    }
+    const manifest = readPackageIdentity(dir);
+    const required = Object.keys(manifest.dependencies ?? {});
+    const optional = Object.keys(manifest.optionalDependencies ?? {});
+    for (const name of [...required, ...optional]) {
+      const isOptionalOnly = !required.includes(name);
+      const resolved = resolveDependencyDir(dir, name, rootReal);
+      if (resolved === null) {
+        if (isOptionalOnly) continue;
+        throw new Error(`dependency ${name} of ${manifest.name}@${manifest.version} did not resolve from ${dir}`);
       }
-      const path = join(dir, child.name);
-      if (child.name === "node_modules") {
-        walk(path, depth + 1, false);
-        continue;
-      }
-      if (readPackageIdentity(path) !== null) {
-        packages += 1;
-        walk(join(path, "node_modules"), depth + 1, false);
-      } else {
-        // A scope directory (`@scope`) or a stray directory: its packages, if
-        // any, are one level down.
-        walk(path, depth + 1, false);
-      }
+      visit(resolved, depth + 1);
     }
   };
 
-  walk(globalNodeModules, 0, true);
+  visit(flairReal, 0);
   return packages;
 }
 
@@ -257,20 +324,38 @@ export function harperVersion(paths) {
 }
 
 /**
- * Apply the four checks to a finished install. Pure — takes the captured log
- * and the on-disk tree, returns findings. Unit-tested in
+ * Apply the checks to a finished install. Takes the npm exit status and the
+ * captured log, returns findings. Unit-tested in
  * test/unit/global-install-lockfile.test.ts.
  *
- * `added` (npm's summary line) is returned for reporting only; the floor is
- * compared against `measured`, the count taken from the tree itself.
+ * A nonzero or missing status fails first: an install npm refused is not
+ * rescued by whatever tree it left behind. `added` (npm's summary line) is
+ * returned for reporting only; the floor is compared against `measured`, the
+ * count taken from Flair's installed dependency graph.
  */
-export function evaluateInstall({ log, paths, minPackages }) {
+export function evaluateInstall({ status, log, paths, minPackages }) {
   if (!Number.isFinite(minPackages) || minPackages <= 0) {
     throw new Error("evaluateInstall requires a positive minPackages (see readMinPackages)");
   }
   if (typeof paths.globalNodeModules !== "string" || paths.globalNodeModules === "") {
     throw new Error("evaluateInstall requires paths.globalNodeModules (see treePaths)");
   }
+  const added = parseAddedCount(log);
+
+  if (status !== 0) {
+    const shown = status === null || status === undefined ? "none (the process was killed)" : status;
+    return {
+      added,
+      measured: null,
+      fsExtra: { ok: false, error: "not evaluated: npm install failed" },
+      harper: { ok: false, error: "not evaluated: npm install failed" },
+      failures: [
+        `npm install exited with status ${shown} — refusing the install before evaluating the tree it left behind`,
+      ],
+      ok: false,
+    };
+  }
+
   const failures = [];
 
   if (hasDamagedLockfileWarning(log)) {
@@ -280,12 +365,16 @@ export function evaluateInstall({ log, paths, minPackages }) {
     );
   }
 
-  const added = parseAddedCount(log);
-  const measured = countInstalledPackages(paths.globalNodeModules);
-  if (measured < minPackages) {
+  let measured = null;
+  try {
+    measured = countFlairTree(paths.flair, paths.globalNodeModules);
+  } catch (err) {
+    failures.push(`could not measure Flair's installed dependency graph: ${messageOf(err)}`);
+  }
+  if (measured !== null && measured < minPackages) {
     const reported = added === null ? "" : ` (npm reported "added ${added}")`;
     failures.push(
-      `installed tree has ${measured} packages (package.json with a name and version under lib/node_modules), ` +
+      `installed Flair tree has ${measured} packages (Flair and each package resolved from it), ` +
         `below the ${minPackages} floor${reported} — dependency tree collapsed`,
     );
   }
@@ -343,9 +432,9 @@ function main() {
       process.exit(2);
     }
     try {
-      console.log(countInstalledPackages(opts.countRoot));
+      console.log(countFlairTree(join(opts.countRoot, "@tpsdev-ai", "flair"), opts.countRoot));
     } catch (err) {
-      console.error(`DID NOT RUN: ${err instanceof Error ? err.message : err}`);
+      console.error(`DID NOT RUN: ${messageOf(err)}`);
       process.exit(2);
     }
     return;
@@ -388,18 +477,21 @@ function main() {
 
     const paths = treePaths(prefix);
     if (!existsSync(paths.flair)) {
-      console.error(`DID NOT RUN: no installed tree at ${paths.flair} (npm exit ${run.status})`);
+      const shown = run.status === null ? "none (the process was killed)" : run.status;
+      console.error(`DID NOT RUN: no installed tree at ${paths.flair} (npm exit ${shown})`);
       console.error(log.trim().split("\n").slice(-20).join("\n"));
       process.exit(2);
     }
 
     const result = evaluateInstall({
+      status: run.status,
       log,
       paths,
       minPackages: opts.minPackages ?? readMinPackages(),
     });
     console.error(
-      `[global-install] npm-added=${result.added ?? "(no summary line)"} measured=${result.measured} packages ` +
+      `[global-install] npm-status=${run.status ?? "none"} npm-added=${result.added ?? "(no summary line)"} ` +
+        `measured=${result.measured ?? "(not evaluated)"} packages ` +
         `fs-extra=${result.fsExtra.ok ? "ok" : "FAIL"} harper version=${result.harper.ok ? result.harper.version : "FAIL"}`,
     );
     if (!result.ok) {

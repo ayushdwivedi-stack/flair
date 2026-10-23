@@ -16,10 +16,11 @@
  * (`<name>@<version>  <path under harper/node_modules>`), then the count.
  *
  * Exit codes:
- *   0 — harper is installed, declares a bundle, and every copy was read.
+ *   0 — harper is installed, declares a bundle, and every declared copy was read.
  *   2 — DID NOT RUN: harper or its manifest is unreadable, it declares no
- *       bundleDependencies, or an installed package's manifest is unreadable.
- *       Never 0 for a tree this script could not measure.
+ *       bundleDependencies, a declared entry has no directory, or an installed
+ *       package's manifest is missing, unreadable or malformed. Every defect is
+ *       named on stderr. Never 0 for a tree this script could not measure.
  */
 
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
@@ -48,13 +49,15 @@ function readManifest(file) {
 }
 
 /** Installed packages under one node_modules directory, including nested copies. */
-function walk(nodeModules, dir, seen, copies) {
-  if (!existsSync(dir)) return;
+function walk(nodeModules, dir, seen, copies, problems) {
   let real;
   try {
     real = realpathSync(dir);
   } catch (e) {
-    throw new Error(`cannot resolve ${dir}: ${e.message}`);
+    // A package with no nested node_modules is normal, not a skipped copy.
+    if (e?.code === "ENOENT") return;
+    problems.push(`cannot resolve ${dir}: ${e.message}`);
+    return;
   }
   if (seen.has(real)) return;
   seen.add(real);
@@ -62,28 +65,48 @@ function walk(nodeModules, dir, seen, copies) {
   try {
     entries = readdirSync(dir, { withFileTypes: true });
   } catch (e) {
-    throw new Error(`cannot read ${dir}: ${e.message}`);
+    problems.push(`cannot read ${dir}: ${e.message}`);
+    return;
   }
+  const visit = (packageDir) => {
+    let isDir = false;
+    try {
+      isDir = statSync(packageDir).isDirectory();
+    } catch (e) {
+      problems.push(`cannot stat ${packageDir}: ${e.message}`);
+      return;
+    }
+    if (!isDir) return;
+    const manifestPath = join(packageDir, "package.json");
+    if (!existsSync(manifestPath)) {
+      problems.push(`package directory ${packageDir} has no package.json`);
+      return;
+    }
+    let manifest;
+    try {
+      manifest = readManifest(manifestPath);
+    } catch (e) {
+      problems.push(e.message);
+      return;
+    }
+    copies.push({ name: manifest.name, version: manifest.version, path: relative(nodeModules, packageDir) });
+    walk(nodeModules, join(packageDir, "node_modules"), seen, copies, problems);
+  };
   for (const entry of entries) {
     if (entry.name === ".bin" || entry.name.startsWith(".")) continue;
     const full = join(dir, entry.name);
-    const names = entry.name.startsWith("@")
-      ? readdirSync(full, { withFileTypes: true }).map((child) => join(full, child.name))
-      : [full];
-    for (const packageDir of names) {
-      let isDir = false;
+    if (entry.name.startsWith("@")) {
+      let children;
       try {
-        isDir = statSync(packageDir).isDirectory();
-      } catch {
-        isDir = false;
+        children = readdirSync(full, { withFileTypes: true });
+      } catch (e) {
+        problems.push(`cannot read scope directory ${full}: ${e.message}`);
+        continue;
       }
-      if (!isDir) continue;
-      const manifestPath = join(packageDir, "package.json");
-      if (!existsSync(manifestPath)) continue;
-      const manifest = readManifest(manifestPath);
-      copies.push({ name: manifest.name, version: manifest.version, path: relative(nodeModules, packageDir) });
-      walk(nodeModules, join(packageDir, "node_modules"), seen, copies);
+      for (const child of children) visit(join(full, child.name));
+      continue;
     }
+    visit(full);
   }
 }
 
@@ -112,7 +135,16 @@ export function listBundledCopies(nodeModulesDir) {
   }
   if (!hasBundledDir) throw new Error(`harper ${manifest.version} has no ${bundledDir}`);
   const copies = [];
-  walk(bundledDir, bundledDir, new Set(), copies);
+  const problems = [];
+  walk(bundledDir, bundledDir, new Set(), copies, problems);
+  for (const name of declaredNames) {
+    if (!copies.some((copy) => copy.path === name)) {
+      problems.push(`declared bundled package ${name} has no directory at ${join(bundledDir, name)}`);
+    }
+  }
+  if (problems.length > 0) {
+    throw new Error(problems.join("; "));
+  }
   if (copies.length === 0) throw new Error(`no installed packages under ${bundledDir}`);
   copies.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   return { harperVersion: manifest.version, declared: declaredNames, copies, bundledDir };

@@ -94,4 +94,51 @@ describe("harper's bundled copies", () => {
     });
     expect(() => listBundledCopies(join(root, "node_modules"))).toThrow(/no string name and version/);
   });
+
+  test("a declared bundle entry with no directory exits 2, naming it", () => {
+    const root = fixture({
+      "harper/package.json": harper({ bundleDependencies: ["fastify", "missing-pkg"] }),
+      "harper/node_modules/fastify/package.json": { name: "fastify", version: "5.12.5" },
+    });
+    expect(() => listBundledCopies(join(root, "node_modules"))).toThrow(/missing-pkg.*has no directory/);
+  });
+
+  test("a package directory with no manifest exits 2, naming the path", () => {
+    const root = fixture({
+      "harper/package.json": harper({ bundleDependencies: ["fastify"] }),
+      "harper/node_modules/fastify/package.json": { name: "fastify", version: "5.12.5" },
+    });
+    mkdirSync(join(root, "node_modules", "harper", "node_modules", "stray"), { recursive: true });
+    expect(() => listBundledCopies(join(root, "node_modules"))).toThrow(/stray.*has no package\.json/);
+  });
+
+  test("an unreadable manifest exits 2 for root too, naming the path", () => {
+    const root = fixture({
+      "harper/package.json": harper({ bundleDependencies: ["fastify"] }),
+      "harper/node_modules/fastify/package.json": { name: "fastify", version: "5.12.5" },
+    });
+    // A directory where the manifest belongs: readFileSync fails with EISDIR,
+    // which root does not bypass (chmod 000 would).
+    const manifestPath = join(root, "node_modules", "harper", "node_modules", "fastify", "package.json");
+    rmSync(manifestPath);
+    mkdirSync(manifestPath, { recursive: true });
+    expect(() => listBundledCopies(join(root, "node_modules"))).toThrow(/cannot read .*fastify.*package\.json/);
+  });
+
+  test("a manifest-less copy makes main exit 2 instead of skipping it", () => {
+    const root = fixture({
+      "harper/package.json": harper({ bundleDependencies: ["fastify"] }),
+      "harper/node_modules/fastify/package.json": { name: "fastify", version: "5.12.5" },
+    });
+    mkdirSync(join(root, "node_modules", "harper", "node_modules", "stray"), { recursive: true });
+    const errors: string[] = [];
+    const original = console.error;
+    console.error = (message: string) => errors.push(String(message));
+    try {
+      expect(main([join(root, "node_modules")])).toBe(2);
+    } finally {
+      console.error = original;
+    }
+    expect(errors.join("\n")).toContain("stray");
+  });
 });

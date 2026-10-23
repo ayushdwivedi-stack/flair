@@ -48,8 +48,8 @@ export interface HarperCheck {
 export interface InstallEvaluation {
   /** npm's "added N packages" summary, reported only — never compared to the floor. */
   added: number | null;
-  /** Packages on disk: package.json with a name and version under lib/node_modules. */
-  measured: number;
+  /** Packages in Flair's resolved dependency graph; null when npm failed first. */
+  measured: number | null;
   fsExtra: ResolveCheck;
   harper: HarperCheck;
   failures: string[];
@@ -58,14 +58,26 @@ export interface InstallEvaluation {
 
 export function treePaths(prefix: string): TreePaths;
 /**
- * Counts package directories under a global `lib/node_modules`, bundled copies
- * included. Throws on an unreadable directory or a tree past its hard bounds.
+ * Counts Flair's installed dependency graph from the installed
+ * @tpsdev-ai/flair directory: the root package plus every dependency resolved
+ * from the packages in it (bundled copies included), each once. Throws on a
+ * required dependency that does not resolve and on a missing, unreadable or
+ * malformed manifest; an absent optional dependency is skipped.
  */
-export function countInstalledPackages(globalNodeModules: string): number;
+export function countFlairTree(flairDir: string, root?: string): number;
 export function parseAddedCount(log: string): number | null;
 export function hasDamagedLockfileWarning(log: string): boolean;
 /** `ok` is false unless the resolve lands inside `paths.flair` (no ambient hoist). */
 export function resolveFromLoggingDir(paths: TreePaths): ResolveCheck;
 export function harperVersion(paths: TreePaths): HarperCheck;
-/** `minPackages` is required; pass `readMinPackages()` for the reviewed floor. */
-export function evaluateInstall(args: { log: string; paths: TreePaths; minPackages: number }): InstallEvaluation;
+/**
+ * `minPackages` is required; pass `readMinPackages()` for the reviewed floor.
+ * `status` must be npm's exit status: anything but 0 fails before the tree is
+ * evaluated (null/undefined = the process was killed).
+ */
+export function evaluateInstall(args: {
+  status: number | null | undefined;
+  log: string;
+  paths: TreePaths;
+  minPackages: number;
+}): InstallEvaluation;
