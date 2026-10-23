@@ -5,7 +5,7 @@ import { WriteBackConflictError, writeBackCommittedRow } from "./write-back.js";
 import { txnPausePoint } from "./txn-pause-point.js";
 import { isJoinableTransaction } from "./request-transaction.js";
 import { promotionContentHash } from "./promotion-binding.js";
-import { memoryLockHeld, withMemoryWriteLock, withMemoryWriteLockOnce, type MemoryLockOutcome } from "./memory-write-lock.js";
+import { withMemoryWriteLock, withMemoryWriteLockOnce, type MemoryLockOutcome } from "./memory-write-lock.js";
 
 /** The row a promotion's Memory write produced: its owner, content and
  *  incarnation token. A row an earlier sweep recorded adds the fields that
@@ -101,12 +101,10 @@ export async function stampMemoryPromotion(
   const table = (databases as any).flair.Memory;
   if (isJoinableTransaction(stagedContext)) {
     // Manual promotion: the Memory write and this stamp share the caller's
-    // transaction. When the caller holds the id's lock across that
-    // transaction's commit (PromoteMemoryCandidate, flair#2478 slice 1 part 2),
-    // the stamp runs inside it; otherwise it takes the lock for its own
-    // read/decision/write and the enclosing transaction commits after the
-    // release (the composed limit in resources/memory-write-lock.ts).
-    const stamp = async (): Promise<boolean> => {
+    // transaction. The memory lock is taken for the stamp's own read/decision/
+    // write; the enclosing transaction commits after it releases (the composed
+    // limit in resources/memory-write-lock.ts).
+    const outcome = await withMemoryWriteLock(memoryPrimaryStore(), [id], async () => {
       const row = await table.get(id, stagedContext);
       if (!row) throw new Error(`Promotion memory ${id} was not written`);
       if (isStaleBasis(row, written)) return false;
@@ -118,12 +116,7 @@ export async function stampMemoryPromotion(
       await table.update(id, update, stagedContext);
       noteMemoryUpsert({ ...row, ...update });
       return true;
-    };
-    if (memoryLockHeld(stagedContext)) {
-      if ((await stamp()) === false) throw new PromotionStampStaleRowError(id);
-      return;
-    }
-    const outcome = await withMemoryWriteLock(memoryPrimaryStore(), [id], stamp, { phase: "promotion-stamp-manual" });
+    }, { phase: "promotion-stamp-manual" });
     if (outcome.kind !== "done") throw new PromotionStampLockError(outcome.kind, id);
     if (outcome.value === false) throw new PromotionStampStaleRowError(id);
     return;

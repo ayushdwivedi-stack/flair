@@ -1,24 +1,19 @@
 /**
- * owner-post-delete-lock-2478.test.ts — flair#2478 slice 1 part 2: the
- * remaining foreground Memory writers take the per-id write lock, real Harper.
+ * owner-post-delete-lock-2478.test.ts — flair#2478 slice 1 part 2: an owner
+ * POST and an owner DELETE take the per-id Memory write lock, real Harper.
  *
- * Writers under test: an owner POST that names an existing row (an authored
- * replacement, full row), an owner DELETE, the basement/restore endpoint
- * (`POST /MemoryArchive`, a full `put` inside one owned transaction), a skill
- * POST update (successor create plus predecessor close inside the version
- * transaction), and manual promotion (`POST /PromoteMemoryCandidate`: a create
- * under a fresh id plus the verdict stamp, one composed transaction). Each is
- * foreground: it waits within the owner budget and answers `503 memory_busy`
- * on a miss. The lock is held across the writer's commit.
+ * Writers under test: an owner POST that names an id or a `supersedes` target,
+ * and an owner DELETE. Each is foreground: it waits within the owner budget
+ * and answers `503 memory_busy` on a miss.
  *
- * The matrix: each writer first, held after its write staged or after its
- * commit, against an owner PUT and PATCH (refused `memory_busy`; after release
- * the writer's and then the owner's fields are stored); an owner write first,
- * held after its commit, against the writer (refused `memory_busy`); a
- * lock-bypassing trace assertion that each writer wrote its own fields under
- * its phase. Seeded rows carry an explicit visibility, an incarnation token
- * and a bare current stamp so boot migrations leave them alone. Home-isolated
- * ephemeral Harper; every URL is asserted to be this test's own.
+ * The matrix: the writer first, held while it still holds the lock, against an
+ * owner PUT and PATCH (refused `memory_busy`; after release the writer's write
+ * is stored); an owner write first, held after its commit, against the writer
+ * (refused `memory_busy`); a lock-bypassing trace assertion that each writer
+ * wrote under its phase. Seeded rows carry an
+ * explicit visibility, an incarnation token and a bare current stamp so boot
+ * migrations leave them alone. Home-isolated ephemeral Harper; every URL is
+ * asserted to be this test's own.
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { randomUUID } from "node:crypto";
@@ -84,12 +79,39 @@ afterAll(async () => {
 }, HARPER_STOP_BUDGET_MS);
 
 describe("flair#2478 — owner POST (real Harper)", () => {
-  it("CONTROL: a pure create under a fresh id lands, and the POST write is traced under phase post", async () => {
+  it("CONTROL: a create under an explicit id lands", async () => {
     const id = "opdl-post-control";
     const res = await h.signed(owner, "POST", "/Memory", { id, agentId: owner.id, content: WRITER_TEXT, visibility: "shared" });
     expect([200, 201], await res.clone().text()).toContain(res.status);
     expect((await h.readRow(id))?.content).toBe(WRITER_TEXT);
   }, 120_000);
+
+  for (const verb of ["PUT", "PATCH"] as const) {
+    it(`a POST that supersedes a row, held while it holds the lock, refuses an owner ${verb} on that row memory_busy`, async () => {
+      const target = `opdl-post-sup-target-${verb.toLowerCase()}`;
+      const successor = `opdl-post-sup-new-${verb.toLowerCase()}`;
+      await seed(target);
+      h.arm("memory-post-verify");
+      const pending = h.signed(owner, "POST", "/Memory", {
+        id: successor, agentId: owner.id, content: WRITER_TEXT, visibility: "private", supersedes: target,
+      });
+      try {
+        await paused("memory-post-verify");
+        const body = await expectRefused(await ownerWrite(verb, target, OWNER_TEXT), "memory_busy");
+        expect(body).toEqual({ error: "memory_busy", caller: owner.id });
+        await h.release("memory-post-verify");
+      } finally {
+        h.letGo("memory-post-verify");
+      }
+      const res = await pending;
+      expect([200, 201], await res.clone().text()).toContain(res.status);
+      expect((await h.readRow(successor))?.supersedes).toBe(target);
+      const closed = await h.readRow(target);
+      expect(closed, "the superseded row is gone").not.toBeNull();
+      expect(typeof closed.validTo, "the superseded row was not closed").toBe("string");
+      expect(h.writesBy(target, "post").length, "the close was not written under phase post").toBeGreaterThan(0);
+    }, 120_000);
+  }
 });
 
 describe("flair#2478 — owner DELETE (real Harper)", () => {

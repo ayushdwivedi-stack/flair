@@ -37,9 +37,7 @@ import {
   markMemoryWriteOutcomeUnknown,
   memoryWriteOutcomeUnknown,
   memoryBusyResponse,
-  memoryLockHeld,
   memoryLockUnavailableResponse,
-  markMemoryLockHeld,
   boundLockedProviderCall,
   memoryLockedProviderTimeoutMs,
   MemoryProviderTimeout,
@@ -267,40 +265,30 @@ function memoryWriteLockStore(): unknown {
   return (databases as any)?.flair?.Memory?.primaryStore;
 }
 
-/** The lock ids a Memory verb names: the URL-bound id and body id(s), plus the
- *  `supersedes` target a write closes, dropping non-id values so the sorted,
- *  deduplicated key set is real (flair#2478 slice 1 part 2). */
+/** The lock ids a Memory verb names: the URL-bound id and body id(s), dropping
+ *  non-id values so the sorted, deduplicated key set is real. */
 function putLockIds(resource: unknown, content?: unknown): string[] {
-  const ids = writeTargetIds(resource, content)
+  return writeTargetIds(resource, content)
     .filter((id) => typeof id === "string" || typeof id === "number")
     .map((id) => String(id));
+}
+
+/** The lock ids a POST names: the addressed/body ids plus the `supersedes`
+ *  target it closes. A pure create under a fresh server-allocated id names no
+ *  id and takes no lock (the design's create case). */
+function postLockIds(resource: unknown, content?: unknown): string[] {
+  const ids = putLockIds(resource, content);
   const supersedes = (content as { supersedes?: unknown } | null | undefined)?.supersedes;
   if (typeof supersedes === "string" || typeof supersedes === "number") ids.push(String(supersedes));
   return [...new Set(ids)];
 }
 
-/** The lock ids a POST names: the same set, empty for a pure create under a
- *  fresh server-allocated id (the design's create case, which takes no lock). */
-function postLockIds(resource: unknown, content?: unknown): string[] {
-  return putLockIds(resource, content);
-}
-
-/** The lock ids a DELETE names: the addressed id(s) and, when the addressed row
- *  is a skill, the live head this delete closes. The pre-read only sizes the
- *  lock set; the body re-reads and revalidates every row under the lock. */
-async function deleteLockIds(resource: unknown, id: unknown): Promise<string[]> {
+/** The lock ids a DELETE names: the addressed id and any body id(s), dropping
+ *  non-id values so the sorted, deduplicated key set is real. */
+function deleteLockIds(resource: unknown, id: unknown): string[] {
   const ids = putLockIds(resource, id && typeof id === "object" ? id : undefined);
   if (typeof id === "string" || typeof id === "number") ids.push(String(id));
-  try {
-    const addressed = typeof id === "string" ? await (databases as any).flair.Memory.get(id, {}) : null;
-    if (addressed && rowIsSkill(addressed)) {
-      const head = await resolveSkillHead(String(addressed.skillSubjectId ?? addressed.id), String(addressed.id), {});
-      if (head?.id !== undefined && head?.id !== null) ids.push(String(head.id));
-    }
-  } catch {
-    // The body's reads decide; a failed sizing read never licenses a write.
-  }
-  return [...new Set(ids)];
+  return ids;
 }
 
 /** The caller id a lock-miss refusal carries — the request's agent annotation,
@@ -1433,10 +1421,6 @@ async function writeSkillCreateOrUpdate(
     /** A reserved seed id: version the write IN PLACE (same physical id). */
     inPlaceId?: string | null;
     reembedding?: boolean;
-    /** Join the caller's open request transaction (a POST normally does). A
-     *  POST that holds the per-id lock passes false so its owned transaction
-     *  commits before the lock is released (flair#2478 slice 1 part 2). */
-    joinRequestTransaction?: boolean;
     /** The fields a PUT supplied. An in-place (reserved seed) PUT whose supplied
      *  fields equal the live head writes no row. Absent when the PUT's
      *  redaction replaced a value: that PUT always writes its redacted row. */
@@ -1471,7 +1455,7 @@ async function writeSkillCreateOrUpdate(
   let successorBasis: any = null;
   const outcome = await runSkillVersionWrite({
     ctx,
-    joinCallerTransaction: method === "post" && args.joinRequestTransaction !== false,
+    joinCallerTransaction: method === "post",
     subjectId,
     agentId: String(content.agentId),
     head: (shared) => resolveSkillHead(subjectId, addressedId, shared),
@@ -2285,15 +2269,17 @@ export class Memory extends (databases as any).flair.Memory {
    *  under one owned transaction (flair#2478 slice 1 part 2). A pure create
    *  under a fresh server-allocated id names no id and takes no lock. */
   async post(content: any, context?: any) {
-    const ids = postLockIds(this, content);
-    if (ids.length === 0) return this.postLocked(content, context, false);
+    // A skill POST is a skill version write, which joins the request
+    // transaction; it is not converted to the per-id lock here (later slice).
+    const ids = isSkillWrite(content) ? [] : postLockIds(this, content);
+    if (ids.length === 0) return this.postLocked(content, context);
     const outcome = await withMemoryWriteLock(
-      memoryWriteLockStore(), ids, () => this.postLocked(content, context, true), { phase: "post" });
+      memoryWriteLockStore(), ids, () => this.postLocked(content, context), { phase: "post" });
     if (outcome.kind === "done") return outcome.value;
     return memoryLockRefusal(outcome, memoryLockCallerId(this))!;
   }
 
-  private async postLocked(content: any, context: any, lockHeld: boolean) {
+  private async postLocked(content: any, context: any) {
     // flair#2612: a POST body that is not a single JSON object — an array, null,
     // a string or a number — is refused here with a named 400 before any write
     // path runs. Without it, an array reaches Harper's collection create, which
@@ -2649,9 +2635,7 @@ export class Memory extends (databases as any).flair.Memory {
     // POST joins an open caller transaction and confirms before its commit;
     // post-commit verification belongs to that owner (#2656 slice B).
     // Without a caller transaction, POST owns the commit and verifies after it.
-    // A POST that holds the per-id lock owns its transaction so the lock spans
-    // the commit (flair#2478 slice 1 part 2).
-    const postJoinsRequestTxn = !lockHeld && isJoinableTransaction(ctx);
+    const postJoinsRequestTxn = isJoinableTransaction(ctx);
     if (isSkillWrite(content)) {
       const reservedId = [content?.id, (this as any).getId?.()].find((candidate) => isReservedSeedId("Memory", candidate));
       const skillStaged: { supplied: readonly StoredTextField[]; text: StoredMemoryText | null; row?: Record<string, any>; joined?: boolean } = { supplied: suppliedText, text: null };
@@ -2685,7 +2669,7 @@ export class Memory extends (databases as any).flair.Memory {
     let postRowId: string | undefined;
     let grantedClosed: Record<string, any> | null = null;
     try {
-      postResult = await (lockHeld ? withOwnedTransaction : withSharedWriteTransaction)(ctx, async (c) => {
+      postResult = await withSharedWriteTransaction(ctx, async (c) => {
         postStaged = storedMemoryText(content, suppliedText);
         stagedRow = structuredClone(content);
         const newId = await writeMemoryRowPost((this as any).constructor, content, c);
@@ -2774,12 +2758,9 @@ export class Memory extends (databases as any).flair.Memory {
    *  re-embed owned writes commit before releasing the lock. A re-embed body
    *  (flair#2296) holds the lock under its own phase name, `patch-reembed`, so
    *  a hold warning names the re-embed (flair#2478 slice 3). */
-  async patch(content: any, query?: any, lockHeld = false) {
+  async patch(content: any, query?: any) {
     const ids = putLockIds(this, content);
     if (ids.length === 0) return memoryIdRequiredResponse();
-    // A nested writer (archive/restore, manual promotion) already holds the
-    // id's lock across its own transaction's commit (flair#2478 part 2).
-    if (lockHeld || memoryLockHeld(query)) return this.patchLocked(content, query);
     const phase = isReembedPatch(content) ? "patch-reembed" : "patch";
     const outcome = await withMemoryWriteLock(memoryWriteLockStore(), ids, async () => {
       const result = await this.patchLocked(content, query);
@@ -3157,12 +3138,9 @@ export class Memory extends (databases as any).flair.Memory {
    * that names no id is refused 400 before the lock; a store with no lock is
    * refused 503 `memory_lock_unavailable`. See resources/memory-write-lock.ts.
    */
-  async put(content: any, query?: any, lockHeld = false) {
+  async put(content: any, query?: any) {
     const ids = putLockIds(this, content);
     if (ids.length === 0) return memoryIdRequiredResponse();
-    // A nested writer (archive/restore, manual promotion) already holds the
-    // id's lock across its own transaction's commit (flair#2478 part 2).
-    if (lockHeld || memoryLockHeld(query)) return this.putLocked(content, query);
     const outcome = await withMemoryWriteLock(memoryWriteLockStore(), ids, async () => {
       const result = await this.putLocked(content, query);
       // Test-only: the verb body has returned and the lock is still held. A body
@@ -3788,12 +3766,11 @@ export class Memory extends (databases as any).flair.Memory {
     return buildWriteResponse(putResult.content, result, putResult.dedupMatch, putResult.redactedValues, putStaged);
   }
 
-  /** DELETE takes the addressed id's lock (and, for a skill row, the live
-   *  head's) before its first read, so the row it decides on is the row it
-   *  deletes and its owned transaction commits before the lock is released
-   *  (flair#2478 slice 1 part 2). */
+  /** DELETE takes the addressed id's lock before its first read, so the row it
+   *  decides on is the row it deletes and its owned transaction commits before
+   *  the lock is released (flair#2478 slice 1 part 2). */
   async delete(id: any) {
-    const ids = await deleteLockIds(this, id);
+    const ids = deleteLockIds(this, id);
     if (ids.length === 0) return this.deleteLocked(id);
     const outcome = await withMemoryWriteLock(memoryWriteLockStore(), ids, () => this.deleteLocked(id), { phase: "delete" });
     if (outcome.kind === "done") return outcome.value;
