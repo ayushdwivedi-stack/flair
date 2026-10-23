@@ -217,7 +217,7 @@ describe("the locked transaction scope (flair#2478 part 3a)", () => {
     expect(result).toEqual({ kind: "done", value: { kind: "refused", response } });
   });
 
-  test("a capability refusal inside the scope aborts it, even when the work catches it", async () => {
+  test("a checked-write admission capability refusal inside the scope aborts it, even when the work catches it", async () => {
     const store = fakeStore();
     const ctx: any = { log: [] as string[] };
     const run = withMemoryWriteLock(store, ["a"], (held) =>
@@ -270,7 +270,7 @@ describe("the locked transaction scope (flair#2478 part 3a)", () => {
     const store = fakeStore();
     const other = fakeStore();
     const seen: Record<string, string> = {};
-    // Each refusal inside an open scope also aborts it; the scope's rejection is expected.
+    // Each admission refusal inside an open scope also aborts it; the scope's rejection is expected.
     const aborting = (scope: Promise<unknown>) => scope.then(() => "committed", (err) => (err instanceof MemoryWriteCapabilityError ? `aborted:${err.reason}` : "error"));
     let savedHeld: MemoryWriteLockToken | undefined;
     let savedTx: LockedMemoryTransaction | undefined;

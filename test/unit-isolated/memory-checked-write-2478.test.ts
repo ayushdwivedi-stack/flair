@@ -80,7 +80,7 @@ describe("checked Memory writes under a held lock (flair#2478 part 3a)", () => {
       });
     }
 
-    it(`${verb}: a confirmed field the staged write holds as undefined confirms against a row without it`, async () => {
+    it(`${verb}: a confirmed field that reads as undefined in the staged write confirms against a row where it reads as undefined`, async () => {
       const content = { ...body(verb, "the checked edit"), archivedBy: undefined };
       const outcome = await withMemoryWriteLock(store, ["m1"], (held) =>
         withLockedMemoryTransaction(held, ctx(), (tx) => checked[verb](held, tx, { id: "m1", content, confirmFields: ["archivedBy"] })));
@@ -116,10 +116,11 @@ describe("checked Memory writes under a held lock (flair#2478 part 3a)", () => {
     });
   }
 
-  it("a checked PUT refuses a skill body and an _reindex body; a checked PATCH refuses a re-embed", async () => {
+  it("a checked PUT refuses a skill body, an _reindex body and a body naming citations; a checked PATCH refuses a re-embed", async () => {
     const cases: Array<[Verb, Record<string, unknown>]> = [
       ["put", { ...ROW, tags: ["skill"], content: "a skill body" }],
       ["put", { ...ROW, _reindex: true }],
+      ["put", { ...ROW, content: "a body citing a memory", usedMemoryIds: ["m2"] }],
       ["patch", { embedding: null, embeddingModel: null }],
     ];
     for (const [verb, content] of cases) {

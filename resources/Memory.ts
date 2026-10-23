@@ -455,10 +455,9 @@ async function verifyWrittenRow(
     if (!sameDeclaredField(row[field], declared[field])) return { mismatch: true };
   }
   // flair#2478 part 3a: a checked write also confirms the row's id and its
-  // `exactFields`, whether or not the write declared them: a field undefined in
-  // the staged write (absent, or holding undefined, which a write does not
-  // store) must be undefined in the row, and a defined one must be equal (a
-  // null is a value).
+  // `exactFields`, whether or not the write declared them: a field that reads
+  // as undefined in the staged write must read as undefined in the row, and a
+  // defined one must be equal (a null is a value).
   if (checked) {
     if (String(row.id) !== String(id)) return { mismatch: true };
     for (const field of checked.exactFields) {
@@ -4163,9 +4162,9 @@ export interface CheckedMemoryWriteInput {
   /** The write body, as a PUT or PATCH body. */
   readonly content: Record<string, unknown>;
   /** Stored fields the post-commit confirmation compares with the staged
-   *  write: a field undefined in the staged write must be undefined in the
-   *  row, a defined one (null included) equal. The confirmation also compares
-   *  the row's id. */
+   *  write: a field that reads as undefined in the staged write must read as
+   *  undefined in the row, a defined one (null included) equal. The
+   *  confirmation also compares the row's id. */
   readonly confirmFields?: readonly string[];
 }
 

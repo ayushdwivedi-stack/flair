@@ -9,4 +9,6 @@
   answers `503 memory_busy`. When the archive cannot take the lock within that
   budget, it answers `503 memory_busy` and writes nothing. A stored row that
   does not hold the archive fields after the commit answers
-  `409 stored_row_changed`. A skill row is archived and restored as before.
+  `409 stored_row_changed`. A skill row keeps the existing `Memory.put` path
+  and its skill-state refusals (`skill_state_requires_delete` for
+  `archived: true`).

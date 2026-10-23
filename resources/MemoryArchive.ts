@@ -35,8 +35,9 @@
  * (`archived`, `archivedAt`, `archivedBy`), and only then answers; the lock is
  * held throughout. An owner PUT or PATCH of a held id waits within its budget
  * and otherwise answers `503 memory_busy`; when the archive cannot take the
- * lock, it answers the lock's refusal itself. A skill row still writes through
- * Memory.put() (the skill version writer, converted later).
+ * lock, it answers the lock's refusal itself. A skill row keeps the existing
+ * Memory.put() path and its skill-state refusals (`skill_state_requires_delete`
+ * for `archived: true`); the skill version writer is converted later.
  *
  * Registered automatically at /MemoryArchive via config.yaml's
  * `jsResource: files: dist/resources/*.js` (named export → export name).
@@ -170,8 +171,9 @@ export class MemoryArchive extends Resource {
     const beforeReread = txnPausePoint("memory-archive-pre");
     if (beforeReread) await beforeReread;
 
-    // A skill row is a skill version write; it still writes through Memory.put()
-    // in a transaction this call owns (not converted to the checked write yet).
+    // A skill row keeps the existing Memory.put() path, and its skill-state
+    // refusals, in a transaction this call owns (not converted to the checked
+    // write yet).
     if (rowIsSkill(persistedBasis)) {
       return await withOwnedTransaction(ctx, async (c) => {
         const merged = await rereadAndMerge(id, c, persistedBasis, archived, auth.agentId);

@@ -17,8 +17,9 @@
  *     A write settles as `staged` once its row is staged; its body then waits.
  *  2. When `work` settles, admission closes and every admitted write is
  *     drained. A rejection, a refusal returned by `work` (a `Response`), a
- *     refused write, or a write refused its capability inside the scope aborts
- *     the transaction; nothing is committed, and a waiting body ends.
+ *     refused write, or a checked-write admission capability refusal inside
+ *     the scope aborts the transaction; nothing is committed, and a waiting
+ *     body ends.
  *  3. The transaction commits.
  *  4. Each staged write's body resumes, in admission order, for its
  *     post-commit confirmation, while the lock is still held (the acquisition
@@ -66,7 +67,7 @@ interface ScopeState {
   readonly confirmations: Array<() => Promise<unknown>>;
   /** Each staged write's resume gate: true after the commit, false otherwise. */
   readonly gates: Array<(committed: boolean) => void>;
-  /** A write refused its capability inside this open scope: the scope aborts. */
+  /** A checked-write admission refused its capability inside this open scope: the scope aborts. */
   failure?: { error: unknown };
 }
 
@@ -181,8 +182,9 @@ export interface LockedWriteAdmission {
    * `stage()` once its row is staged: the write then settles as `staged` for
    * `id`, and `stage()` resolves true after the scope commits (what `run` then
    * returns is the write's confirmed answer) or false when the scope does not
-   * commit. A `run` that returns without staging settles the write as refused
-   * with the `Response` it returned; one that throws, with its error.
+   * commit. A `run` that returns a `Response` without staging settles the
+   * write as refused with that `Response`; one that returns anything else
+   * without staging, or throws, settles the write as rejected.
    */
   track(id: string, run: (stage: () => Promise<boolean>) => Promise<unknown>): Promise<MemoryWriteReceipt>;
 }
@@ -195,8 +197,8 @@ function scopeTransactionOpen(state: ScopeState): boolean {
  * Admit one checked Memory write into `tx` (resources/Memory.ts). Refuses with
  * {@link MemoryWriteCapabilityError} unless `held` is a live token acquired on
  * `store` that covers every id in `ids`, `tx` is an open scope opened on that
- * same acquisition, and the scope's transaction is still open. A refusal inside
- * an open scope also aborts that scope.
+ * same acquisition, and the scope's transaction is still open. A refusal of this
+ * admission inside an open scope also aborts that scope.
  */
 export function admitLockedMemoryWrite(
   held: unknown,
