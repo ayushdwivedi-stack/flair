@@ -158,8 +158,8 @@ function listDir(dir, required) {
  * package.json). Nested `node_modules` (regular hoisting) and a package's own
  * bundled `node_modules` (harper's bundleDependencies) are walked, so the count
  * reflects what is on disk rather than npm's "added N packages" summary, which
- * omits bundled copies. Symlinks are not followed: a global install creates
- * `.bin` symlinks, and following them would loop.
+ * omits bundled copies. Symlinks are not followed, so a linked entry cannot be
+ * counted twice.
  *
  * Throws on an unreadable directory or a tree past the bounds above. A failed
  * read is never reported as a smaller tree.
