@@ -640,9 +640,10 @@ export function candidateIncompleteFlag(claim: unknown): string | null {
  * `api()` throws an ApiHttpError for a non-2xx response with a body
  * (flair#2764). The kind is read from its unredacted text (apiErrorRawBody);
  * the text shown is derived from that text through boundErrorText, which
- * redacts the credential values the request sent from the server's text within
- * the scope stated on ApiHttpError (the prefix the caller prints is outside
- * it). The two classified distillation failures are:
+ * redacts the credential values read from the request's Authorization header
+ * (credentialsInHeader) from the server's text within the scope stated on
+ * ApiHttpError, or withholds that text when the header's credential could not
+ * be read (the prefix the caller prints is outside the scope). The two classified distillation failures are:
  *   503 no-backend:        { error: "No generative backend configured..." }
  *   502 distillation_failed: { error: "distillation_failed", detail: "..." }
  * The 503 pause refusal ({ error: "rem_aborted", detail: "..." }, sent while the

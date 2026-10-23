@@ -3,11 +3,14 @@
  * body (every failure except a refused redirect, a credential-less 403 and a
  * response with `Content-Length: 0`), the ApiHttpError message is
  * `HTTP <status>` plus the JSON body's named error, or else a bounded one-line
- * excerpt of the body, and the error keeps the body, which sendJsonRequest
- * writes to stderr only with FLAIR_DEBUG set (a JSON body shown re-serialized,
- * or withheld when it cannot be). In the message, `body`, that stderr line and
- * the rem display texts, the credential values the request sent are replaced
- * with `[redacted]` in the text the server supplied. Scope: redaction removes
+ * excerpt of the body, and the error keeps the body's display form, which
+ * sendJsonRequest writes to stderr only with FLAIR_DEBUG set (a JSON body shown
+ * re-serialized, or withheld when it cannot be). In the message, `body`, that
+ * stderr line and the rem display texts, the credential values the CLI reads
+ * from the request's Authorization header (a Basic password and a TPS-Ed25519
+ * signature read with Flair's server grammar) are replaced with `[redacted]` in
+ * the text the server supplied, and that text is withheld when the header names
+ * basic, bearer or tps-ed25519 but its credential cannot be read. Scope: redaction removes
  * the request's credential values from the text the server supplied (literal,
  * inside any JSON string, percent-encoded); text the CLI writes itself (the
  * `HTTP <status>: ` prefix, the debug line's labels, a caller's `Error: `
@@ -30,7 +33,17 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import nacl from "tweetnacl";
-import { ApiHttpError, apiErrorBody, apiErrorRawBody, sendJsonRequest } from "../../src/lib/auth-resolve.ts";
+import {
+  ApiHttpError,
+  BASIC_HEADER_GRAMMAR,
+  TPS_ED25519_HEADER_GRAMMAR,
+  apiErrorBody,
+  apiErrorRawBody,
+  credentialsInHeader,
+  sendJsonRequest,
+} from "../../src/lib/auth-resolve.ts";
+import { TPS_ED25519_HEADER_RE, parseTpsEd25519Header } from "../../resources/ed25519-auth.ts";
+import { BASIC_AUTH_HEADER_RE, parseBasicAuthHeader } from "../../resources/basic-auth-header.ts";
 import { isNoBackendConfigured, isRemAbortedFailure, runNightlyCycle } from "../../src/rem/runner.ts";
 import { describeReflectError } from "../../src/commands/rem.ts";
 import {
@@ -447,7 +460,7 @@ describe("flair#2764 — an ApiHttpError is never a connect failure", () => {
   }, 30_000);
 });
 
-describe("flair#2764 — the request's credential values are removed from the server's text in every output, within the stated scope", () => {
+describe("flair#2764 — the credential values read from the request's header are redacted from the server's text in each output, within the stated scope", () => {
   const PASSWORD = "s3cret-pass-2764-fixture";
   const BASIC_CREDENTIAL = Buffer.from(`admin:${PASSWORD}`).toString("base64");
   const BASIC = `Basic ${BASIC_CREDENTIAL}`;
@@ -765,6 +778,36 @@ describe("flair#2764 — the request's credential values are removed from the se
     }
   });
 
+  test("a no-break space after the scheme: the signature and token are redacted from the message, body, debug line and rem text", async () => {
+    const nbsp = String.fromCharCode(0xa0);
+    const signature = Buffer.from("signature-2764-nbsp").toString("base64");
+    const header = `TPS-Ed25519${nbsp}agent-a:1760000000000:nonce-2764:${signature}`;
+    // Flair's server parser accepts this header and reads this signature.
+    expect(parseTpsEd25519Header(header)?.signatureB64).toBe(signature);
+    const signed = await failEcho(header, () => JSON.stringify({ error: `bad ${signature}`, detail: signature }), true);
+    const token = "tok-2764-no-break-space";
+    const bearer = await failEcho(`Bearer${nbsp}${token}`, () => JSON.stringify({ error: `bad ${token}`, detail: token }), true);
+    for (const [{ err, stderr }, secret] of [[signed, signature], [bearer, token]] as const) {
+      const display = describeReflectError(err).text;
+      expect(err.message, secret).toBe("HTTP 500: bad [redacted]");
+      expect(err.body, secret).toBe('{"error":"bad [redacted]","detail":"[redacted]"}');
+      expect(stderr, secret).toBe(`[flair] GET /echo answered HTTP 500; response body: ${JSON.stringify('{"error":"bad [redacted]","detail":"[redacted]"}')}\n`);
+      expect(display, secret).toBe("bad [redacted]");
+      for (const text of [err.message, err.body!, stderr, display]) expect(text, secret).not.toContain(secret);
+    }
+  });
+
+  test("a known scheme whose credential cannot be extracted: the server's text is withheld", async () => {
+    for (const header of ["TPS-Ed25519 not-the-signed-form", "Bearer"]) {
+      const { err, stderr } = await failEcho(header, () => JSON.stringify({ error: "bad not-the-signed-form", detail: "x" }), true);
+      expect(credentialsInHeader(header).withhold, header).toBe(true);
+      expect(err.message, header).toBe("HTTP 500: [body withheld]");
+      expect(err.body, header).toBe("[body withheld]");
+      expect(stderr, header).toBe('[flair] GET /echo answered HTTP 500; response body: "[body withheld]"\n');
+      expect(describeReflectError(err).text, header).toBe("[body withheld]");
+    }
+  });
+
   test("a body that carries no credential value is unchanged", async () => {
     const { err, stderr } = await failEcho(BASIC, () => "upstream unavailable", true);
     expect(err.message).toBe("HTTP 500: upstream unavailable");
@@ -772,4 +815,123 @@ describe("flair#2764 — the request's credential values are removed from the se
     expect(apiErrorRawBody(err)).toBe("upstream unavailable");
     expect(stderr).toBe(`[flair] GET /echo answered HTTP 500; response body: "upstream unavailable"\n`);
   });
+});
+
+describe("flair#2764 — the CLI reads a sent header with the server's own grammar", () => {
+  test("the CLI's grammar copies equal the server's", () => {
+    expect(TPS_ED25519_HEADER_GRAMMAR.source).toBe(TPS_ED25519_HEADER_RE.source);
+    expect(TPS_ED25519_HEADER_GRAMMAR.flags).toBe(TPS_ED25519_HEADER_RE.flags);
+    expect(BASIC_HEADER_GRAMMAR.source).toBe(BASIC_AUTH_HEADER_RE.source);
+    expect(BASIC_HEADER_GRAMMAR.flags).toBe(BASIC_AUTH_HEADER_RE.flags);
+  });
+
+  test("on each header form the server accepts, the CLI extracts the signature or password the server reads", () => {
+    const nbsp = String.fromCharCode(0xa0);
+    const signature = Buffer.from("signature-2764-parity").toString("base64");
+    for (const [scheme, separator] of [
+      ["TPS-Ed25519", " "],
+      ["TPS-Ed25519", "\t"],
+      ["TPS-Ed25519", nbsp],
+      ["TPS-Ed25519", "   "],
+      ["tps-ed25519", " "],
+      ["TPS-ED25519", "\t "],
+    ] as const) {
+      const header = `${scheme}${separator}agent-a:1760000000000:nonce-2764:${signature}`;
+      const server = parseTpsEd25519Header(header);
+      expect(server?.signatureB64, JSON.stringify(header)).toBe(signature);
+      const cli = credentialsInHeader(header);
+      expect(cli.values, JSON.stringify(header)).toContain(server!.signatureB64);
+      expect(cli.withhold, JSON.stringify(header)).toBe(false);
+    }
+    const encoded = Buffer.from("admin:pw-2764-parity").toString("base64");
+    for (const header of [`Basic ${encoded}`, `basic ${encoded}`, `BASIC ${encoded}`, `Basic  ${encoded}`, `Basic \t${encoded}`]) {
+      const server = parseBasicAuthHeader(header);
+      expect(server?.pass, header).toBe("pw-2764-parity");
+      const cli = credentialsInHeader(header);
+      expect(cli.values, header).toContain(server!.pass);
+      expect(cli.withhold, header).toBe(false);
+    }
+    // A scheme followed by a tab or no-break space is not the server's Basic
+    // form; the CLI still reads the password from the part after the scheme.
+    for (const separator of ["\t", nbsp]) {
+      const header = `Basic${separator}${encoded}`;
+      expect(parseBasicAuthHeader(header), JSON.stringify(header)).toBeNull();
+      expect(credentialsInHeader(header).values, JSON.stringify(header)).toContain("pw-2764-parity");
+    }
+  });
+});
+
+describe("flair#2764 — under Node, a no-break-space TPS-Ed25519 header a node:http server accepts", () => {
+  test("the built CLI's request redacts the signature the server read from the message, body, debug line and rem text", async () => {
+    ensureCliBuild();
+    const dir = mkdtempSync(join(tmpdir(), "flair-2764-node-"));
+    try {
+      const script = join(dir, "echo.mjs");
+      writeFileSync(script, [
+        'import { createServer } from "node:http";',
+        "const { sendJsonRequest } = await import(process.env.AUTH_RESOLVE_URL);",
+        "const { describeReflectError } = await import(process.env.REM_URL);",
+        "let received = \"\";",
+        "const server = createServer((req, res) => {",
+        "  received = String(req.headers.authorization ?? \"\");",
+        "  const echoed = received.slice(received.lastIndexOf(\":\") + 1);",
+        "  res.writeHead(500, { \"content-type\": \"application/json\" });",
+        "  res.end(JSON.stringify({ error: \"bad \" + echoed, detail: echoed }));",
+        "});",
+        "await new Promise((r) => server.listen(0, \"127.0.0.1\", r));",
+        "const written = [];",
+        "const write = process.stderr.write.bind(process.stderr);",
+        "process.stderr.write = (chunk, ...rest) => { written.push(String(chunk)); return true; };",
+        "let out;",
+        "try {",
+        "  await sendJsonRequest(new URL(\"/echo\", \"http://127.0.0.1:\" + server.address().port), \"GET\", undefined, process.env.SENT_HEADER, true);",
+        "  out = { thrown: false };",
+        "} catch (err) {",
+        "  out = { thrown: true, name: err.name, message: err.message, body: err.body, display: describeReflectError(err).text };",
+        "} finally {",
+        "  process.stderr.write = write;",
+        "  server.close();",
+        "}",
+        "out.received = received;",
+        "out.stderr = written.filter((w) => w.startsWith(\"[flair] GET \")).join(\"\");",
+        "process.stdout.write(JSON.stringify(out));",
+      ].join("\n"));
+      const signature = Buffer.from("signature-2764-node").toString("base64");
+      const header = `TPS-Ed25519${String.fromCharCode(0xa0)}agent-a:1760000000000:nonce-2764:${signature}`;
+      const dist = join(import.meta.dirname ?? __dirname, "..", "..", "dist");
+      const env: Record<string, string> = {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        HOME: dir,
+        FLAIR_DEBUG: "1",
+        SENT_HEADER: header,
+        AUTH_RESOLVE_URL: `file://${join(dist, "lib", "auth-resolve.js")}`,
+        REM_URL: `file://${join(dist, "commands", "rem.js")}`,
+      };
+      const result = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+        const startedAt = Date.now();
+        const child = spawn(nodeBin({ env, cwd: dir }), [script], { cwd: dir, env, stdio: ["ignore", "pipe", "pipe"], timeout: CHILD_DEADLINE_MS });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (d) => (stdout += d));
+        child.stderr.on("data", (d) => (stderr += d));
+        child.on("close", (code, signal) => {
+          if (signal !== null || code !== 0) {
+            reject(new Error(childOverranDeadline("node echo script", "no-break space", CHILD_DEADLINE_MS, { status: code, signal, elapsedMs: Date.now() - startedAt, stdout, stderr })));
+            return;
+          }
+          resolve({ stdout, stderr });
+        });
+      });
+      const out = JSON.parse(result.stdout);
+      // The node:http server received the header as sent, and Flair's server parser reads its signature.
+      expect(out.received).toBe(header);
+      expect(parseTpsEd25519Header(out.received)?.signatureB64).toBe(signature);
+      const shown = '{"error":"bad [redacted]","detail":"[redacted]"}';
+      expect(out).toMatchObject({ thrown: true, name: "ApiHttpError", message: "HTTP 500: bad [redacted]", body: shown, display: "bad [redacted]" });
+      expect(out.stderr).toBe(`[flair] GET /echo answered HTTP 500; response body: ${JSON.stringify(shown)}\n`);
+      for (const text of [out.message, out.body, out.stderr, out.display]) expect(text).not.toContain(signature);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

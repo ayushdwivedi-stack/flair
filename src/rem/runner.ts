@@ -513,9 +513,11 @@ function rowsFromRead(raw: unknown, label: string): any[] {
  * — /ReflectMemories's 503 (no backend configured) and 502
  * (distillation_failed) bodies are JSON `{ error: string, detail?: string }`.
  * A JSON object with a string `error` becomes one bounded line through
- * boundErrorText, which redacts the credential values the request sent from
- * the server's text within the scope stated on ApiHttpError (a prefix added
- * when the line is written is outside it):
+ * boundErrorText, which redacts the credential values read from the request's
+ * Authorization header (credentialsInHeader) from the server's text within the
+ * scope stated on ApiHttpError, or withholds that text when the header's
+ * credential could not be read (a prefix added when the line is written is
+ * outside the scope):
  * `error: detail` when `detail` is a non-empty string and `error` alone
  * otherwise, so distinct failure modes read distinctly in the audit log
  * instead of as a raw JSON blob. Text that is not JSON, or JSON without a

@@ -5,12 +5,17 @@
   line: line breaks become spaces, other control characters are removed, and
   text past 200 characters is cut to at most 200 and marked `...`. When the
   helper builds that message from a response body it read and `FLAIR_DEBUG` is
-  set, it also writes that body to stderr, encoded as one JSON string (#2764).
+  set, it also writes that body's display form to stderr, encoded as one JSON
+  string (#2764).
 
-  In the message and that stderr line, the credential values the request sent
-  (the Authorization header value, the part after its scheme, a Basic header's
-  decoded `user:password` and password, a TPS-Ed25519 signature) are replaced
-  with `[redacted]` in the text the server supplied. The stderr line shows a
+  In the message and that stderr line, the credential values the CLI reads from
+  the request's Authorization header (the header value, the part after its
+  scheme, a Basic header's decoded `user:password` and password, a TPS-Ed25519
+  signature) are replaced with `[redacted]` in the text the server supplied. A
+  Basic header in the form Flair's server accepts, and a TPS-Ed25519 header,
+  are read with the server's own grammar. When the header names the Basic,
+  Bearer or TPS-Ed25519 scheme but no credential can be read from it, the
+  server's text is shown as `[body withheld]` instead. The stderr line shows a
   JSON body re-serialized, or withheld when it cannot be, and the request path
   percent-decoded (withheld when it does not decode or holds a control
   character). Redaction removes the request's credential values from the text

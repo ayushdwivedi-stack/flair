@@ -89,17 +89,20 @@ import { resolveHome } from "./home.js";
  *     case — distinguishes "we had nothing to send" from "we sent
  *     something and it was rejected", which is exactly the signal
  *     `authedRequest` uses to decide whether tier 5 (the floor) applies.
- *   - `body` (flair#2764): the response body for display, set by
- *     `fromResponse` (`displayBody`): a JSON body re-serialized with every
- *     string in it redacted after decoding, or withheld when it cannot be;
- *     any other body redacted as text, with the credential values the request
- *     sent. The message's reason is
- *     built from the unredacted text and redacted (`describeHttpFailure`); its
- *     `HTTP <status>` prefix is not passed through redaction.
- *     Classifiers read the unredacted text through `apiErrorRawBody`; the rem
- *     formatters that derive display text from it pass that text through
- *     `boundErrorText`, which redacts. A credential value in the server's text
- *     becomes `[redacted]`.
+ *   - `body` (flair#2764): the display form of the response body, set by
+ *     `fromResponse` (`displayBody`), with the credential values
+ *     `credentialsInHeader` read from the request's Authorization header: a
+ *     JSON body re-serialized with every string in it redacted after decoding,
+ *     or withheld when it cannot be; any other body redacted as text; and any
+ *     body withheld when that header names basic, bearer or tps-ed25519 but
+ *     its credential could not be read. The message's reason is built from the
+ *     unredacted text and redacted or withheld the same way
+ *     (`describeHttpFailure`); its `HTTP <status>` prefix is not passed
+ *     through redaction. Classifiers read the unredacted text through
+ *     `apiErrorRawBody`; the rem formatters that derive display text from it
+ *     pass that text through `boundErrorText`, which redacts or withholds it
+ *     the same way. Within the scope below, each of those values becomes
+ *     `[redacted]` in the server's text as displayed.
  * Scope: redaction removes the request's credential values from the text the
  * server supplied (literal, inside any JSON string, percent-encoded); text the
  * CLI writes itself (the `HTTP <status>: ` prefix, the debug line's labels, a
@@ -121,19 +124,21 @@ export class ApiHttpError extends Error {
 
   /**
    * The error for a non-2xx response whose body text is `body` (flair#2764).
-   * `sentValues` are the credential values the request sent
-   * (`sentCredentialValues`): the message and `body` are redacted with them
-   * (within the scope on ApiHttpError), and the unredacted text and the values
-   * are kept in a module-private map for apiErrorRawBody and boundErrorText.
+   * `sentValues` are the credential values `credentialsInHeader` read from the
+   * request's Authorization header: the message and `body` are redacted with them
+   * (within the scope on ApiHttpError). `withhold` is credentialsInHeader's
+   * flag: when set, the server's text is shown as BODY_WITHHELD in the message
+   * and `body`. The unredacted text, the values and the flag are kept in a
+   * module-private map for apiErrorRawBody and boundErrorText.
    */
-  static fromResponse(status: number, body: string, sentValues: readonly string[] = []): ApiHttpError {
+  static fromResponse(status: number, body: string, sentValues: readonly string[] = [], withhold = false): ApiHttpError {
     const err = new ApiHttpError(
       status,
-      describeHttpFailure(status, body, sentValues),
+      describeHttpFailure(status, body, sentValues, withhold),
       false,
-      displayBody(body, sentValues),
+      displayBody(body, sentValues, withhold),
     );
-    privateText.set(err, { raw: body, sentValues: [...sentValues] });
+    privateText.set(err, { raw: body, sentValues: [...sentValues], withhold });
     return err;
   }
 }
@@ -145,39 +150,79 @@ export class ApiHttpError extends Error {
  * redact) read this map. No field of the error holds the sent values; `body`
  * and the message are display forms of the raw text, which may equal it.
  */
-const privateText = new WeakMap<ApiHttpError, { raw: string; sentValues: readonly string[] }>();
+const privateText = new WeakMap<ApiHttpError, { raw: string; sentValues: readonly string[]; withhold: boolean }>();
 
 /** What a credential value the request sent becomes in the server's text as displayed. */
 export const REDACTED_CREDENTIAL = "[redacted]";
 
 /**
+ * Copy of TPS_ED25519_HEADER_RE in resources/ed25519-auth.ts, the grammar
+ * Flair's server parses a TPS-Ed25519 header with. The CLI build cannot import
+ * from resources/, so test/unit/http-error-reason-2764.test.ts asserts the two
+ * have the same source and flags (flair#2764).
+ */
+export const TPS_ED25519_HEADER_GRAMMAR = /^TPS-Ed25519\s+([^:\s]+):(\d+):([^:\s]+):(.+)$/i;
+
+/** Copy of BASIC_AUTH_HEADER_RE in resources/basic-auth-header.ts, held to it by the same test (flair#2764). */
+export const BASIC_HEADER_GRAMMAR = /^Basic /i;
+
+/** The schemes credentialsInHeader extracts a credential from (lower case). */
+const KNOWN_SCHEMES = new Set(["basic", "bearer", "tps-ed25519"]);
+
+/** What credentialsInHeader reads from a sent Authorization header. */
+export interface SentCredentials {
+  /** The credential values to redact from the server's text. */
+  values: string[];
+  /** True when the header names a known scheme but its credential could not be extracted. */
+  withhold: boolean;
+}
+
+/**
  * The credential values an Authorization header carries (flair#2764), read
  * from the value Fetch sends: the header with leading and trailing HTTP
  * whitespace (tab, line feed, carriage return, space) removed, as Fetch
- * normalizes it. The scheme is the text before the first run of spaces or
- * tabs, compared without regard to case, as Flair's server reads it. The
- * values are that header value, the part after its scheme (as written and
- * with surrounding whitespace trimmed), for Basic the decoded `user:password`
- * and the password, and for TPS-Ed25519 the signature (the text after the
- * third `:` of `agentId:timestamp:nonce:signature`, or the last `:`-separated
- * field when there are fewer). Empty values are left out.
+ * normalizes it. The scheme is the text before the first run of whitespace
+ * (any character the regular expression class for whitespace matches),
+ * compared without regard to case. The values are that header value, the
+ * part after the scheme (as written and with surrounding whitespace trimmed),
+ * and for:
+ *   - basic: the decoded `user:password` (or the decoded text, without a
+ *     colon) and the password. When the header matches BASIC_HEADER_GRAMMAR,
+ *     the server's own grammar, the decoded text is read as the server reads
+ *     it (the text after its first six characters); otherwise from the part
+ *     after the scheme;
+ *   - tps-ed25519: the signature, read with TPS_ED25519_HEADER_GRAMMAR, the
+ *     server's own grammar.
+ * `withhold` is set when the scheme is basic, bearer or tps-ed25519 but no
+ * decoded text, token or signature could be extracted that way; the server's
+ * text is then withheld rather than shown. Empty values are left out.
  */
-function sentCredentialValues(authHeader: string | undefined): string[] {
-  if (!authHeader) return [];
+export function credentialsInHeader(authHeader: string | undefined): SentCredentials {
+  if (!authHeader) return { values: [], withhold: false };
   const sent = authHeader.replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, "");
-  const parts = /^(\S+)[\t ]+([\s\S]*)$/.exec(sent);
-  const scheme = parts ? parts[1]!.toLowerCase() : "";
-  const credential = parts ? parts[2]! : sent;
+  const scheme = (/^\S+/.exec(sent)?.[0] ?? "").toLowerCase();
+  const credential = /^\S+\s+([\s\S]*)$/.exec(sent)?.[1] ?? "";
   const values = [sent, credential, credential.trim()];
+  let extracted = false;
   if (scheme === "basic") {
-    const decoded = Buffer.from(credential.trim(), "base64").toString("utf8");
-    const colon = decoded.indexOf(":");
-    if (colon !== -1) values.push(decoded, decoded.slice(colon + 1));
+    const encoded = BASIC_HEADER_GRAMMAR.test(sent) ? sent.slice(6) : credential.trim();
+    const decoded = Buffer.from(encoded, "base64").toString("utf8");
+    if (decoded.length > 0) {
+      const colon = decoded.indexOf(":");
+      values.push(decoded);
+      if (colon !== -1) values.push(decoded.slice(colon + 1));
+      extracted = true;
+    }
   } else if (scheme === "tps-ed25519") {
-    const fields = credential.trim().split(":");
-    values.push(fields.length > 4 ? fields.slice(3).join(":") : fields[fields.length - 1]!);
+    const parsed = TPS_ED25519_HEADER_GRAMMAR.exec(sent);
+    if (parsed) {
+      values.push(parsed[4]!);
+      extracted = true;
+    }
+  } else if (scheme === "bearer") {
+    extracted = credential.trim().length > 0;
   }
-  return values.filter((value) => value.length > 0);
+  return { values: values.filter((value) => value.length > 0), withhold: KNOWN_SCHEMES.has(scheme) && !extracted };
 }
 
 const HEX2 = /^[0-9A-Fa-f]{2}$/;
@@ -335,9 +380,11 @@ export const BODY_WITHHELD = "[body withheld]";
  * replaced; or as BODY_WITHHELD when it cannot be: when parsing fails any
  * other way (for example a nesting too deep to parse), when its redaction or
  * re-serialization fails, or when the re-serialized JSON still holds a sent
- * value (for example a value that occurs in JSON syntax).
+ * value (for example a value that occurs in JSON syntax). With `withhold` set
+ * (credentialsInHeader), a non-empty body is shown as BODY_WITHHELD.
  */
-function displayBody(body: string, sentValues: readonly string[]): string {
+function displayBody(body: string, sentValues: readonly string[], withhold = false): string {
+  if (withhold && body.length > 0) return BODY_WITHHELD;
   let parsed: unknown;
   try {
     parsed = JSON.parse(body);
@@ -494,9 +541,16 @@ function boundAndRedact(text: string, sentValues: readonly string[]): string {
  * withholds the body. The named error and the excerpt are read from the
  * unredacted body and go through boundAndRedact with `sentValues`. The
  * `HTTP <status>` prefix and BODY_WITHHELD are written by this function and
- * are not passed through redaction.
+ * are not passed through redaction. With `withhold` set (credentialsInHeader),
+ * the reason for a non-empty body is BODY_WITHHELD.
  */
-export function describeHttpFailure(status: number, body: string, sentValues: readonly string[] = []): string {
+export function describeHttpFailure(
+  status: number,
+  body: string,
+  sentValues: readonly string[] = [],
+  withhold = false,
+): string {
+  if (withhold && body.length > 0) return `HTTP ${status}: ${BODY_WITHHELD}`;
   let reason = "";
   let parsed: unknown;
   try {
@@ -518,9 +572,11 @@ export function describeHttpFailure(status: number, body: string, sentValues: re
 }
 
 /**
- * The display body an ApiHttpError carries (`body`): when fromResponse built
- * the error, displayBody's form of the server's text, redacted with the values
- * its request sent. Undefined for any other error (flair#2764).
+ * The display form of the response body an ApiHttpError carries (`body`):
+ * when fromResponse built the error, displayBody's form of the server's text,
+ * redacted with the values credentialsInHeader read from its request's
+ * Authorization header (within the scope on ApiHttpError), or withheld.
+ * Undefined for any other error (flair#2764).
  */
 export function apiErrorBody(err: unknown): string | undefined {
   return err instanceof ApiHttpError ? err.body : undefined;
@@ -530,8 +586,9 @@ export function apiErrorBody(err: unknown): string | undefined {
  * The unredacted response text, for code that classifies a failure by the
  * server's text (flair#2764). It may hold a credential the request sent:
  * classifiers read it, and text displayed from it goes through boundErrorText,
- * which redacts. For an ApiHttpError not built by fromResponse it is `body`;
- * undefined for any other error.
+ * which redacts it within the scope on ApiHttpError or withholds it. For an
+ * ApiHttpError not built by fromResponse it is `body`; undefined for any other
+ * error.
  */
 export function apiErrorRawBody(err: unknown): string | undefined {
   if (!(err instanceof ApiHttpError)) return undefined;
@@ -540,20 +597,23 @@ export function apiErrorRawBody(err: unknown): string | undefined {
 
 /**
  * `text` (taken from apiErrorRawBody) as one bounded line for output, with
- * the credential values `err`'s request sent redacted from it (boundAndRedact,
- * within the scope on ApiHttpError). For an error that has none,
+ * the credential values credentialsInHeader read from `err`'s request header
+ * redacted from it (boundAndRedact, within the scope on ApiHttpError), or
+ * BODY_WITHHELD when credentialsInHeader set `withhold` for that header. For an error that has no sent values,
  * boundServerText(text) (flair#2764).
  */
 export function boundErrorText(err: unknown, text: string): string {
   const kept = err instanceof ApiHttpError ? privateText.get(err) : undefined;
+  if (kept?.withhold && text.length > 0) return BODY_WITHHELD;
   return boundAndRedact(text, kept?.sentValues ?? []);
 }
 
 /**
- * With FLAIR_DEBUG set (any non-empty value), write a failed response's body
- * to stderr as one JSON string (flair#2764). The path is shown by displayPath
- * (percent-decoded, then redacted, or withheld) and the body by displayBody (a
- * JSON body re-serialized, or withheld), each redacted within the scope on
+ * With FLAIR_DEBUG set (any non-empty value), write the display form of a
+ * failed response's body to stderr as one JSON string (flair#2764). The path
+ * is shown by displayPath (percent-decoded, then redacted, or withheld) and
+ * the body by displayBody (a JSON body re-serialized, or withheld; any body
+ * withheld when `withhold` is set), each redacted within the scope on
  * ApiHttpError; the labels, method, status and the JSON encoding of the body
  * are written by this function and are not passed through redaction. In the
  * JSON-encoded body, DEL, C1 control characters and the Unicode line and
@@ -567,11 +627,12 @@ export function emitHttpErrorBodyDebug(
   status: number,
   body: string,
   sentValues: readonly string[] = [],
+  withhold = false,
   env: Record<string, string | undefined> = process.env,
   write: (s: string) => void = (s) => { process.stderr.write(s); },
 ): void {
   if (!env.FLAIR_DEBUG) return;
-  const shownBody = JSON.stringify(displayBody(body, sentValues)).replace(
+  const shownBody = JSON.stringify(displayBody(body, sentValues, withhold)).replace(
     /[\u007F-\u009F\u2028\u2029]/g,
     (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
   );
@@ -1045,12 +1106,13 @@ export async function sendJsonRequest(
   const text = await res.text();
   if (!res.ok) {
     // The FLAIR_DEBUG line's path and body, the message's reason and `body`
-    // are redacted with the credential values this request sent, within the
-    // scope on ApiHttpError; classifiers read the unredacted text through
-    // apiErrorRawBody.
-    const sent = sentCredentialValues(authHeader);
-    emitHttpErrorBodyDebug(method, url.pathname, res.status, text, sent);
-    throw ApiHttpError.fromResponse(res.status, text, sent);
+    // are redacted with the credential values credentialsInHeader reads from
+    // this request's Authorization header, within the scope on ApiHttpError,
+    // and the server's text is withheld when it sets `withhold`; classifiers
+    // read the unredacted text through apiErrorRawBody.
+    const sent = credentialsInHeader(authHeader);
+    emitHttpErrorBodyDebug(method, url.pathname, res.status, text, sent.values, sent.withhold);
+    throw ApiHttpError.fromResponse(res.status, text, sent.values, sent.withhold);
   }
   if (!text) return { ok: true };
   return JSON.parse(text);
