@@ -11,7 +11,7 @@
 // what the built modules answered: a capability refusal's `reason`, or the
 // lock and scope outcomes.
 import { Resource, databases } from "harper";
-import { putMemoryWithLock } from "./Memory.js";
+import { patchMemoryWithLock, putMemoryWithLock } from "./Memory.js";
 import { withMemoryWriteLock } from "./memory-write-lock.js";
 import { withLockedMemoryTransaction } from "./memory-write-transaction.js";
 import { withMemoryWriteLock as withCopiedRegistryLock } from "./zz-memory-write-lock-copy-2478.js";
@@ -43,6 +43,29 @@ export class CheckedWriteProbe2478 extends Resource {
         const lock = await withMemoryWriteLock(store(), [id], (held) =>
           withLockedMemoryTransaction(held, ctx, (tx) => putMemoryWithLock(held, tx, { id, content })), PHASE);
         return { lock: lock.kind, scope: lock.value?.kind, confirmed: lock.value?.confirmed };
+      }
+      case "patch-commit":
+      case "patch-abort": {
+        // A checked PATCH: the committed read made while the scope is open
+        // shows whether the write is staged in the scope's transaction; the
+        // abort case refuses after the write staged.
+        let receipt;
+        let duringScope;
+        const lock = await withMemoryWriteLock(store(), [id], (held) =>
+          withLockedMemoryTransaction(held, ctx, async (tx) => {
+            receipt = await patchMemoryWithLock(held, tx, { id, content: { content: body.text } });
+            duringScope = (await databases.flair.Memory.get(id, {}))?.content;
+            if (body.op === "patch-abort") return new Response(JSON.stringify({ error: "probe_refusal" }), { status: 409 });
+            return "kept";
+          }), PHASE);
+        return {
+          lock: lock.kind,
+          scope: lock.value?.kind,
+          confirmed: lock.value?.confirmed?.length,
+          refusedStatus: lock.value?.response?.status,
+          receipt: receipt?.status,
+          duringScope,
+        };
       }
       case "revoked": {
         const content = await edit(id, body.text);

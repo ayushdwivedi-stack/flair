@@ -34,8 +34,9 @@
  * confirms the row's identity, the PUT's verified fields and the archive fields
  * (`archived`, `archivedAt`, `archivedBy`), and only then answers; the lock is
  * held throughout. An owner PUT or PATCH of a held id waits within its budget
- * and otherwise answers `503 memory_busy`; when the archive cannot take the
- * lock, it answers the lock's refusal itself. A skill row keeps the existing
+ * and, if the hold outlasts it, answers `503 memory_busy` (an id with an
+ * unresolved write outcome answers `503 write_outcome_unknown` first); when
+ * the archive cannot take the lock, it answers the lock's refusal itself. A skill row keeps the existing
  * Memory.put() path and its skill-state refusals (`skill_state_requires_delete`
  * for `archived: true`); the skill version writer is converted later.
  *
@@ -84,8 +85,9 @@ function asResponse(value: any): Response | null {
 
 /**
  * The archive's authoritative read and its write body: re-read the row with
- * `c` (in the transaction `c` carries), refuse a non-readable row (404) or one
- * whose persisted row differs from the basis (409 `memory_changed`), and merge
+ * `c` (in the transaction `c` carries), return a read refusal with its own
+ * status, refuse a missing row (404) or one whose persisted row differs from
+ * the basis (409 `memory_changed`), and merge
  * the archive fields into the re-read row. The re-read row's embedding is kept;
  * pointer fields are omitted so the stored pointer row stands.
  */
@@ -198,7 +200,8 @@ export class MemoryArchive extends Resource {
         // flair#2275: re-read the row INSIDE the locked transaction and build the
         // write from THAT read — never from the basis above, which another writer
         // may have changed before the lock was taken. Unequal persisted rows are
-        // refused (409); a non-readable row returns 404.
+        // refused (409); a read refusal keeps its own status, and a missing row
+        // returns 404.
         const merged = await rereadAndMerge(id, lockedTransactionContext(tx), persistedBasis, archived, auth.agentId);
         if (merged instanceof Response) return merged;
         // Memory.put()'s write body, joined to this transaction: its ownership

@@ -18,9 +18,11 @@
  *    its binding are unchanged);
  *  - through the built app (a test-only probe resource,
  *    test/fixtures/checked-write-probe-2478/probe.js): a checked write on a
- *    live token succeeds; one with a revoked token, one naming an id the token
- *    does not hold, and one with a token from a second copy of the lock module
- *    (another registry) are refused, and nothing is written.
+ *    live token succeeds; a checked patch is staged in the scope's
+ *    transaction, confirmed while the lock is held, and rolled back when the
+ *    scope refuses after it staged; one with a revoked token, one naming an id
+ *    the token does not hold, and one with a token from a second copy of the
+ *    lock module (another registry) are refused, and nothing is written.
  *
  * Seeded rows carry an explicit visibility, an incarnation token and a current
  * stamp, so boot migrations leave them alone. Home-isolated ephemeral Harper;
@@ -234,6 +236,33 @@ describe("flair#2478 part 3a — checked writes through the built app (real Harp
     expect(result.confirmed).toEqual([{ id, written: true, deduplicated: false, visibility: "shared" }]);
     expect((await h.readRow(id))?.content).toBe(PROBE_TEXT);
     expect(h.writesBy(id, "checked-write-probe").map((w) => w.method)).toEqual(["put"]);
+  }, 120_000);
+
+  it("CONTROL: a checked patch stages in the scope, commits, and is confirmed while the lock is held", async () => {
+    const id = "mal-probe-patch";
+    await seed(id, "basement");
+    h.arm("memory-locked-committed");
+    const pending = probe({ op: "patch-commit", id, text: PROBE_TEXT });
+    try {
+      await h.assertPaused("memory-locked-committed");
+      // Committed, confirmation not yet run: the id is still held.
+      const body = await expectRefused(await ownerWrite("PATCH", id), "memory_busy");
+      expect(body).toEqual({ error: "memory_busy", caller: owner.id });
+      await h.release("memory-locked-committed");
+    } finally {
+      h.letGo("memory-locked-committed");
+    }
+    const result = await pending;
+    expect(result).toMatchObject({ lock: "done", scope: "committed", confirmed: 1, receipt: "staged", duringScope: ORIGINAL });
+    expect((await h.readRow(id))?.content).toBe(PROBE_TEXT);
+  }, 120_000);
+
+  it("a checked patch whose scope refuses after it staged is rolled back", async () => {
+    const id = "mal-probe-patch-abort";
+    await seed(id, "basement");
+    const result = await probe({ op: "patch-abort", id, text: PROBE_TEXT });
+    expect(result).toMatchObject({ lock: "done", scope: "refused", refusedStatus: 409, receipt: "staged", duringScope: ORIGINAL });
+    expect((await h.readRow(id))?.content, "the refused scope's staged patch landed").toBe(ORIGINAL);
   }, 120_000);
 
   it("a revoked token (its acquisition settled) is refused and nothing is written", async () => {

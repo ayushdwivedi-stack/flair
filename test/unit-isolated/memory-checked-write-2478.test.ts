@@ -1,9 +1,11 @@
 // flair#2478 part 3a — the checked Memory writes (resources/Memory.ts
 // putMemoryWithLock / patchMemoryWithLock) against the shared Memory harness:
-// they stage inside a locked transaction scope and are answered after its
+// they are admitted into a locked transaction scope and answered after its
 // commit and confirmation; without a live token for the store and every id
 // they write, they are refused and nothing is written; and the public PUT/PATCH
-// acquire the lock whatever they are handed. The real-Harper cases are in
+// take the lock when handed a live token, its scope and bypass markers. The
+// harness stages a table put in its mock transaction but writes a table patch
+// through, so PATCH staging and rollback are covered against real Harper in
 // test/integration/memory-archive-lock-2478.test.ts.
 import { beforeEach, describe, expect, it } from "bun:test";
 import { databasesMock, harnessState, installMemoryHarperMock, resetHarnessState } from "../helpers/memory-search-harness";
