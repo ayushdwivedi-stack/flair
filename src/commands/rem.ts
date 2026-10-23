@@ -638,9 +638,12 @@ export function candidateIncompleteFlag(claim: unknown): string | null {
 /**
  * Classifies a thrown /ReflectMemories execute-mode error for CLI display.
  * `api()` throws an ApiHttpError whose `body` is the response text for a non-2xx
- * response with a body (flair#2764) — the two execute-mode failure bodies are:
+ * response with a body (flair#2764) — the two classified distillation failures are:
  *   503 no-backend:        { error: "No generative backend configured..." }
  *   502 distillation_failed: { error: "distillation_failed", detail: "..." }
+ * The 503 pause refusal ({ error: "rem_aborted", detail: "..." }, sent while the
+ * pause sentinel or FLAIR_REM_PAUSE=1 is set) has no kind of its own: it reads
+ * as "other" with the text `rem_aborted`.
  * Any other shape (network errors, the 400/403 actor-resolution errors
  * prompt mode shares) falls back to "other" — printed as a plain message,
  * no docs pointer or retry hint attached since neither applies. Accepts the

@@ -64,7 +64,11 @@ async function refused(path: string, authHeader: string, method = "GET", body?: 
   return caught as ApiHttpError;
 }
 
-/** What the message must say for this body: the named error of a JSON body, else the whole one-line body. */
+/**
+ * The reason expected in this suite's messages: the named error of a JSON body,
+ * else the body itself. It neither bounds nor cleans the text, so it fits only
+ * the short single-line Harper responses used here.
+ */
 function expectedReason(body: string): string {
   try {
     const parsed = JSON.parse(body);

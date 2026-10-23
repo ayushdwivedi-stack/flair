@@ -6834,7 +6834,8 @@ export async function proveAdminPassAgainstInstance(
     if (err instanceof ApiHttpError && (err.status === 401 || err.status === 403)) {
       return `the supplied admin credential was rejected (HTTP ${err.status})`;
     }
-    // An ApiHttpError's message already begins with `HTTP <status>`.
+    // Each ApiHttpError sendJsonRequest raises for this request begins its
+    // message with `HTTP <status>`.
     const detail = err instanceof Error ? err.message : String(err);
     return `admin credential verification could not be completed (${detail})`;
   }
