@@ -11,7 +11,8 @@
   The message and that stderr line replace the credential values the request
   sent (the Authorization header value, the part after its scheme, a Basic
   header's decoded `user:password` and password, a TPS-Ed25519 signature)
-  with `[redacted]`; the `HTTP <status>` prefix is not changed. The stderr
+  with `[redacted]`, or with nothing where `[redacted]` itself holds a sent
+  value; the `HTTP <status>` prefix is not changed. The stderr
   line shows a JSON body re-serialized (withheld when it parses as JSON but
   cannot be redacted and re-serialized) and the request path percent-decoded
   (withheld when it does not decode or holds a control character). Redaction

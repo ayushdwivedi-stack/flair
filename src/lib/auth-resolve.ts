@@ -97,7 +97,9 @@ import { resolveHome } from "./home.js";
  *     `HTTP <status>` prefix is not passed through redaction.
  *     Classifiers read the unredacted text through `apiErrorRawBody`; the rem
  *     formatters that derive display text from it pass that text through
- *     `boundErrorText`, which redacts.
+ *     `boundErrorText`, which redacts. In each redacted part a credential value
+ *     becomes `[redacted]`, or nothing where `[redacted]` itself holds a sent
+ *     value, and the part holds no occurrence credentialIntervals finds.
  * Scope: redaction covers a response that repeats the request's credential
  * values literally, inside any JSON string (whatever escaping the JSON uses),
  * or percent-encoded (either hex case). A server that transforms a credential
@@ -142,7 +144,7 @@ export class ApiHttpError extends Error {
  */
 const privateText = new WeakMap<ApiHttpError, { raw: string; sentValues: readonly string[] }>();
 
-/** What a credential value the request sent becomes in output. */
+/** What a credential value the request sent becomes in output, unless this text itself holds a sent value. */
 export const REDACTED_CREDENTIAL = "[redacted]";
 
 /**
@@ -265,22 +267,40 @@ function credentialIntervals(text: string, sentValues: readonly string[]): Array
   return merged;
 }
 
+/** The most redaction passes redactSentCredentials makes before it gives up on a text. */
+const MAX_REDACTION_PASSES = 4;
+
+/** `text` when credentialIntervals finds no sent value in it, else `fallback` (flair#2764). */
+function withoutOccurrence(text: string, sentValues: readonly string[], fallback = ""): string {
+  return credentialIntervals(text, sentValues).length === 0 ? text : fallback;
+}
+
 /**
- * `text` with each merged interval of credentialIntervals replaced once by
- * REDACTED_CREDENTIAL (flair#2764). The message's reason, `body`, the
- * FLAIR_DEBUG line's path and body, and the text boundErrorText returns are
- * built with it; the scope is the one on ApiHttpError.
+ * `text` with each merged interval of credentialIntervals replaced once by a
+ * marker (flair#2764): REDACTED_CREDENTIAL, or nothing when that marker itself
+ * holds a sent value. A replacement can join the text around it into a new
+ * occurrence, so the pass repeats until credentialIntervals finds none, at most
+ * MAX_REDACTION_PASSES times; a text that still holds one is returned as "".
+ * The result therefore holds no occurrence credentialIntervals finds. The
+ * message's reason, `body`, the FLAIR_DEBUG line's path and body, and the text
+ * boundErrorText returns are built with it; the scope is the one on
+ * ApiHttpError.
  */
 export function redactSentCredentials(text: string, sentValues: readonly string[]): string {
-  const merged = credentialIntervals(text, sentValues);
-  if (merged.length === 0) return text;
-  let out = "";
-  let at = 0;
-  for (const [start, end] of merged) {
-    out += text.slice(at, start) + REDACTED_CREDENTIAL;
-    at = end;
+  const marker = withoutOccurrence(REDACTED_CREDENTIAL, sentValues);
+  let current = text;
+  for (let pass = 0; pass < MAX_REDACTION_PASSES; pass++) {
+    const merged = credentialIntervals(current, sentValues);
+    if (merged.length === 0) return current;
+    let out = "";
+    let at = 0;
+    for (const [start, end] of merged) {
+      out += current.slice(at, start) + marker;
+      at = end;
+    }
+    current = out + current.slice(at);
   }
-  return out + text.slice(at);
+  return withoutOccurrence(current, sentValues);
 }
 
 /** A parsed JSON value with every string in it, object keys included, redacted (flair#2764). */
@@ -307,7 +327,8 @@ export const BODY_WITHHELD = "[body withheld]";
  * SyntaxError) is shown as received. Either way the result is redacted as text
  * as its last step. When parsing fails any other way (for example a nesting
  * too deep to parse), or the redaction or re-serialization of parsed JSON
- * fails, the body is shown as BODY_WITHHELD.
+ * fails, the body is shown as BODY_WITHHELD, or as "" when that text holds a
+ * sent value.
  */
 function displayBody(body: string, sentValues: readonly string[]): string {
   let parsed: unknown;
@@ -315,34 +336,34 @@ function displayBody(body: string, sentValues: readonly string[]): string {
     parsed = JSON.parse(body);
   } catch (err) {
     if (err instanceof SyntaxError) return redactSentCredentials(body, sentValues);
-    return BODY_WITHHELD;
+    return withoutOccurrence(BODY_WITHHELD, sentValues);
   }
   try {
     return redactSentCredentials(JSON.stringify(redactJsonStrings(parsed, sentValues)), sentValues);
   } catch {
-    return BODY_WITHHELD;
+    return withoutOccurrence(BODY_WITHHELD, sentValues);
   }
 }
 
 /** What displayPath shows for a path it cannot show. */
 export const PATH_WITHHELD = "[path withheld]";
 
-/** C0 controls, DEL and C1 controls. */
-const CONTROL_CHARACTER = /[\u0000-\u001F\u007F-\u009F]/;
+/** C0 controls, DEL, C1 controls and the Unicode line and paragraph separators. */
+const CONTROL_CHARACTER = /[\u0000-\u001F\u007F-\u009F\u2028\u2029]/;
 
 /**
  * A request path for display (flair#2764): percent-decoded, then redacted.
- * PATH_WITHHELD when it does not decode or the decoded path holds a control
- * character.
+ * PATH_WITHHELD when it does not decode or the decoded path holds a
+ * CONTROL_CHARACTER, or "" when PATH_WITHHELD itself holds a sent value.
  */
 function displayPath(path: string, sentValues: readonly string[]): string {
   let decoded: string;
   try {
     decoded = decodeURIComponent(path);
   } catch {
-    return PATH_WITHHELD;
+    return withoutOccurrence(PATH_WITHHELD, sentValues);
   }
-  if (CONTROL_CHARACTER.test(decoded)) return PATH_WITHHELD;
+  if (CONTROL_CHARACTER.test(decoded)) return withoutOccurrence(PATH_WITHHELD, sentValues);
   return redactSentCredentials(decoded, sentValues);
 }
 
@@ -384,13 +405,42 @@ export function boundServerText(text: string): string {
 }
 
 /**
+ * The first SERVER_TEXT_MAX_CHARS characters of `line`, or fewer so that the
+ * cut does not fall inside a %XX or JSON string escape that credentialIntervals
+ * decodes (viewUnit), with trailing whitespace trimmed; null when `line` is not
+ * longer than SERVER_TEXT_MAX_CHARS characters (flair#2764).
+ */
+function keptBeforeCut(line: string): string | null {
+  let count = 0;
+  let index = 0;
+  for (const ch of line) {
+    if (count === SERVER_TEXT_MAX_CHARS) break;
+    count++;
+    index += ch.length;
+  }
+  if (index >= line.length) return null;
+  let boundary = index;
+  if (line.includes("%") || line.includes("\\")) {
+    for (let i = 0; i < index; ) {
+      const width = viewUnit(line, i).width;
+      if (i + width > index) {
+        boundary = i;
+        break;
+      }
+      i += width;
+    }
+  }
+  return line.slice(0, boundary).trimEnd();
+}
+
+/**
  * boundServerText for output, with `sentValues` redacted (flair#2764), in this
  * order: redact, make one line, redact, then cut. The first pass catches a
  * credential before line-making can change it (a whitespace run collapsed, a
  * control character removed); the second catches one that line-making forms.
- * After it the line holds no occurrence that credentialIntervals finds, and
- * neither does any prefix of it, so the cut text is not redacted again and the
- * cut splits only `[redacted]` or other text. The "..." the cut appends is
+ * After it the line holds no occurrence that credentialIntervals finds. The cut
+ * (keptBeforeCut) ends between view units, so the kept text holds none either;
+ * it is checked, and replaced by "" if it does. The "..." the cut appends is
  * never passed through redaction: where it would complete an occurrence, the
  * kept text is shortened to end before that occurrence, and where "..." alone
  * would be one, the cut text ends without it.
@@ -398,9 +448,9 @@ export function boundServerText(text: string): string {
 function boundAndRedact(text: string, sentValues: readonly string[]): string {
   if (sentValues.length === 0) return boundServerText(text);
   const line = redactSentCredentials(oneLine(redactSentCredentials(text, sentValues)), sentValues);
-  const cut = cutToBound(line);
-  if (cut === line) return line;
-  let kept = cut.slice(0, -"...".length);
+  const cutText = keptBeforeCut(line);
+  if (cutText === null) return line;
+  let kept = withoutOccurrence(cutText, sentValues);
   for (;;) {
     const marked = `${kept}...`;
     const reach = credentialIntervals(marked, sentValues).filter(([, end]) => end > kept.length);
@@ -477,9 +527,11 @@ export function boundErrorText(err: unknown, text: string): string {
  * (percent-decoded, then redacted, or withheld) and the body by displayBody (a
  * JSON body re-serialized), each redacted within the scope on ApiHttpError;
  * the method and status are written by this function. In the JSON-encoded body,
- * DEL and C1 control characters are escaped as well, so the line holds no
- * control character but its final newline. `sendJsonRequest` calls it where it
- * builds the error from the body. `env` and `write` are injectable for tests.
+ * DEL, C1 control characters and the Unicode line and paragraph separators are
+ * escaped as well, so the line holds no CONTROL_CHARACTER but its final
+ * newline. The JSON-encoded body is checked once more and shown as `""` if the
+ * encoding formed a sent value. `sendJsonRequest` calls it where it builds the
+ * error from the body. `env` and `write` are injectable for tests.
  */
 export function emitHttpErrorBodyDebug(
   method: string,
@@ -491,10 +543,11 @@ export function emitHttpErrorBodyDebug(
   write: (s: string) => void = (s) => { process.stderr.write(s); },
 ): void {
   if (!env.FLAIR_DEBUG) return;
-  const shownBody = JSON.stringify(displayBody(body, sentValues)).replace(
-    /[\u007F-\u009F]/g,
+  const encoded = JSON.stringify(displayBody(body, sentValues)).replace(
+    /[\u007F-\u009F\u2028\u2029]/g,
     (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
   );
+  const shownBody = withoutOccurrence(encoded, sentValues, '""');
   write(`[flair] ${method} ${displayPath(path, sentValues)} answered HTTP ${status}; response body: ${shownBody}\n`);
 }
 

@@ -6,7 +6,8 @@
  * excerpt of the body, and the error keeps the body, which sendJsonRequest
  * writes to stderr only with FLAIR_DEBUG set (a JSON body shown re-serialized).
  * The message, `body`, that stderr line and the rem display texts replace the
- * credential values the request sent with `[redacted]`. Scope: redaction
+ * credential values the request sent with `[redacted]` (with nothing where
+ * `[redacted]` itself holds a sent value). Scope: redaction
  * covers a response that repeats the request's credential values literally,
  * inside any JSON string (whatever escaping the JSON uses), or percent-encoded
  * (either hex case). A server that transforms a credential some other way is
@@ -679,6 +680,44 @@ describe("flair#2764 — the request's credential values are redacted in every o
       expect(err.body, encoded).toBe("rejected [redacted]");
       expect(stderr, encoded).toBe(`[flair] GET /echo answered HTTP 500; response body: "rejected [redacted]"\n`);
     }
+  });
+
+  test("a password equal to the marker: nothing stands in for it, and no output holds it", async () => {
+    const { err, stderr } = await failEcho(
+      `Basic ${Buffer.from("admin:[redacted]").toString("base64")}`,
+      () => JSON.stringify({ error: "bad [redacted]", detail: "[redacted]" }),
+      true,
+    );
+    const display = describeReflectError(err).text;
+    expect(err.message).toBe("HTTP 500: bad");
+    expect(err.body).toBe('{"error":"bad ","detail":""}');
+    expect(stderr).toBe(`[flair] GET /echo answered HTTP 500; response body: ${JSON.stringify('{"error":"bad ","detail":""}')}\n`);
+    expect(display).toBe("bad");
+    for (const text of [err.message, err.body!, stderr, display]) expect(text).not.toContain("[redacted]");
+  });
+
+  test("a password inside the withheld text: the withheld body is shown as nothing", async () => {
+    const depth = 1_000_000;
+    const { err, stderr } = await failEcho(
+      `Basic ${Buffer.from("admin:withheld").toString("base64")}`,
+      () => `${"[".repeat(depth)}1${"]".repeat(depth)}`,
+      true,
+    );
+    expect(err.body).toBe("");
+    expect(err.message).toBe("HTTP 500");
+    expect(stderr).toBe('[flair] GET /echo answered HTTP 500; response body: ""\n');
+  }, 30_000);
+
+  test("a replacement that joins its neighbours into a new occurrence is redacted again", async () => {
+    const { err, stderr } = await failEcho("Bearer x[red", () => "xx[red", true);
+    expect(err.body).toBe("[redacted]acted]");
+    for (const text of [err.message, err.body!, stderr]) expect(text).not.toContain("x[red");
+  });
+
+  test("the cut does not fall inside an escape the search decodes", async () => {
+    const bs = String.fromCharCode(92);
+    const { err } = await failEcho(`Bearer A${bs}u`, () => `${"x".repeat(195)}%41${bs}u0042zzzz`, false);
+    expect(err.message).toBe(`HTTP 500: ${"x".repeat(195)}%41...`);
   });
 
   test("a body that carries no credential value is unchanged", async () => {
