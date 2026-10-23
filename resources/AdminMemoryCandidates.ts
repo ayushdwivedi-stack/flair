@@ -6,8 +6,11 @@
  *
  * Returns `{ candidates: [{ id }], hasMore }`: each candidate object carries
  * only its id, which restore uses to delete the row through the same endpoint.
- * `limit` defaults to 200 and is capped at 500; `hasMore` reports whether the
- * agent holds more rows than this response carries.
+ * `limit` defaults to 200 and is capped at 500. A 200 reply with `hasMore`
+ * false lists every row the agent holds; `hasMore` true means it holds more
+ * rows than the reply carries. A row it reads whose id is not a non-empty
+ * string fails the request (500, `candidate_id_unusable`) instead of being
+ * left out.
  *
  * Admin-only: allowRead() is allowAdmin(), so a request with no Authorization
  * header is refused by the `/Admin*` path gate (401) and a verified non-admin
@@ -23,6 +26,14 @@ const JSON_HEADERS = { "Content-Type": "application/json" } as const;
 
 function badRequest(error: string): Response {
   return new Response(JSON.stringify({ error }), { status: 400, headers: JSON_HEADERS });
+}
+
+/** A listing that would leave out a row without a usable id fails instead. */
+function candidateIdUnusable(): Response {
+  return new Response(
+    JSON.stringify({ error: "candidate_id_unusable", message: "a MemoryCandidate row for this agent has no usable id, so the listing would be incomplete" }),
+    { status: 500, headers: JSON_HEADERS },
+  );
 }
 
 function requestUrl(self: any): URL | null {
@@ -72,7 +83,7 @@ export class AdminMemoryCandidates extends Resource {
         conditions: [{ attribute: "agentId", comparator: "equals", value: agentId }],
         limit: limit + 1,
       })) {
-        if (typeof row?.id !== "string" || row.id.length === 0) continue;
+        if (typeof row?.id !== "string" || row.id.length === 0) return candidateIdUnusable();
         if (candidates.length === limit) {
           hasMore = true;
           break;

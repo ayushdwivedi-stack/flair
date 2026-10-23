@@ -518,6 +518,36 @@ describe("applySnapshot — real restore", () => {
     expect(r.preRestoreSnapshotPath).toBeUndefined();
   });
 
+  it("refuses a candidate listing answered 500 candidate_id_unusable as incomplete, before any delete or write", async () => {
+    const snapshotPath = await makeTestSnapshot();
+    const { api, calls } = recordingApi({
+      "GET:/Memory": () => [{ id: "mem-1", agentId: "test-agent" }],
+      "GET:/Soul": () => [{ id: "soul-1", agentId: "test-agent" }],
+      "GET:/AdminMemoryCandidates": () => {
+        throw new ApiHttpError(500, JSON.stringify({ error: "candidate_id_unusable", message: "fixture" }));
+      },
+    });
+    const soul = recordingApi();
+
+    const r = await applySnapshot({
+      agentId: "test-agent",
+      snapshotPath,
+      flairVersion: "0.0.0-test",
+      apiCall: api,
+      soulApiCall: soul.api,
+      preRestoreSnapshotRoot: snapshotRoot,
+      tmpRootOverride: testRoot,
+    });
+
+    expect(calls.filter((c) => ["DELETE", "PUT", "POST", "PATCH"].includes(c.method))).toEqual([]);
+    expect(soul.calls).toEqual([]);
+    expect(r.status).toBe("failed");
+    expect(r.errors).toEqual([
+      "fetch-candidates: the target's MemoryCandidate listing for agent test-agent could not be read completely: GET /AdminMemoryCandidates answered candidate_id_unusable (a row has no usable id). "
+        + "No target rows were deleted or written. Remove or repair that agent's MemoryCandidate row without a usable id on the target, then retry.",
+    ]);
+  });
+
   const malformedListings: Array<[string, unknown, string]> = [
     ["a missing hasMore", { candidates: [{ id: "cand-1" }] }, "unexpected response shape: hasMore is missing or not a boolean"],
     ["a non-boolean hasMore", { candidates: [{ id: "cand-1" }], hasMore: "false" }, "unexpected response shape: hasMore is missing or not a boolean"],

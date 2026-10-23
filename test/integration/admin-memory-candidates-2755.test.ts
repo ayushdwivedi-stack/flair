@@ -12,18 +12,25 @@
  * FLAIR_OPS_PORT naming the other's operations port. It must list and delete
  * on the target alone: the target loses its candidate, the other instance
  * keeps its own.
+ *
+ * Harper's MemoryCandidate primary key stores an empty string or an array of
+ * strings as given. A row with such an id that the route reads fails its
+ * agent's listing with `candidate_id_unusable`, and a restore that gets that
+ * answer writes no target row.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import nacl from "tweetnacl";
 import { randomUUID } from "node:crypto";
+import { pathToFileURL } from "node:url";
 import { startHarper, stopHarpers, type HarperInstance, HARPER_STOP_BUDGET_MS } from "../helpers/harper-lifecycle";
 import { nodeBin } from "../helpers/node-runtime";
 import { createSnapshot } from "../../src/rem/snapshot.ts";
 
 const CLI = join(process.cwd(), "dist", "cli.js");
+const FETCH_LOG_PRELOAD = join(import.meta.dirname, "..", "helpers", "fetch-request-log-preload.ts");
 const AGENT_ID = "agent-a";
 const OTHER_AGENT_ID = "agent-b";
 const MEMORY_ID = "m-restored";
@@ -111,7 +118,8 @@ async function seedCandidate(h: HarperInstance, id: string, agentId: string, cla
   });
 }
 
-function runRestore(h: HarperInstance, opsSide: HarperInstance, date: string): Promise<{ code: number; stdout: string; stderr: string }> {
+/** With `fetchLog`, the CLI loads the request-log preload, which appends each `fetch` it sends to that file. */
+function runRestore(h: HarperInstance, opsSide: HarperInstance, date: string, fetchLog?: string): Promise<{ code: number; stdout: string; stderr: string }> {
   const childEnv: Record<string, string | undefined> = {
     ...process.env,
     HOME: home,
@@ -124,11 +132,13 @@ function runRestore(h: HarperInstance, opsSide: HarperInstance, date: string): P
     FLAIR_ADMIN_USER: undefined,
     HDB_ADMIN_PASSWORD: undefined,
     FLAIR_AGENT_ID: undefined,
+    FLAIR_TEST_FETCH_LOG: fetchLog,
     NO_COLOR: "1",
   };
   for (const [key, value] of Object.entries(childEnv)) if (value === undefined) delete childEnv[key];
+  const preload = fetchLog ? ["--import", pathToFileURL(FETCH_LOG_PRELOAD).href] : [];
   const child = Bun.spawn(
-    [nodeBin({ env: childEnv as Record<string, string> }), CLI, "rem", "restore", date, "--agent", AGENT_ID, "--apply", "--admin-pass", h.admin.password],
+    [nodeBin({ env: childEnv as Record<string, string> }), ...preload, CLI, "rem", "restore", date, "--agent", AGENT_ID, "--apply", "--admin-pass", h.admin.password],
     { env: childEnv as Record<string, string>, timeout: 90_000, stdout: "pipe", stderr: "pipe" },
   );
   return (async () => {
@@ -199,6 +209,49 @@ describe("flair#2755 — admin-only candidate listing", () => {
     expect(body.status).toBe(403);
   });
 
+  test("Harper stores an empty or an array MemoryCandidate id, and the route fails that agent's listing", async () => {
+    const base = { claim: "unusable id", generatedAt: createdAt, status: "pending" };
+    const insert = (record: Record<string, unknown>) =>
+      fetch(adminHarper.opsURL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: adminAuth(adminHarper) },
+        body: JSON.stringify({ operation: "insert", database: "flair", table: "MemoryCandidate", records: [{ ...base, ...record }] }),
+        signal: AbortSignal.timeout(15_000),
+      });
+    const idsOf = (agentId: string) =>
+      ops(adminHarper, {
+        operation: "search_by_conditions",
+        table: "MemoryCandidate",
+        operator: "and",
+        conditions: [{ search_attribute: "agentId", search_type: "equals", search_value: agentId }],
+        get_attributes: ["id"],
+      });
+    const list = (agentId: string) => fetch(`${adminHarper.httpURL}${path(agentId)}`, { headers: { Authorization: adminAuth(adminHarper) } });
+
+    // The primary key refuses a number and a boolean, and generates a string id for a missing one.
+    expect((await insert({ id: 7, agentId: "agent-number-id" })).status).toBe(400);
+    expect((await insert({ id: true, agentId: "agent-boolean-id" })).status).toBe(400);
+    expect((await insert({ agentId: "agent-missing-id" })).status).toBe(200);
+    const generated = await idsOf("agent-missing-id");
+    expect(generated).toHaveLength(1);
+    expect(typeof generated[0].id).toBe("string");
+    expect(generated[0].id.length).toBeGreaterThan(0);
+    const listed = await list("agent-missing-id");
+    expect(listed.status).toBe(200);
+    expect(await listed.json()).toEqual({ candidates: [{ id: generated[0].id }], hasMore: false });
+
+    // It stores an empty string and an array of strings as given.
+    expect((await insert({ id: "", agentId: "agent-empty-id" })).status).toBe(200);
+    expect((await insert({ id: ["unusable", "2755"], agentId: "agent-array-id" })).status).toBe(200);
+    expect(await idsOf("agent-empty-id")).toEqual([{ id: "" }]);
+    expect(await idsOf("agent-array-id")).toEqual([{ id: ["unusable", "2755"] }]);
+    for (const agentId of ["agent-empty-id", "agent-array-id"]) {
+      const res = await list(agentId);
+      expect(res.status).toBe(500);
+      expect((await res.json() as any).error).toBe("candidate_id_unusable");
+    }
+  });
+
   test("with two instances holding the same Instance row, a restore lists and deletes on its target only", async () => {
     other = await startHarper();
     assertOwnInstance(other);
@@ -262,5 +315,56 @@ describe("flair#2755 — admin-only candidate listing", () => {
       get_attributes: ["id", "content"],
     });
     expect(otherMemories).toEqual([{ id: "m-on-other", content: "other instance memory" }]);
+  }, 300_000);
+
+  test("a restore whose candidate listing answers candidate_id_unusable sends no write and leaves the target's rows as they were", async () => {
+    await seedCandidate(adminHarper, "c-usable-2755", AGENT_ID, "usable candidate");
+    await ops(adminHarper, {
+      operation: "insert",
+      table: "MemoryCandidate",
+      records: [{ id: ["unusable", AGENT_ID], agentId: AGENT_ID, claim: "unusable id", generatedAt: createdAt, status: "pending" }],
+    });
+    await ops(adminHarper, {
+      operation: "upsert",
+      table: "Memory",
+      records: [{ id: "m-drift-unusable", agentId: AGENT_ID, content: "drifted", durability: "persistent", createdAt }],
+    });
+    const agentState = async () => {
+      const out: Record<string, unknown[]> = {};
+      for (const table of ["Memory", "Soul", "MemoryCandidate"]) {
+        const rows = await ops(adminHarper, {
+          operation: "search_by_conditions",
+          table,
+          operator: "and",
+          conditions: [{ search_attribute: "agentId", search_type: "equals", search_value: AGENT_ID }],
+          get_attributes: ["*"],
+        });
+        out[table] = rows.map((r) => JSON.stringify(r)).sort();
+      }
+      return out;
+    };
+    const before = await agentState();
+    expect(before.MemoryCandidate).toHaveLength(2);
+
+    const created = await createSnapshot({
+      agentId: AGENT_ID,
+      flairVersion: "0.0.0-test",
+      memories: [{ id: MEMORY_ID, agentId: AGENT_ID, content: "restored memory", durability: "persistent", createdAt }],
+      soul: { id: SOUL_ID, agentId: AGENT_ID, key: "identity", value: "restored soul", createdAt },
+      pendingCandidateCount: null,
+      rootOverride: join(home, ".flair", "snapshots"),
+    });
+    const stem = basename(created.path).replace(/\.tar\.gz$/, "");
+    const fetchLog = join(home, "unusable-id-fetch-log.jsonl");
+
+    const result = await runRestore(adminHarper, adminHarper, stem, fetchLog);
+
+    const requests = readFileSync(fetchLog, "utf-8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    expect(requests.filter((r) => r.method !== "GET")).toEqual([]);
+    expect(requests.some((r) => r.path === `/AdminMemoryCandidates/${AGENT_ID}`)).toBe(true);
+    expect(result.code, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`).not.toBe(0);
+    expect(result.stdout).toContain(`the target's MemoryCandidate listing for agent ${AGENT_ID} could not be read completely`);
+    expect(result.stdout).toContain("No target rows were deleted or written.");
+    expect(await agentState()).toEqual(before);
   }, 300_000);
 });

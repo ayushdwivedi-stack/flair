@@ -176,6 +176,12 @@ async function listAgentCandidates(apiCall: ApiCall, agentId: string): Promise<A
   } catch (err) {
     // Only this GET's 404 gets the candidate-route 404 guidance.
     if (isCandidateRoute404(err)) throw new Error(candidateRoute404Guidance(err as ApiHttpError));
+    if (err instanceof ApiHttpError && apiErrorCode(err) === "candidate_id_unusable") {
+      throw new Error(
+        `the target's MemoryCandidate listing for agent ${agentId} could not be read completely: GET /AdminMemoryCandidates answered candidate_id_unusable (a row has no usable id). `
+          + "No target rows were deleted or written. Remove or repair that agent's MemoryCandidate row without a usable id on the target, then retry.",
+      );
+    }
     throw err;
   }
   const defect = candidateListDefect(body);
