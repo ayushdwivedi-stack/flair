@@ -15,9 +15,9 @@
  * (resources/Memory.ts's derivedFrom sources and resources/MemoryReflect.ts's
  * gathered sources) (slice 3b part 2); and the federation merge of an
  * incoming Memory row (resources/Federation.ts) and the batch reindex writer
- * (resources/MemoryReindex.ts) (slice 3c); and basement/restore
- * (resources/MemoryArchive.ts, through the checked write below) (slice 1
- * part 3a). The other Memory writers convert in later parts.
+ * (resources/MemoryReindex.ts) (slice 3c); and basement/restore of a
+ * non-skill row (resources/MemoryArchive.ts, through the checked write below)
+ * (slice 1 part 3a). The other Memory writers convert in later parts.
  *
  * A writer that must make its read, decision and write on one committed basis
  * runs under one key per ID of `Memory.primaryStore`'s lock: `["memory", fullStoredId]`.

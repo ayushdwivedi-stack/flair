@@ -4,9 +4,9 @@
  *
  * A writer that holds the per-id Memory lock (resources/memory-write-lock.ts)
  * and must write a Memory row through the guarded write body opens this scope
- * with its lock token. The scope owns one transaction for that acquisition
- * (withOwnedTransaction: a request transaction on the caller context is
- * detached for the scope and restored afterwards) and hands `work` a
+ * with its lock token. Each scope owns one transaction (withOwnedTransaction:
+ * a request transaction on the caller context is detached for the scope and
+ * restored afterwards) and hands `work` a
  * {@link LockedMemoryTransaction} bound to it. The checked writes
  * (`putMemoryWithLock` / `patchMemoryWithLock` in resources/Memory.ts) join that
  * transaction; they return `staged`, never committed success.

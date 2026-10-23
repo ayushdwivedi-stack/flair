@@ -59,19 +59,26 @@ describe("checked Memory writes under a held lock (flair#2478 part 3a)", () => {
       expect(harnessState.memoryStore.get("m1").instanceToken).toBe("token-m1");
     });
 
-    it(`${verb}: a confirmation of a field the commit did not keep refuses instead of answering success`, async () => {
-      const outcome = await withMemoryWriteLock(store, ["m1"], (held) =>
-        withLockedMemoryTransaction(held, ctx(), async (tx) => {
-          const receipt = await checked[verb](held, tx, { id: "m1", content: body(verb, "the checked edit"), confirmFields: ["archivedBy"] });
-          // From here on, a read of the row finds a field the write did not stage.
-          harnessState.getOverride = (id) => (id === "m1" ? { ...harnessState.memoryStore.get("m1"), archivedBy: "agent-z" } : undefined);
-          return receipt;
-        }));
-      const written = (outcome as any).value;
-      expect(written.kind).toBe("refused");
-      expect(written.response.status).toBe(409);
-      expect((await written.response.json()).error).toBe("stored_row_changed");
-    });
+    // After the staged write, every read of the row returns `committed` with
+    // `change` applied: the confirmation's read included.
+    for (const [label, change, confirmFields] of [
+      ["a field the write did not stage, stored with a value", { archivedBy: "agent-z" }, ["archivedBy"]],
+      ["a field the write did not stage, stored as null", { archivedBy: null }, ["archivedBy"]],
+      ["another row id, with no confirmFields", { id: "m-other" }, []],
+    ] as const) {
+      it(`${verb}: a confirmation that reads ${label} refuses instead of answering success`, async () => {
+        const outcome = await withMemoryWriteLock(store, ["m1"], (held) =>
+          withLockedMemoryTransaction(held, ctx(), async (tx) => {
+            const receipt = await checked[verb](held, tx, { id: "m1", content: body(verb, "the checked edit"), confirmFields });
+            harnessState.getOverride = (id) => (id === "m1" ? { ...harnessState.memoryStore.get("m1"), ...change } : undefined);
+            return receipt;
+          }));
+        const written = (outcome as any).value;
+        expect(written.kind).toBe("refused");
+        expect(written.response.status).toBe(409);
+        expect((await written.response.json()).error).toBe("stored_row_changed");
+      });
+    }
 
     it(`${verb}: refused with no token, another id set's token, a revoked token, or another store's token; nothing is written`, async () => {
       const content = () => ({ id: "m1", content: body(verb, "an unauthorized edit") });

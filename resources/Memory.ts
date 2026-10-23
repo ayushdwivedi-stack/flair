@@ -438,7 +438,7 @@ async function verifyWrittenRow(
   fallbackId: any,
   identity: { expectedToken: unknown },
   fields: readonly string[] = POSTCOMMIT_VERIFY_FIELDS,
-  exactFields: readonly string[] = [],
+  checked?: { readonly exactFields: readonly string[] },
 ): Promise<{ mismatch?: boolean; unknown?: boolean }> {
   const id = declared?.id ?? fallbackId;
   if (id === undefined || id === null) return { unknown: true };
@@ -454,11 +454,17 @@ async function verifyWrittenRow(
     if (!Object.prototype.hasOwnProperty.call(declared, field)) continue;
     if (!sameDeclaredField(row[field], declared[field])) return { mismatch: true };
   }
-  // flair#2478 part 3a: a checked write's own fields and the row's id, compared
-  // whether or not the write declared them (an absent field must stay absent).
-  if (exactFields.length > 0 && String(row.id) !== String(id)) return { mismatch: true };
-  for (const field of exactFields) {
-    if (!sameDeclaredField(row[field] ?? null, declared?.[field] ?? null)) return { mismatch: true };
+  // flair#2478 part 3a: a checked write also confirms the row's id and its
+  // `exactFields`, whether or not the write declared them: a field the staged
+  // write lacks must be absent from the row, and a present one must be equal
+  // (a null is a value, not an absence).
+  if (checked) {
+    if (String(row.id) !== String(id)) return { mismatch: true };
+    for (const field of checked.exactFields) {
+      const staged = declared?.[field];
+      if ((row[field] === undefined) !== (staged === undefined)) return { mismatch: true };
+      if (staged !== undefined && !sameDeclaredField(row[field], staged)) return { mismatch: true };
+    }
   }
   return {};
 }
@@ -3265,7 +3271,7 @@ export class Memory extends (databases as any).flair.Memory {
     const verifyPause = txnPausePoint("memory-patch-verify");
     if (verifyPause) await verifyPause;
     const staged = "staged" in patched ? patched.staged : content;
-    const verified = await verifyWrittenRow((databases as any).flair.Memory, staged, (this as any).getId?.(), patched.identity, reembedRequest ? [] : declaredFields, locked?.confirmFields);
+    const verified = await verifyWrittenRow((databases as any).flair.Memory, staged, (this as any).getId?.(), patched.identity, reembedRequest ? [] : declaredFields, locked ? { exactFields: locked.confirmFields } : undefined);
     if (verified.unknown) return writeOutcomeUnknownFor(content?.id ?? (this as any).getId?.());
     if (verified.mismatch) return storedRowChangedRefusal("Memory");
     // A verified re-embed answers with its own response (it declares no text
@@ -3910,7 +3916,7 @@ export class Memory extends (databases as any).flair.Memory {
       if (verifyPause) await verifyPause;
       const verified = await verifyWrittenRow(
         (databases as any).flair.Memory, putResult.content, putResult.fallbackId,
-        { expectedToken: putResult.content?.instanceToken }, POSTCOMMIT_VERIFY_FIELDS, locked?.confirmFields,
+        { expectedToken: putResult.content?.instanceToken }, POSTCOMMIT_VERIFY_FIELDS, locked ? { exactFields: locked.confirmFields } : undefined,
       );
       if (verified.unknown) return writeOutcomeUnknownFor(putResult.content?.id ?? putResult.fallbackId);
       if (verified.mismatch) return storedRowChangedRefusal("Memory");
@@ -4144,8 +4150,9 @@ export interface CheckedMemoryWriteInput {
   readonly id: string;
   /** The write body, as a PUT or PATCH body. */
   readonly content: Record<string, unknown>;
-  /** Stored fields the post-commit confirmation compares exactly with the
-   *  staged write (an absent staged field must be absent), with the row's id. */
+  /** Stored fields the post-commit confirmation compares with the staged
+   *  write: a field the staged write lacks must be absent from the row, a
+   *  present one equal. The confirmation also compares the row's id. */
   readonly confirmFields?: readonly string[];
 }
 
@@ -4196,8 +4203,8 @@ function enterCheckedWrite(verb: "put" | "patch", held: MemoryWriteLockToken, tx
  * It enters the ordinary PUT's write body without acquiring a lock or opening a
  * transaction, joins the scope's transaction and returns `staged`. After the
  * scope commits, the body resumes for the PUT's post-commit steps; its
- * verification also compares `confirmFields`. A skill write or an `_reindex`
- * body is refused.
+ * verification also compares the row's id and `confirmFields`. A skill write
+ * or an `_reindex` body is refused.
  */
 export function putMemoryWithLock(held: MemoryWriteLockToken, tx: LockedMemoryTransaction, input: CheckedMemoryWriteInput): Promise<MemoryWriteReceipt> {
   return enterCheckedWrite("put", held, tx, input);

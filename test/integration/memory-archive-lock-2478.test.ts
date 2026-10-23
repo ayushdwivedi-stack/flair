@@ -12,6 +12,10 @@
  *    at `memory-locked-committed` (committed, before the confirmation), against
  *    an owner PUT and PATCH: the owner write is refused `503 memory_busy`, and
  *    the archive's fields are stored and confirmed;
+ *  - basement of a successor while its predecessor is held (an owner PUT of the
+ *    predecessor is refused, the archive closes it under the lock), and
+ *    basement then restore of a row with a host pointer (the pointer row and
+ *    its binding are unchanged);
  *  - through the built app (a test-only probe resource,
  *    test/fixtures/checked-write-probe-2478/probe.js): a checked write on a
  *    live token succeeds; one with a revoked token, one naming an id the token
@@ -49,9 +53,9 @@ let vector: number[];
 
 type Action = "basement" | "restore";
 
-function seed(id: string, action: Action): Promise<void> {
+function seed(id: string, action: Action, extra: Record<string, unknown> = {}): Promise<void> {
   const archived = action === "restore" ? { archived: true, archivedAt: ARCHIVED_AT, archivedBy: owner.id } : { archived: false };
-  return h.seedMemory({ id, agentId: owner.id, content: ORIGINAL, embedding: vector, ...archived }, { embeddingModel: SEED_MODEL_ID });
+  return h.seedMemory({ id, agentId: owner.id, content: ORIGINAL, embedding: vector, ...archived, ...extra }, { embeddingModel: SEED_MODEL_ID });
 }
 function archive(id: string, action: Action): Promise<Response> {
   return h.signed(owner, "POST", "/MemoryArchive", { id, action });
@@ -166,6 +170,58 @@ describe("flair#2478 part 3a — the archive writes under its held lock (real Ha
       }
     }
   }
+});
+
+describe("flair#2478 part 3a — archiving a successor and a pointer-bearing row (real Harper)", () => {
+  it("basement of a successor holds its predecessor: an owner PUT of it is refused memory_busy, and the archive closes it under the lock", async () => {
+    const predecessor = "mal-sup-predecessor";
+    const successor = "mal-sup-successor";
+    await seed(predecessor, "basement");
+    await seed(successor, "basement", { supersedes: predecessor });
+    h.arm("memory-locked-staged");
+    const pending = archive(successor, "basement");
+    try {
+      await h.assertPaused("memory-locked-staged");
+      const body = await expectRefused(await ownerWrite("PUT", predecessor), "memory_busy");
+      expect(body).toEqual({ error: "memory_busy", caller: owner.id });
+      await h.release("memory-locked-staged");
+    } finally {
+      h.letGo("memory-locked-staged");
+    }
+    const stored = await expectArchived(await pending, successor, "basement");
+    expect(stored.supersedes).toBe(predecessor);
+    const closed = await h.readRow(predecessor);
+    expect(closed?.content, "the owner PUT of the predecessor landed").toBe(ORIGINAL);
+    expect(typeof closed?.validTo, "the predecessor was not closed").toBe("string");
+    expect(closed.validTo).toBe(stored.validFrom);
+    expect(h.writesBy(predecessor, "archive-basement").map((w) => w.method), "the close was not written under the archive's lock").toEqual(["put"]);
+  }, 120_000);
+
+  it("basement then restore of a row with a host pointer leaves the stored pointer row and its binding unchanged", async () => {
+    const id = "mal-pointer";
+    await seed(id, "basement");
+    const memory = await h.readRow(id);
+    const pointer = {
+      memoryId: id,
+      hostSource: JSON.stringify({ v: 1, host: "openclaw", kind: "run", id: "run-mal2478", url: "https://host.example/path?a=1#frag" }),
+      scopeAtWrite: "shared",
+      authorId: owner.id,
+      memoryInstanceToken: memory.instanceToken,
+      receivedAt: new Date().toISOString(),
+    };
+    await h.ops({ operation: "insert", database: "flair", table: "MemoryHostSource", records: [pointer] });
+    const readPointer = async () => {
+      const rows = await h.ops({ operation: "search_by_id", database: "flair", table: "MemoryHostSource", ids: [id], get_attributes: ["*"] });
+      return Array.isArray(rows) ? rows[0] ?? null : rows;
+    };
+    const before = await readPointer();
+    expect(before).toMatchObject(pointer);
+    for (const action of ["basement", "restore"] as const) {
+      await expectArchived(await archive(id, action), id, action);
+      expect(await readPointer(), `the pointer row changed on ${action}`).toEqual(before);
+      expect((await h.readRow(id))?.instanceToken, `the row no longer binds its pointer after ${action}`).toBe(pointer.memoryInstanceToken);
+    }
+  }, 120_000);
 });
 
 describe("flair#2478 part 3a — checked writes through the built app (real Harper)", () => {

@@ -25,11 +25,12 @@
  * status Harper returns for a denied allowCreate() (403 for SkillScan's same
  * allowVerified() gate in test/integration/gate4-authgate.test.ts).
  *
- * The write (flair#2478 part 3a): after the read above, the archive takes the
- * per-id Memory write lock for the id (and the `supersedes` target the PUT body
- * closes) under phase `archive-basement` / `archive-restore`, opens a locked
- * transaction scope (resources/memory-write-transaction.ts), re-reads the row
- * inside it, and writes through `putMemoryWithLock`. The scope commits, then
+ * The write of a non-skill row (flair#2478 part 3a): after the read above,
+ * the archive takes the per-id Memory write lock for the id (and the
+ * `supersedes` target the PUT body closes) under phase `archive-basement` /
+ * `archive-restore`, opens a locked transaction scope
+ * (resources/memory-write-transaction.ts), re-reads the row inside it, and
+ * writes through `putMemoryWithLock`. The scope commits, then
  * confirms the row's identity, the PUT's verified fields and the archive fields
  * (`archived`, `archivedAt`, `archivedBy`), and only then answers; the lock is
  * held throughout. An owner PUT or PATCH of a held id waits within its budget
