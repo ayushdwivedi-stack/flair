@@ -509,8 +509,11 @@ function rowsFromRead(raw: unknown, label: string): any[] {
 /**
  * Best-effort extraction of a readable message out of a thrown API error.
  * `api()` (src/cli.ts) throws an ApiHttpError for a non-2xx HTTP response
- * with a body (flair#2764); its unredacted text is parsed here (apiErrorRawBody)
- * — /ReflectMemories's 503 (no backend configured) and 502
+ * (flair#2764). When that error was built from a non-empty response body
+ * (ApiHttpError.fromResponse), its unredacted text is parsed here
+ * (apiErrorRawBody); otherwise (the credential-less 403 and a refused redirect
+ * carry only a message, as does any other error) the message is parsed
+ * instead. /ReflectMemories's 503 (no backend configured) and 502
  * (distillation_failed) bodies are JSON `{ error: string, detail?: string }`.
  * A JSON object with a string `error` becomes one bounded line through
  * boundErrorText, which redacts the credential values read from the request's
