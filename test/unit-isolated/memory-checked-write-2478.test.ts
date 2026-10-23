@@ -150,6 +150,24 @@ describe("checked Memory writes under a held lock (flair#2478 part 3a)", () => {
     expect(harnessState.memoryStore.get("m1").tags).toEqual(["note"]);
   });
 
+  it("put: a body holding shared memory (a SharedArrayBuffer view, at any depth) is rejected before admission; nothing is written", async () => {
+    for (const shared of [
+      { embedding: new Float32Array(new SharedArrayBuffer(16)) },
+      { extra: { nested: [new Int8Array(new SharedArrayBuffer(4))] } },
+    ]) {
+      let rejected: unknown;
+      const outcome = await withMemoryWriteLock(store, ["m1"], (held) =>
+        withLockedMemoryTransaction(held, ctx(), async (tx) => {
+          rejected = await putMemoryWithLock(held, tx, { id: "m1", content: { ...ROW, content: "a shared edit", ...shared } }).catch((err) => err);
+          return "work";
+        }));
+      expect(rejected).toBeInstanceOf(TypeError);
+      expect(String((rejected as Error).message)).toContain("shared memory");
+      expect((outcome as any).value).toEqual({ kind: "committed", value: "work", confirmed: [] });
+      expect(harnessState.memoryStore.get("m1")).toEqual(ROW);
+    }
+  });
+
   it("a checked PUT refuses a skill body, an _reindex body and a body naming citations; a checked PATCH refuses a re-embed", async () => {
     const cases: Array<[Verb, Record<string, unknown>]> = [
       ["put", { ...ROW, tags: ["skill"], content: "a skill body" }],
