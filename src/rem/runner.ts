@@ -511,17 +511,19 @@ function rowsFromRead(raw: unknown, label: string): any[] {
  * `api()` (src/cli.ts) throws an ApiHttpError whose `body` is the response
  * text for a non-2xx HTTP response with a body (flair#2764) — /ReflectMemories's
  * 503 (no backend configured) and 502 (distillation_failed) bodies are JSON
- * `{ error: string, detail?: string }`. Unwraps that shape into a single
- * bounded line so distinct failure modes read distinctly in the audit log
- * instead of as a raw JSON blob; falls back to the error's message for network
- * errors or any other shape.
+ * `{ error: string, detail?: string }`. A JSON object with a string `error`
+ * becomes one bounded line, `error: detail` when `detail` is a non-empty
+ * string and `error` alone otherwise, so distinct failure modes read
+ * distinctly in the audit log instead of as a raw JSON blob. Text that is not
+ * JSON, or JSON without a string `error`, falls back to the error's message.
  */
 function describeApiError(err: unknown): string {
   const message = typeof err === "string" ? err : (err as any)?.message ?? String(err);
   try {
     const parsed = JSON.parse(apiErrorBody(err) || message);
     if (parsed && typeof parsed === "object" && typeof parsed.error === "string") {
-      return boundServerText(parsed.detail ? `${parsed.error}: ${parsed.detail}` : parsed.error);
+      const detail = typeof parsed.detail === "string" ? parsed.detail : "";
+      return boundServerText(detail ? `${parsed.error}: ${detail}` : parsed.error);
     }
   } catch {
     // Not a JSON error body — network error, plain string, etc.

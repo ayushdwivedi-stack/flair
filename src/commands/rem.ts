@@ -652,7 +652,8 @@ export function describeReflectError(err: unknown): { kind: "no-backend" | "dist
     const parsed = JSON.parse(apiErrorBody(err) || message);
     if (parsed && typeof parsed === "object") {
       if (parsed.error === "distillation_failed") {
-        return { kind: "distillation-failed", text: boundServerText(String(parsed.detail ?? parsed.error)) };
+        const detail = typeof parsed.detail === "string" ? parsed.detail : "";
+        return { kind: "distillation-failed", text: boundServerText(detail || parsed.error) };
       }
       if (typeof parsed.error === "string" && parsed.error.startsWith("No generative backend configured")) {
         return { kind: "no-backend", text: boundServerText(parsed.error) };

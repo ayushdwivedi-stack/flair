@@ -112,7 +112,7 @@ export class ApiHttpError extends Error {
   }
 }
 
-/** The most characters of server text an ApiHttpError message carries (flair#2764). */
+/** The most characters boundServerText keeps before it cuts the text and appends "..." (flair#2764). */
 export const SERVER_TEXT_MAX_CHARS = 200;
 
 /**

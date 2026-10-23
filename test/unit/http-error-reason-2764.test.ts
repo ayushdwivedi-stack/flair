@@ -1,8 +1,12 @@
 /**
- * flair#2764 — the message of the ApiHttpError raised for a failed REST
- * request is `HTTP <status>` plus the JSON body's named error, or else a
- * bounded one-line excerpt of the body. The error keeps the full body, which
- * sendJsonRequest prints only with FLAIR_DEBUG set.
+ * flair#2764 — when sendJsonRequest builds the error from a failed response's
+ * body (every failure except a refused redirect, a credential-less 403 and a
+ * response with `Content-Length: 0`), the ApiHttpError message is
+ * `HTTP <status>` plus the JSON body's named error, or else a bounded one-line
+ * excerpt of the body, and the error keeps the body as received, which
+ * sendJsonRequest writes to stderr only with FLAIR_DEBUG set. A zero-length
+ * failure keeps the message `HTTP <status>`, and the credential-less 403 keeps
+ * main's hint.
  *
  * Every request goes through the real sendJsonRequest to a node HTTP listener
  * on 127.0.0.1 that this file starts; the last describe spawns the built CLI
@@ -18,7 +22,8 @@ import nacl from "tweetnacl";
 import { ApiHttpError, apiErrorBody, sendJsonRequest } from "../../src/lib/auth-resolve.ts";
 import { isNoBackendConfigured, isRemAbortedFailure, runNightlyCycle } from "../../src/rem/runner.ts";
 import { describeReflectError } from "../../src/commands/rem.ts";
-import { isFederationStatusAuthFailure } from "../../src/commands/federation.ts";
+import { isFederationStatusAuthFailure, isFederationStatusAuthRemedy } from "../../src/commands/federation.ts";
+import { proveAdminPassAgainstInstance } from "../../src/cli.ts";
 import {
   FederationPairLocalAccessError,
   rewriteFederationPairLocalAccessError,
@@ -205,42 +210,50 @@ describe("flair#2764 — code that classifies a failure reads the full body", ()
     expect(rewritten).toBeInstanceOf(FederationPairLocalAccessError);
   });
 
-  test("rem's distillation error still names the body's error and detail", async () => {
-    const root = mkdtempSync(join(tmpdir(), "flair-2764-runner-"));
-    const routes: Record<string, Reply> = {
-      "GET /Memory": { status: 200, body: JSON.stringify([{ id: "m1", agentId: AGENT_ID, content: "first memory" }]) },
-      "GET /Soul": { status: 200, body: "[]" },
-      "POST /MemoryMaintenance": { status: 200, body: JSON.stringify({ expired: 0, archived: 0, total: 0, errors: 0 }) },
-      "POST /ReflectMemories": {
-        status: 502,
-        body: JSON.stringify({ error: "distillation_failed", detail: "model output did not validate after one retry" }),
-      },
-      "POST /MemoryDedupStats": {
-        status: 200,
-        body: JSON.stringify({ clusterCount: 0, largestClusterSize: 0, totalMemoriesInClusters: 0, computedAt: "2026-07-22T03:00:00.000Z" }),
-      },
-    };
-    const own = await startListener((line) => routes[line.split("?")[0]] ?? { status: 404, body: `no route for ${line}` });
-    try {
-      const apiCall = (method: string, path: string, body?: unknown) =>
-        sendJsonRequest(new URL(path, `http://127.0.0.1:${own.port}`), method, body, "Basic fixture", true);
-      const r = await runNightlyCycle({
-        agentId: AGENT_ID,
-        flairVersion: "0.0.0-test",
-        apiCall,
-        snapshotRoot: join(root, "snapshots"),
-        logPath: join(root, "rem-nightly.jsonl"),
-        pauseFlagPath: join(root, "rem.paused"),
-        envPaused: false,
-        healthProbe: async () => ({ ok: true, elapsedMs: 1 }),
-      });
-      expect(r.logRow.errors, own.seen.join("\n")).toEqual([
-        "distillation: distillation_failed: model output did not validate after one retry",
-      ]);
-    } finally {
-      await own.close();
-      rmSync(root, { recursive: true, force: true });
-    }
+  for (const [detail, expected] of [
+    ["model output did not validate after one retry", "distillation: distillation_failed: model output did not validate after one retry"],
+    [{ reason: "nested" }, "distillation: distillation_failed"],
+  ] as const) {
+    test(`rem's distillation error names the body's error${typeof detail === "string" ? " and string detail" : ", leaving out an object detail"}`, async () => {
+      const root = mkdtempSync(join(tmpdir(), "flair-2764-runner-"));
+      const routes: Record<string, Reply> = {
+        "GET /Memory": { status: 200, body: JSON.stringify([{ id: "m1", agentId: AGENT_ID, content: "first memory" }]) },
+        "GET /Soul": { status: 200, body: "[]" },
+        "POST /MemoryMaintenance": { status: 200, body: JSON.stringify({ expired: 0, archived: 0, total: 0, errors: 0 }) },
+        "POST /ReflectMemories": { status: 502, body: JSON.stringify({ error: "distillation_failed", detail }) },
+        "POST /MemoryDedupStats": {
+          status: 200,
+          body: JSON.stringify({ clusterCount: 0, largestClusterSize: 0, totalMemoriesInClusters: 0, computedAt: "2026-07-22T03:00:00.000Z" }),
+        },
+      };
+      const own = await startListener((line) => routes[line.split("?")[0]] ?? { status: 404, body: `no route for ${line}` });
+      try {
+        const apiCall = (method: string, path: string, body?: unknown) =>
+          sendJsonRequest(new URL(path, `http://127.0.0.1:${own.port}`), method, body, "Basic fixture", true);
+        const r = await runNightlyCycle({
+          agentId: AGENT_ID,
+          flairVersion: "0.0.0-test",
+          apiCall,
+          snapshotRoot: join(root, "snapshots"),
+          logPath: join(root, "rem-nightly.jsonl"),
+          pauseFlagPath: join(root, "rem.paused"),
+          envPaused: false,
+          healthProbe: async () => ({ ok: true, elapsedMs: 1 }),
+        });
+        expect(r.logRow.errors, own.seen.join("\n")).toEqual([expected]);
+      } finally {
+        await own.close();
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test("describeReflectError leaves out an object detail of a distillation_failed body", async () => {
+    const err = await failWith("/reflect-failed-object-detail", {
+      status: 502,
+      body: JSON.stringify({ error: "distillation_failed", detail: { reason: "nested" } }),
+    });
+    expect(describeReflectError(err)).toEqual({ kind: "distillation-failed", text: "distillation_failed" });
   });
 
   test("federation status still reads an auth marker outside the named error", async () => {
@@ -250,6 +263,24 @@ describe("flair#2764 — code that classifies a failure reads the full body", ()
     });
     expect(err.message).toBe("HTTP 400: bad_request");
     expect(isFederationStatusAuthFailure(err)).toBe(true);
+    expect(isFederationStatusAuthRemedy(err)).toBe(true);
+  });
+
+  test("the admin-password probe names a non-auth HTTP failure once, with the bounded reason", async () => {
+    const routes: Record<string, Reply> = {};
+    const own = await startListener((line) => routes[line] ?? { status: 404, body: `no route for ${line}` });
+    try {
+      for (const [reply, expected] of [
+        [{ status: 500, body: JSON.stringify({ error: "boom" }) }, "admin credential verification could not be completed (HTTP 500: boom)"],
+        [{ status: 503, body: "store down\n" }, "admin credential verification could not be completed (HTTP 503: store down)"],
+      ] as const) {
+        routes["GET /FederationPeers"] = reply;
+        expect(await proveAdminPassAgainstInstance(own.port, "fixture-password")).toBe(expected);
+      }
+      expect(own.seen).toEqual(["GET /FederationPeers", "GET /FederationPeers"]);
+    } finally {
+      await own.close();
+    }
   });
 });
 

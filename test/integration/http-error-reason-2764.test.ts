@@ -1,8 +1,10 @@
 /**
- * flair#2764 against a real Harper: the error bodies Harper and Flair send for
- * a refused request become a bounded `HTTP <status>: <reason>` message, the
- * error keeps the full body, and the pair command's AccessViolation rewrite
- * still recognises Harper's real 403 body.
+ * flair#2764 against a real Harper started with FLAIR_REM_PAUSE=1. Each refused
+ * request below sends a credential, so sendJsonRequest builds the error from
+ * the response body: the message is a bounded `HTTP <status>: <reason>`, the
+ * error keeps the body as received, the pair command's AccessViolation rewrite
+ * still recognises Harper's real 403 body, and rem's pause check still
+ * classifies the real /ReflectMemories 503.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import nacl from "tweetnacl";
@@ -15,6 +17,7 @@ import {
   FederationPairLocalAccessError,
   rewriteFederationPairLocalAccessError,
 } from "../../src/lib/federation-pair-access.ts";
+import { isNoBackendConfigured, isRemAbortedFailure } from "../../src/rem/runner.ts";
 
 interface TestAgent { id: string; publicKey: string; secretKey: Uint8Array; }
 
@@ -49,11 +52,11 @@ function assertOwnInstance(h: HarperInstance): void {
 const AGENT = mkAgent("agent-2764");
 let harper: HarperInstance;
 
-async function refused(path: string, authHeader: string): Promise<ApiHttpError> {
+async function refused(path: string, authHeader: string, method = "GET", body?: unknown): Promise<ApiHttpError> {
   assertOwnInstance(harper);
   let caught: unknown;
   try {
-    await sendJsonRequest(new URL(path, harper.httpURL), "GET", undefined, authHeader, true);
+    await sendJsonRequest(new URL(path, harper.httpURL), method, body, authHeader, true);
   } catch (err) {
     caught = err;
   }
@@ -74,7 +77,7 @@ function expectedReason(body: string): string {
 
 describe("flair#2764 — refused requests against a real Harper", () => {
   beforeAll(async () => {
-    harper = await startHarper();
+    harper = await startHarper({ serverEnv: { FLAIR_REM_PAUSE: "1" } });
     assertOwnInstance(harper);
     await ensureFlairAgentRole(harper.opsURL, harper.admin.username, harper.admin.password);
     await ensureFlairAgentUser(harper.opsURL, harper.admin.username, harper.admin.password);
@@ -113,5 +116,19 @@ describe("flair#2764 — refused requests against a real Harper", () => {
     expect([401, 403], detail).toContain(err.status);
     expect(err.message, detail).toBe(`HTTP ${err.status}: ${expectedReason(err.body!)}`);
     expect(err.message, detail).not.toMatch(/[\u0000-\u001F\u007F-\u009F]/);
+  }, 30_000);
+
+  test("a paused instance's POST /ReflectMemories: rem's pause check classifies it, and the message is the bounded reason", async () => {
+    const path = "/ReflectMemories";
+    const err = await refused(path, ed25519Header(AGENT, "POST", path), "POST", { agentId: AGENT.id, execute: true });
+    const detail = `status ${err.status}, body ${JSON.stringify(err.body)}, message ${JSON.stringify(err.message)}`;
+    expect(err.status, detail).toBe(503);
+    expect(err.message, detail).toBe("HTTP 503: rem_aborted");
+    expect(JSON.parse(err.body!), detail).toEqual({
+      error: "rem_aborted",
+      detail: "REM distillation aborted (pause sentinel or FLAIR_REM_PAUSE=1). Resume with: flair rem resume",
+    });
+    expect(isRemAbortedFailure(err), detail).toBe(true);
+    expect(isNoBackendConfigured(err), detail).toBe(false);
   }, 30_000);
 });
