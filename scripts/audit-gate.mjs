@@ -56,7 +56,7 @@
 
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { dirname, join, relative, resolve, sep } from "node:path";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -1472,7 +1472,7 @@ async function main() {
 }
 
 // Only run when executed directly, so the unit tests can import the helpers.
-if (process.argv[1] && (import.meta.url === `file://${process.argv[1]}` || import.meta.url === pathToFileURL(process.argv[1]).href)) {
+if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
   main().catch((e) => {
     console.error(`audit-gate crashed: ${e?.stack || e}`);
     process.exit(1);
