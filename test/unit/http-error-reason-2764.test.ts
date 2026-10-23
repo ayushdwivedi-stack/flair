@@ -22,7 +22,11 @@ import nacl from "tweetnacl";
 import { ApiHttpError, apiErrorBody, sendJsonRequest } from "../../src/lib/auth-resolve.ts";
 import { isNoBackendConfigured, isRemAbortedFailure, runNightlyCycle } from "../../src/rem/runner.ts";
 import { describeReflectError } from "../../src/commands/rem.ts";
-import { isFederationStatusAuthFailure, isFederationStatusAuthRemedy } from "../../src/commands/federation.ts";
+import {
+  isFederationStatusAuthFailure,
+  isFederationStatusAuthRemedy,
+  isFederationStatusConnectFailure,
+} from "../../src/commands/federation.ts";
 import { proveAdminPassAgainstInstance } from "../../src/cli.ts";
 import {
   FederationPairLocalAccessError,
@@ -361,4 +365,73 @@ describe("flair#2764 — built CLI: flair rem nightly run-once lists the bounded
       expect(result.code, detail).toBe(1);
     }, 30_000);
   }
+});
+
+describe("flair#2764 — an ApiHttpError is never a connect failure", () => {
+  test("an HTTP error whose body says fetch failed is not a connect failure", async () => {
+    const err = await failWith("/upstream-fetch-failed", { status: 502, body: "upstream fetch failed" });
+    expect(err.message).toBe("HTTP 502: upstream fetch failed");
+    expect(isFederationStatusConnectFailure(err)).toBe(false);
+  });
+
+  test("HTTP 502, 503 and 504 errors are not connect failures", async () => {
+    for (const [status, body] of [[502, "Bad Gateway"], [503, "Service Unavailable"], [504, "Gateway Timeout"]] as const) {
+      const err = await failWith(`/gateway-${status}`, { status, body });
+      expect(err.status).toBe(status);
+      expect(isFederationStatusConnectFailure(err), `HTTP ${status}`).toBe(false);
+    }
+  });
+
+  test("a raw fetch failure is still a connect failure: TypeError fetch failed, and a refused connection", async () => {
+    expect(isFederationStatusConnectFailure(new TypeError("fetch failed"))).toBe(true);
+    const closed = await startListener(() => ({ status: 200, body: "" }));
+    const port = closed.port;
+    await closed.close();
+    let caught: unknown;
+    try {
+      await sendJsonRequest(new URL("/Health", `http://127.0.0.1:${port}`), "GET", undefined, "Basic fixture", true);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeDefined();
+    expect(caught).not.toBeInstanceOf(ApiHttpError);
+    expect(isFederationStatusConnectFailure(caught), String(caught)).toBe(true);
+  });
+
+  test("the built CLI does not retry an HTTP 502 on the configured alternate port, and keeps the HTTP error", async () => {
+    ensureCliBuild();
+    const recordedHome = mkdtempSync(join(tmpdir(), "flair-2764-altport-"));
+    const recorded = await startListener((line) => {
+      if (line === "GET /Health") return { status: 200, body: "[]" };
+      if (line === `GET /Memory?agentId=${AGENT_ID}`) return { status: 502, body: "upstream fetch failed" };
+      if (line === `GET /Soul?agentId=${AGENT_ID}`) return { status: 200, body: "[]" };
+      return { status: 404, body: `no route for ${line}` };
+    });
+    const alternate = await startListener(() => ({ status: 200, body: "[]" }));
+    try {
+      const flairDir = join(recordedHome, ".flair");
+      mkdirSync(join(flairDir, "data"), { recursive: true });
+      mkdirSync(join(flairDir, "keys"), { recursive: true });
+      const kp = nacl.sign.keyPair();
+      writeFileSync(join(flairDir, "keys", `${AGENT_ID}.key`), Buffer.from(kp.secretKey.slice(0, 32)), { mode: 0o600 });
+      // Harper's record names the listener that answers 502; ~/.flair/config.yaml names
+      // a different port, which api() tries only after a connect failure.
+      writeFileSync(join(flairDir, "data", "harper-config.yaml"), `http:\n  port: ${recorded.port}\n`);
+      writeFileSync(join(flairDir, "config.yaml"), `port: ${alternate.port}\n`);
+      const result = await runCli(["rem", "nightly", "run-once", "--agent", AGENT_ID, "--dry-run"], { HOME: recordedHome });
+      const detail = `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
+      expect(recorded.seen, detail).toEqual(["GET /Health", `GET /Memory?agentId=${AGENT_ID}`, `GET /Soul?agentId=${AGENT_ID}`]);
+      expect(alternate.seen, detail).toEqual([]);
+      const lines = result.stdout.split("\n");
+      const errorsAt = lines.indexOf("Errors:");
+      expect(errorsAt, detail).toBeGreaterThan(-1);
+      expect(lines[errorsAt + 1], detail).toBe("  - memory-count: HTTP 502: upstream fetch failed");
+      expect(result.stdout + result.stderr, detail).not.toContain("Cannot reach the Flair instance");
+      expect(result.code, detail).toBe(1);
+    } finally {
+      await recorded.close();
+      await alternate.close();
+      rmSync(recordedHome, { recursive: true, force: true });
+    }
+  }, 30_000);
 });

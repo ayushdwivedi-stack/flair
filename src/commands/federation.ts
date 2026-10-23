@@ -29,6 +29,7 @@ import {
   rewriteFederationPairLocalAccessError,
 } from "../lib/federation-pair-access.js";
 import {
+  ApiHttpError,
   apiErrorBody,
   defaultAdminPassPath,
   isLocalBase,
@@ -593,6 +594,9 @@ export function describeFederationStatusFetchFailed(url: string, setting: string
  *  `TypeError: fetch failed`, Bun's `Unable to connect…`, or a cause
  *  carrying a connect/DNS errno. Auth and HTTP errors stay out. */
 export function isFederationStatusConnectFailure(err: unknown): boolean {
+  // An ApiHttpError means an HTTP response arrived, so the connection did not
+  // fail, whatever its body says (flair#2764).
+  if (err instanceof ApiHttpError) return false;
   const msg = err instanceof Error ? err.message : String(err);
   if (/\bfetch failed\b/i.test(msg)) return true;
   if (/unable to connect/i.test(msg)) return true;
