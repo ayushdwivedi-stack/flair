@@ -16,7 +16,7 @@
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -191,6 +191,7 @@ describe("collectRangedDeps", () => {
       target: "some-pin",
       spec: "^1.2.3",
       declaredIn: "packages/foo/package.json",
+      at: 'dependencies["some-pin"]',
       workspaceDir: "packages/foo",
     }]);
   });
@@ -213,12 +214,24 @@ describe("collectRangedDeps", () => {
     ], keepCurrent)).toEqual([]);
   });
 
-  it("collects an override range and its enclosing package", () => {
+  it("collects an override range with its full key path and selectors", () => {
     expect(collectRangedDeps([
-      { pkg: { overrides: { "some-pin": "1.0.0 || 2.0.0", "parent-dep": { "nested-pin": "1 - 2" } } }, path: "package.json" },
+      { pkg: { overrides: { "some-pin": "1.0.0 || 2.0.0", "outer-dep@^1": { "parent-dep": { "nested-pin": "1 - 2" } } } }, path: "package.json" },
     ], keepCurrent)).toEqual([
-      { kind: "override", name: "some-pin", target: "some-pin", spec: "1.0.0 || 2.0.0", declaredIn: "package.json", workspaceDir: "", parent: null },
-      { kind: "override", name: "nested-pin", target: "nested-pin", spec: "1 - 2", declaredIn: "package.json", workspaceDir: "", parent: "parent-dep" },
+      {
+        kind: "override", name: "some-pin", target: "some-pin", spec: "1.0.0 || 2.0.0", declaredIn: "package.json",
+        at: 'overrides["some-pin"]', workspaceDir: "", path: [{ name: "some-pin", selector: "*" }],
+      },
+      {
+        // An object value without a "." key overrides its package with the key's selector.
+        kind: "override", name: "outer-dep", target: "outer-dep", spec: "^1", declaredIn: "package.json",
+        at: 'overrides["outer-dep@^1"]', workspaceDir: "", path: [{ name: "outer-dep", selector: "^1" }],
+      },
+      {
+        kind: "override", name: "nested-pin", target: "nested-pin", spec: "1 - 2", declaredIn: "package.json",
+        at: 'overrides["outer-dep@^1"]["parent-dep"]["nested-pin"]', workspaceDir: "",
+        path: [{ name: "outer-dep", selector: "^1" }, { name: "parent-dep", selector: "*" }, { name: "nested-pin", selector: "*" }],
+      },
     ]);
   });
 
@@ -238,15 +251,18 @@ describe("resolveRangedDeps", () => {
     packages: {
       "some-pin": ["some-pin@1.2.3", "", {}, "sha512-x"],
       "ws-a/some-pin": ["some-pin@2.0.0", "", {}, "sha512-x"],
+      "parent-dep": ["parent-dep@1.0.0", "", { dependencies: { "some-pin": "^3.0.0" } }, "sha512-x"],
       "parent-dep/some-pin": ["some-pin@3.0.0", "", {}, "sha512-x"],
       "@scope/pkg": ["@scope/pkg@4.0.0", "", {}, "sha512-x"],
+      "some-alias": ["other-pkg@1.0.0", "", {}, "sha512-x"],
+      "no-meta": ["no-meta@1.0.0"],
     },
   }));
 
   it("resolves a root dependency range through the hoisted entry", () => {
     const deps = collectRangedDeps([{ pkg: { dependencies: { "some-pin": "^1.0.0" } }, path: "package.json" }], new Set());
     expect(resolveRangedDeps(deps, lock).resolved).toEqual([
-      { name: "some-pin", version: "1.2.3", spec: "^1.0.0", declaredIn: "package.json", kind: "dependency" },
+      { name: "some-pin", version: "1.2.3", spec: "^1.0.0", declaredIn: "package.json", at: 'dependencies["some-pin"]', kind: "dependency" },
     ]);
   });
 
@@ -272,7 +288,48 @@ describe("resolveRangedDeps", () => {
       name: "absent-dep",
       spec: "^1.0.0",
       declaredIn: "package.json",
+      at: 'dependencies["absent-dep"]',
       reason: "bun.lock has no entry for absent-dep",
+    }]);
+  });
+
+  it("fails an entry that installs a different package than the declaration names", () => {
+    const deps = collectRangedDeps([{ pkg: { dependencies: { "some-alias": "npm:some-pin@^1.0.0" } }, path: "package.json" }], new Set());
+    const { resolved, unresolved } = resolveRangedDeps(deps, lock);
+    expect(resolved).toEqual([]);
+    expect(unresolved.map((u) => u.reason)).toEqual(["bun.lock's some-alias entry installs other-pkg@1.0.0, not some-pin"]);
+  });
+
+  it("fails a nested override whose enclosing key has a version selector, never guessing its scope", () => {
+    const deps = collectRangedDeps([{ pkg: { overrides: { "parent-dep@^1": { "some-pin": "^3.0.0" } } }, path: "package.json" }], new Set());
+    const { resolved, unresolved } = resolveRangedDeps(deps, lock);
+    expect(resolved).toEqual([]);
+    // The rule for parent-dep itself (its key's selector) and the nested rule.
+    expect(unresolved.map((u) => u.at)).toEqual(['overrides["parent-dep@^1"]', 'overrides["parent-dep@^1"]["some-pin"]']);
+    for (const u of unresolved) expect(u.reason).toContain('the key "parent-dep@^1" has a version selector');
+  });
+
+  it("fails a nested override when the lock does not record an enclosing copy's dependencies", () => {
+    const deps = collectRangedDeps([{ pkg: { overrides: { "no-meta": { "some-pin": "^1.0.0" } } }, path: "package.json" }], new Set());
+    const { resolved, unresolved, uninstalled } = resolveRangedDeps(deps, lock);
+    expect(resolved).toEqual([]);
+    expect(uninstalled).toEqual([]);
+    expect(unresolved.map((u) => u.reason)).toEqual([
+      "bun.lock does not record the dependencies of no-meta, so the copies below it cannot be decided",
+    ]);
+  });
+
+  it("reports a nested override whose enclosing package is not installed, and selects no copy", () => {
+    const deps = collectRangedDeps([{ pkg: { overrides: { "absent-parent": { "some-pin": "^1.0.0" } } }, path: "package.json" }], new Set());
+    const { resolved, unresolved, uninstalled } = resolveRangedDeps(deps, lock);
+    expect(resolved).toEqual([]);
+    expect(unresolved).toEqual([]);
+    expect(uninstalled).toEqual([{
+      kind: "override",
+      name: "some-pin",
+      spec: "^1.0.0",
+      declaredIn: "package.json",
+      at: 'overrides["absent-parent"]["some-pin"]',
     }]);
   });
 
@@ -311,6 +368,11 @@ const FIXTURE_DEP = "fixture-dep";
 const FIXTURE_VERSION = "1.0.0";
 /** A positive policy: a dep published "now" is too fresh under it. */
 const MIN_AGE_DAYS = "7";
+/** A publish time one day before the test clock: inside the policy window on any run date. */
+const FRESH_TIME = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+/** The publish date the gate prints for FRESH_TIME. */
+const FRESH_DATE = FRESH_TIME.slice(0, 10);
+const OLD_TIME = "2020-01-01T00:00:00.000Z";
 
 /** A broken test setup fails as itself, never as the CLI exit a case expects. */
 function setupFailure(what: string): never {
@@ -365,11 +427,13 @@ function writeLock(root: string, lock: Record<string, unknown>): void {
   if (!existsSync(join(root, "bun.lock"))) setupFailure(`fixture bun.lock not written under ${root}`);
 }
 
-/** A lockfile whose `packages` map is one entry per `{ key: version }`. */
+/** A lockfile whose `packages` map is one entry per `{ key: version }`, each resolving the key's own package. */
 function lockWithPackages(versions: Record<string, string>, workspaces?: Record<string, unknown>) {
   const packages: Record<string, unknown> = {};
   for (const [key, version] of Object.entries(versions)) {
-    packages[key] = [`${key}@${version}`, "", {}, "sha512-fixture"];
+    const parts = key.split("/");
+    const name = parts.length > 1 && parts[parts.length - 2].startsWith("@") ? parts.slice(-2).join("/") : parts[parts.length - 1];
+    packages[key] = [`${name}@${version}`, "", {}, "sha512-fixture"];
   }
   return workspaces === undefined ? { packages } : { workspaces, packages };
 }
@@ -447,6 +511,217 @@ function registryWithTimes(times: Record<string, string>) {
   if (!server.port) setupFailure("fixture registry did not bind a port");
   return { url: `http://127.0.0.1:${server.port}`, requests, stop: () => server.stop(true) };
 }
+
+/** A well-formed integrity value for packuments; `--lockfile-only` downloads no tarball to compare it with. */
+const PACKUMENT_INTEGRITY = `sha512-${new Bun.CryptoHasher("sha512").update("dep-ages fixture").digest("base64")}`;
+
+/**
+ * Generate a REAL bun.lock in `root`: `bun install --lockfile-only` for
+ * `manifest`, against a registry served from this process whose packuments
+ * carry each version's dependencies (`packages[name][version]`). Returns the
+ * parsed lockfile. No tarball is fetched and nothing reaches the network.
+ */
+async function bunGeneratedLock(
+  root: string,
+  manifest: Record<string, unknown>,
+  packages: Record<string, Record<string, Record<string, string>>>,
+) {
+  mkdirSync(join(root, "packages"), { recursive: true });
+  mkdirSync(join(root, ".bun-home"), { recursive: true });
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(req): Response {
+      const url = new URL(req.url);
+      const name = decodeURIComponent(url.pathname.slice(1));
+      const versions = packages[name];
+      if (!versions) return new Response("{}", { status: 404 });
+      const base = url.origin;
+      const entries: Array<[string, unknown]> = Object.entries(versions).map(([version, dependencies]) => [version, {
+        name,
+        version,
+        dependencies,
+        dist: { tarball: `${base}/${name}/-/${name.split("/").pop()}-${version}.tgz`, integrity: PACKUMENT_INTEGRITY },
+      }]);
+      return Response.json({ name, "dist-tags": { latest: entries[entries.length - 1][0] }, versions: Object.fromEntries(entries) });
+    },
+  });
+  if (!server.port) setupFailure("fixture npm registry did not bind a port");
+  try {
+    writeFileSync(join(root, "package.json"), JSON.stringify(manifest));
+    writeFileSync(join(root, "bunfig.toml"), `[install]\nregistry = "http://127.0.0.1:${server.port}/"\n`);
+    const proc = Bun.spawn([process.execPath, "install", "--lockfile-only", "--ignore-scripts"], {
+      cwd: root,
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: join(root, ".bun-home"),
+        BUN_INSTALL_CACHE_DIR: join(root, ".bun-home", "cache"),
+        TMPDIR: tmpdir(),
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: 30_000,
+      killSignal: "SIGKILL",
+    });
+    const exitCode = await proc.exited;
+    const output = (await new Response(proc.stdout).text()) + (await new Response(proc.stderr).text());
+    if (exitCode !== 0) setupFailure(`bun install --lockfile-only exited ${exitCode}: ${output}`);
+    return parseBunLockText(readFileSync(join(root, "bun.lock"), "utf8"));
+  } finally {
+    server.stop(true);
+  }
+}
+
+/** The `name@version` a real lock's entry resolves, keyed by lock key. */
+function lockResolutions(lock: { packages?: Record<string, unknown> }) {
+  return Object.fromEntries(Object.entries(lock.packages ?? {}).map(([key, entry]) => [key, (entry as string[])[0]]));
+}
+
+/*
+ * Real bun.lock fixtures (bun install against the in-process registry above).
+ *
+ * Aliases: bun installs `"some-alias": "npm:fixture-dep@~1.0.0"` under the
+ * alias key, its entry resolving `fixture-dep@1.0.5`, while the directly
+ * declared fixture-dep resolves 1.2.0 under its own key.
+ */
+const ALIAS_PACKAGES = {
+  [FIXTURE_DEP]: { "1.0.0": {}, "1.0.5": {}, "1.2.0": {} },
+  "wrapper-dep": { "1.0.0": { "wrapped-dep": "^1.0.0" } },
+  "wrapped-dep": { "1.0.0": {} },
+};
+const ALIAS_MANIFEST = {
+  name: "dep-ages-alias-lock-fixture",
+  version: "0.0.0",
+  dependencies: { "some-alias": `npm:${FIXTURE_DEP}@~1.0.0`, [FIXTURE_DEP]: "^1.2.0", "wrapper-dep": "1.0.0" },
+  overrides: { "wrapped-dep": `npm:${FIXTURE_DEP}@~1.0.0` },
+};
+
+/*
+ * Nested overrides: outer-dep -> inner-dep@1 -> child-dep ~1.1.0 and
+ * other-dep -> inner-dep@2 -> child-dep ~1.2.0, with child-dep@2.0.0 at the
+ * root. Bun writes three child-dep copies (bun 1.3 warns that it does not
+ * apply nested overrides, so these are its own resolutions).
+ */
+const NESTED_PACKAGES = {
+  "child-dep": { "1.1.0": {}, "1.1.5": {}, "1.2.0": {}, "1.2.5": {}, "2.0.0": {} },
+  "inner-dep": { "1.0.0": { "child-dep": "~1.1.0" }, "2.0.0": { "child-dep": "~1.2.0" } },
+  "outer-dep": { "1.0.0": { "inner-dep": "^1.0.0" } },
+  "other-dep": { "1.0.0": { "inner-dep": "^2.0.0" } },
+};
+const NESTED_MANIFEST = {
+  name: "dep-ages-nested-lock-fixture",
+  version: "0.0.0",
+  dependencies: { "outer-dep": "1.0.0", "other-dep": "1.0.0", "child-dep": "2.0.0" },
+  overrides: {
+    "outer-dep": { "inner-dep": { "child-dep": "~1.1.0" } },
+    "other-dep": { "inner-dep": { "child-dep": "~1.2.0" } },
+    "absent-dep": { "inner-dep": { "child-dep": "~1.1.0" } },
+  },
+};
+
+describe("resolveRangedDeps against a real bun.lock", () => {
+  it("resolves an npm: alias by its alias key, not by a separately installed target", async () => {
+    const lock = await bunGeneratedLock(join(scratch, "real-lock-alias-unit"), ALIAS_MANIFEST, ALIAS_PACKAGES);
+    expect(lockResolutions(lock)).toMatchObject({
+      "some-alias": `${FIXTURE_DEP}@1.0.5`,
+      [FIXTURE_DEP]: `${FIXTURE_DEP}@1.2.0`,
+      "wrapped-dep": `${FIXTURE_DEP}@1.0.5`,
+    });
+    const { resolved, unresolved, uninstalled } = resolveRangedDeps(
+      collectRangedDeps([{ pkg: ALIAS_MANIFEST, path: "package.json" }], new Set()),
+      lock,
+    );
+    expect(unresolved).toEqual([]);
+    expect(uninstalled).toEqual([]);
+    expect(resolved.map((r) => `${r.at} ${r.name}@${r.version}`).sort()).toEqual([
+      `dependencies["${FIXTURE_DEP}"] ${FIXTURE_DEP}@1.2.0`,
+      `dependencies["some-alias"] ${FIXTURE_DEP}@1.0.5`,
+      `overrides["wrapped-dep"] ${FIXTURE_DEP}@1.0.5`,
+    ]);
+  }, 60_000);
+
+  it("limits each nested override to the copies below its own enclosing path", async () => {
+    const lock = await bunGeneratedLock(join(scratch, "real-lock-nested-unit"), NESTED_MANIFEST, NESTED_PACKAGES);
+    const childCopies = Object.values(lockResolutions(lock)).filter((r) => r.startsWith("child-dep@")).sort();
+    expect(childCopies).toEqual(["child-dep@1.1.5", "child-dep@1.2.5", "child-dep@2.0.0"]);
+    const { resolved, unresolved, uninstalled } = resolveRangedDeps(
+      collectRangedDeps([{ pkg: NESTED_MANIFEST, path: "package.json" }], new Set()),
+      lock,
+    );
+    expect(unresolved).toEqual([]);
+    expect(resolved.map((r) => `${r.at} ${r.name}@${r.version}`).sort()).toEqual([
+      'overrides["other-dep"]["inner-dep"]["child-dep"] child-dep@1.2.5',
+      'overrides["outer-dep"]["inner-dep"]["child-dep"] child-dep@1.1.5',
+    ]);
+    expect(uninstalled.map((u) => u.at)).toEqual(['overrides["absent-dep"]["inner-dep"]["child-dep"]']);
+  }, 60_000);
+});
+
+describe("CLI — a real bun.lock: aliases, nested overrides and declaration lines", () => {
+  it("age-checks a ranged npm: alias at the version installed under the alias", async () => {
+    const root = join(scratch, "real-lock-alias-cli");
+    await bunGeneratedLock(root, ALIAS_MANIFEST, ALIAS_PACKAGES);
+    const registry = registryWithTimes({ "1.0.0": OLD_TIME, "1.0.5": FRESH_TIME, "1.2.0": OLD_TIME });
+    try {
+      const { exitCode, output } = await runGate(CLI_SCRIPT, {
+        FLAIR_CHECK_DEP_AGES_ROOT: root,
+        FLAIR_NPM_REGISTRY: registry.url,
+      });
+      expect(output).toContain(`${FIXTURE_DEP}@1.0.5    — published ${FRESH_DATE}`);
+      expect(output).toContain(`declared in package.json dependencies["some-alias"] (range "npm:${FIXTURE_DEP}@~1.0.0")`);
+      expect(output).toContain(`declared in package.json overrides["wrapped-dep"] (range "npm:${FIXTURE_DEP}@~1.0.0")`);
+      expect(output).not.toContain("no installed copy");
+      expect(output).not.toContain(`${FIXTURE_DEP}@1.2.0    —`);
+      expect(exitCode).toBe(1);
+    } finally {
+      registry.stop();
+    }
+  }, 60_000);
+
+  it("checks a nested override only at the copies below its own enclosing path", async () => {
+    const root = join(scratch, "real-lock-nested-cli");
+    await bunGeneratedLock(root, NESTED_MANIFEST, NESTED_PACKAGES);
+    const registry = registryWithTimes({ "1.0.0": OLD_TIME, "1.1.5": OLD_TIME, "1.2.5": FRESH_TIME, "2.0.0": OLD_TIME });
+    try {
+      const { exitCode, output } = await runGate(CLI_SCRIPT, {
+        FLAIR_CHECK_DEP_AGES_ROOT: root,
+        FLAIR_NPM_REGISTRY: registry.url,
+      });
+      expect(output).toContain(`child-dep@1.2.5    — published ${FRESH_DATE}`);
+      expect(output).toContain(`declared in package.json overrides["other-dep"]["inner-dep"]["child-dep"] (range "~1.2.0")`);
+      expect(output).not.toContain(`declared in package.json overrides["outer-dep"]["inner-dep"]["child-dep"]`);
+      expect(output).toContain("Override ranges with no installed copy in their scope");
+      expect(output).toContain(`package.json overrides["absent-dep"]["inner-dep"]["child-dep"] "~1.1.0"`);
+      expect(exitCode).toBe(1);
+    } finally {
+      registry.stop();
+    }
+  }, 60_000);
+
+  it("prints each declaration of one version: a dependencies range and an overrides range in one manifest", async () => {
+    const root = join(scratch, "real-lock-two-declarations");
+    const lock = await bunGeneratedLock(root, {
+      name: "dep-ages-two-declarations-fixture",
+      version: "0.0.0",
+      dependencies: { [FIXTURE_DEP]: "^1.0.0" },
+      overrides: { [FIXTURE_DEP]: "~1.0.0" },
+    }, ALIAS_PACKAGES);
+    expect(lockResolutions(lock)).toMatchObject({ [FIXTURE_DEP]: `${FIXTURE_DEP}@1.0.5` });
+    const registry = registryWithTimes({ "1.0.5": FRESH_TIME });
+    try {
+      const { exitCode, output } = await runGate(CLI_SCRIPT, {
+        FLAIR_CHECK_DEP_AGES_ROOT: root,
+        FLAIR_NPM_REGISTRY: registry.url,
+      });
+      expect(output).toContain(`${FIXTURE_DEP}@1.0.5    — published ${FRESH_DATE}`);
+      expect(output).toContain(`declared in package.json dependencies["${FIXTURE_DEP}"] (range "^1.0.0")`);
+      expect(output).toContain(`declared in package.json overrides["${FIXTURE_DEP}"] (range "~1.0.0")`);
+      expect(exitCode).toBe(1);
+    } finally {
+      registry.stop();
+    }
+  }, 60_000);
+});
 
 describe("CLI fail-closed exit — dead registry", () => {
   it("exits 2 when FLAIR_NPM_REGISTRY is unreachable", async () => {
@@ -588,8 +863,8 @@ describe("CLI — a pin through overrides and the dated exemption", () => {
       // Nothing is age-checked, so the dead registry is never queried.
       FLAIR_NPM_REGISTRY: "http://127.0.0.1:1",
     });
-    expect(output).toContain("Override ranges with no installed copy");
-    expect(output).toContain(`${FIXTURE_DEP} "^1.0.0"`);
+    expect(output).toContain("Override ranges with no installed copy in their scope");
+    expect(output).toContain(`package.json overrides["${FIXTURE_DEP}"] "^1.0.0"`);
     expect(output).toContain("No external pinned production deps to check.");
     expect(exitCode).toBe(0);
   }, 30_000);
@@ -607,8 +882,8 @@ describe("CLI — a pin through overrides and the dated exemption", () => {
         FLAIR_CHECK_DEP_AGES_ROOT: root,
         FLAIR_NPM_REGISTRY: registry.url,
       });
-      expect(output).toContain("Ranged declarations bun.lock does not resolve");
-      expect(output).toContain(`${FIXTURE_DEP} "^1.0.0": bun.lock has no entry for ${FIXTURE_DEP}`);
+      expect(output).toContain("Ranged declarations the gate cannot resolve through bun.lock");
+      expect(output).toContain(`package.json dependencies["${FIXTURE_DEP}"] "^1.0.0": bun.lock has no entry for ${FIXTURE_DEP}`);
       expect(registry.requests).toEqual([]);
       expect(exitCode).toBe(2);
     } finally {
@@ -647,7 +922,7 @@ describe("CLI — a dependency range is age-checked at its lockfile resolution",
       dependencies: { [FIXTURE_DEP]: "^1.0.0" },
     });
     writeLock(root, lockWithPackages({ [FIXTURE_DEP]: "1.2.3" }));
-    const registry = registryWithTimes({ "1.2.3": "2026-10-20T00:00:00.000Z" });
+    const registry = registryWithTimes({ "1.2.3": FRESH_TIME });
     try {
       const { exitCode, output } = await runGate(CLI_SCRIPT, {
         FLAIR_CHECK_DEP_AGES_ROOT: root,
@@ -655,8 +930,8 @@ describe("CLI — a dependency range is age-checked at its lockfile resolution",
       });
       expect(output).toContain("Pinned production deps younger than the bake-time policy");
       expect(output).toContain(`${FIXTURE_DEP}@1.2.3`);
-      expect(output).toContain("published 2026-10-20");
-      expect(output).toContain(`declared in package.json (range "^1.0.0")`);
+      expect(output).toContain(`published ${FRESH_DATE}`);
+      expect(output).toContain(`declared in package.json dependencies["${FIXTURE_DEP}"] (range "^1.0.0")`);
       expect(exitCode).toBe(1);
     } finally {
       registry.stop();
@@ -670,7 +945,7 @@ describe("CLI — a dependency range is age-checked at its lockfile resolution",
       dependencies: { [FIXTURE_DEP]: "^1.0.0" },
     });
     writeLock(root, lockWithPackages({ [FIXTURE_DEP]: "1.2.3" }));
-    const registry = registryWithTimes({ "1.2.3": "2020-01-01T00:00:00.000Z" });
+    const registry = registryWithTimes({ "1.2.3": OLD_TIME });
     try {
       const { exitCode, output } = await runGate(CLI_SCRIPT, {
         FLAIR_CHECK_DEP_AGES_ROOT: root,
@@ -690,7 +965,7 @@ describe("CLI — a dependency range is age-checked at its lockfile resolution",
       dependencies: { [FIXTURE_DEP]: "^1.0.0" },
     });
     writeLock(root, lockWithPackages({ [FIXTURE_DEP]: "1.2.3" }));
-    const registry = registryWithTimes({ "1.2.3": "2026-10-20T00:00:00.000Z" });
+    const registry = registryWithTimes({ "1.2.3": FRESH_TIME });
     try {
       const { exitCode, output } = await runGate(CLI_SCRIPT, {
         FLAIR_CHECK_DEP_AGES_ROOT: root,
@@ -712,7 +987,7 @@ describe("CLI — a dependency range is age-checked at its lockfile resolution",
       devDependencies: { [FIXTURE_DEP]: "~1.0.0" },
     });
     writeLock(root, lockWithPackages({ [FIXTURE_DEP]: "1.0.9" }));
-    const registry = registryWithTimes({ "1.0.9": "2026-10-20T00:00:00.000Z" });
+    const registry = registryWithTimes({ "1.0.9": FRESH_TIME });
     try {
       const { exitCode, output } = await runGate(CLI_SCRIPT, {
         FLAIR_CHECK_DEP_AGES_ROOT: root,
@@ -732,8 +1007,8 @@ describe("CLI — a dependency range is age-checked at its lockfile resolution",
       [`parent-dep/${FIXTURE_DEP}`]: "1.2.3",
     }));
     const registry = registryWithTimes({
-      "1.0.0": "2020-01-01T00:00:00.000Z",
-      "1.2.3": "2026-10-20T00:00:00.000Z",
+      "1.0.0": OLD_TIME,
+      "1.2.3": FRESH_TIME,
     });
     try {
       const { exitCode, output } = await runGate(CLI_SCRIPT, {
@@ -757,8 +1032,8 @@ describe("CLI — a dependency range is age-checked at its lockfile resolution",
     });
     writeLock(root, lockWithPackages({ [FIXTURE_DEP]: "9.9.9" }));
     const registry = registryWithTimes({
-      "1.0.0": "2026-10-20T00:00:00.000Z",
-      "9.9.9": "2020-01-01T00:00:00.000Z",
+      "1.0.0": FRESH_TIME,
+      "9.9.9": OLD_TIME,
     });
     try {
       const { exitCode, output } = await runGate(CLI_SCRIPT, {
@@ -819,27 +1094,6 @@ describe("CLI — a refused dependency form fails the gate before any fetch", ()
       });
       expect(registry.requests).toEqual([`/${FIXTURE_DEP}`]);
       expect(output).toContain(`${FIXTURE_DEP}@${FIXTURE_VERSION}`);
-      expect(exitCode).toBe(1);
-    } finally {
-      registry.stop();
-    }
-  }, 30_000);
-
-  it("checks an npm: alias range at its target's resolved version", async () => {
-    const root = writeManifestRepo(join(scratch, "dep-alias-range"), {
-      name: "dep-ages-alias-fixture",
-      version: "0.0.0",
-      dependencies: { "some-alias": `npm:${FIXTURE_DEP}@^1.0.0` },
-    });
-    writeLock(root, lockWithPackages({ [FIXTURE_DEP]: FIXTURE_VERSION }));
-    const registry = freshRegistry();
-    try {
-      const { exitCode, output } = await runGate(CLI_SCRIPT, {
-        FLAIR_CHECK_DEP_AGES_ROOT: root,
-        FLAIR_NPM_REGISTRY: registry.url,
-      });
-      expect(registry.requests).toEqual([`/${FIXTURE_DEP}`]);
-      expect(output).toContain(`(range "npm:${FIXTURE_DEP}@^1.0.0")`);
       expect(exitCode).toBe(1);
     } finally {
       registry.stop();

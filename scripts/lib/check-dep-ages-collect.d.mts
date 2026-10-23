@@ -13,16 +13,18 @@ export interface DepEntry {
 
 export interface RangedDep {
   kind: "dependency" | "override";
-  /** The declared key (an `npm:` alias differs from `target`). */
+  /** The declared key, which the package is installed under (an `npm:` alias differs from `target`). */
   name: string;
   /** The registry package the declaration installs. */
   target: string;
   spec: string;
   declaredIn: string;
+  /** Where the declaration sits, e.g. `dependencies["x"]` or `overrides["a"]["b"]`. */
+  at: string;
   /** The manifest's directory; "" for the repo root. */
   workspaceDir: string;
-  /** For a nested override, the enclosing package's name. */
-  parent?: string | null;
+  /** For an override, its full key path from the top of `overrides`. */
+  path?: Array<{ name: string; selector: string }>;
   /** For a dependency range, the field it was declared in. */
   field?: "dependencies" | "devDependencies" | "optionalDependencies";
 }
@@ -32,6 +34,7 @@ export interface ResolvedRange {
   version: string;
   spec: string;
   declaredIn: string;
+  at: string;
   kind: "dependency" | "override";
 }
 
@@ -40,7 +43,28 @@ export interface UnresolvedRange {
   name: string;
   spec: string;
   declaredIn: string;
+  at: string;
   reason: string;
+}
+
+export interface UninstalledOverride {
+  kind: "override";
+  name: string;
+  spec: string;
+  declaredIn: string;
+  at: string;
+}
+
+export interface LockCopy {
+  key: string;
+  /** The name the copy is installed under (the last key segment). */
+  name: string;
+  segments: string[];
+  /** The registry package the entry resolves (an `npm:` alias differs from `name`). */
+  registryName: string;
+  version: string;
+  /** The dependency names the entry declares; null when the lock does not record them. */
+  dependencies: string[] | null;
 }
 
 export interface BunLock {
@@ -95,9 +119,9 @@ export function collectDeps(
 ): Map<string, DepEntry>;
 
 /**
- * Every ranged declaration the bake-time gate age-checks at its lockfile
- * resolution: `dependencies`, `devDependencies`, `optionalDependencies` and
- * `overrides` (nested rules included), from every given manifest.
+ * Every ranged declaration the bake-time gate resolves through bun.lock:
+ * ranges in `dependencies`, `devDependencies` and `optionalDependencies`, and
+ * ranged `overrides` rules (nested rules included), from every given manifest.
  *
  * Exemptions: `@tpsdev-ai/*` and the keep-current list.
  */
@@ -109,20 +133,21 @@ export function collectRangedDeps(
 /** Parse bun.lock (JSON with trailing commas); an unparsable lock throws. */
 export function parseBunLockText(text: string): BunLock;
 
-/** Index a parsed lockfile's `packages` by key and by package name. */
+/** Index a parsed lockfile's `packages` by key and by installed name. */
 export function lockCopies(lock: BunLock): {
-  byKey: Map<string, { key: string; name: string; prefix: string; version: string }>;
-  byName: Map<string, Array<{ key: string; name: string; prefix: string; version: string }>>;
+  byKey: Map<string, LockCopy>;
+  byName: Map<string, LockCopy[]>;
 };
 
 /**
  * Resolve every ranged declaration to the lockfile entries it installs. A
- * declaration with none is returned in `unresolved`.
+ * declaration the gate cannot resolve is returned in `unresolved`; an
+ * overrides range with no installed copy in its scope in `uninstalled`.
  */
 export function resolveRangedDeps(
   entries: RangedDep[],
   lock: BunLock,
-): { resolved: ResolvedRange[]; unresolved: UnresolvedRange[] };
+): { resolved: ResolvedRange[]; unresolved: UnresolvedRange[]; uninstalled: UninstalledOverride[] };
 
 export interface UnsupportedDep {
   declaredIn: string;
