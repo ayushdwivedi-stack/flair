@@ -166,7 +166,7 @@ function readAllowlist(root) {
 
 // ── Main gate logic (always runs — no main-detection guard) ──────────────────
 
-/** One line per declaration of a checked version: exact pins, then each range with where it sits. */
+/** The declarations of a checked version: one line per manifest with an exact pin, then one line per ranged declaration with where it sits. */
 function declarationLines(entry) {
   return [
     ...entry.declaredIn.map((p) => `    declared in ${p}`),
@@ -275,9 +275,16 @@ async function main() {
       process.exit(2);
     }
     const { resolved, unresolved, uninstalled } = resolveRangedDeps(ranged, parseBunLockText(lockText));
-    // A range the gate cannot resolve has no version it can check: fail
-    // closed. An overrides rule with no installed copy in its scope has no
-    // version to check; name it in the output.
+    // An overrides rule with no installed copy in its scope has no version to
+    // check; name it in the output, before any fail-closed exit below. A range
+    // the gate cannot resolve has no version it can check: fail closed.
+    if (uninstalled.length > 0) {
+      console.log("Override ranges with no installed copy in their scope (nothing to age-check):");
+      for (const u of uninstalled) {
+        console.log(`    ${u.declaredIn} ${u.at} "${u.spec}"`);
+      }
+      console.log("");
+    }
     if (unresolved.length > 0) {
       console.error("Ranged declarations the gate cannot resolve through bun.lock:");
       console.error("");
@@ -289,13 +296,6 @@ async function main() {
       console.error("resolved, so the gate fails closed. (An override range with no installed copy");
       console.error("in its scope is not a failure: it is listed, with nothing to check.)");
       process.exit(2);
-    }
-    if (uninstalled.length > 0) {
-      console.log("Override ranges with no installed copy in their scope (nothing to age-check):");
-      for (const u of uninstalled) {
-        console.log(`    ${u.declaredIn} ${u.at} "${u.spec}"`);
-      }
-      console.log("");
     }
     for (const r of resolved) {
       const key = `${r.name}@${r.version}`;
@@ -447,7 +447,8 @@ async function main() {
   }
 
   if (exempted.length > 0) {
-    console.log("Exempted fresh pins (dated exemption, see docs/supply-chain-policy.md):");    console.log("");
+    console.log("Exempted fresh dependency versions (dated exemption, see docs/supply-chain-policy.md):");
+    console.log("");
     for (const f of exempted.sort((a, b) => b.publishedAt - a.publishedAt)) {
       const days = f.ageDays.toFixed(1);
       console.log(

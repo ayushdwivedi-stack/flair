@@ -814,7 +814,7 @@ describe("CLI — a pin through overrides and the dated exemption", () => {
         FLAIR_CHECK_DEP_AGES_ROOT: root,
         FLAIR_NPM_REGISTRY: registry.url,
       });
-      expect(output).toContain("Exempted fresh pins");
+      expect(output).toContain("Exempted fresh dependency versions");
       expect(output).toContain("exempt until 2099-01-01");
       expect(output).not.toContain("Pinned production deps younger than the bake-time policy");
       expect(exitCode).toBe(0);
@@ -890,6 +890,31 @@ describe("CLI — a pin through overrides and the dated exemption", () => {
         FLAIR_CHECK_DEP_AGES_ROOT: root,
         FLAIR_NPM_REGISTRY: registry.url,
       });
+      expect(output).toContain("Ranged declarations the gate cannot resolve through bun.lock");
+      expect(output).toContain(`package.json dependencies["${FIXTURE_DEP}"] "^1.0.0": bun.lock has no entry for ${FIXTURE_DEP}`);
+      expect(registry.requests).toEqual([]);
+      expect(exitCode).toBe(2);
+    } finally {
+      registry.stop();
+    }
+  }, 30_000);
+
+  it("lists an uninstalled override range and fails closed on an unresolved dependency range in the same run", async () => {
+    const root = writeManifestRepo(join(scratch, "unresolved-and-uninstalled"), {
+      name: "dep-ages-range-fixture",
+      version: "0.0.0",
+      dependencies: { [FIXTURE_DEP]: "^1.0.0" },
+      overrides: { "absent-dep": "^2.0.0" },
+    });
+    writeLock(root, lockWithPackages({ "other-dep": "1.0.0" }));
+    const registry = freshRegistry();
+    try {
+      const { exitCode, output } = await runGate(CLI_SCRIPT, {
+        FLAIR_CHECK_DEP_AGES_ROOT: root,
+        FLAIR_NPM_REGISTRY: registry.url,
+      });
+      expect(output).toContain("Override ranges with no installed copy in their scope");
+      expect(output).toContain('package.json overrides["absent-dep"] "^2.0.0"');
       expect(output).toContain("Ranged declarations the gate cannot resolve through bun.lock");
       expect(output).toContain(`package.json dependencies["${FIXTURE_DEP}"] "^1.0.0": bun.lock has no entry for ${FIXTURE_DEP}`);
       expect(registry.requests).toEqual([]);
@@ -1293,7 +1318,7 @@ describe("CLI — malformed exemption metadata", () => {
       });
       expect(output).toContain("dep-age-allowlist.json entries[0]");
       expect(output).toContain(diagnostic);
-      expect(output).not.toContain("Exempted fresh pins");
+      expect(output).not.toContain("Exempted fresh dependency versions");
       expect(output).not.toContain("REGISTRY_FETCH");
       expect(exitCode).toBe(2);
     }, 30_000);
@@ -1315,7 +1340,7 @@ describe("CLI — a malformed exemption date fails the gate", () => {
       });
       expect(output).toContain("dep-age-allowlist.json entries[0]");
       expect(output).toContain(diagnostic);
-      expect(output).not.toContain("Exempted fresh pins");
+      expect(output).not.toContain("Exempted fresh dependency versions");
       expect(registry.requests).toEqual([]);
       expect(exitCode).toBe(2);
     } finally {
