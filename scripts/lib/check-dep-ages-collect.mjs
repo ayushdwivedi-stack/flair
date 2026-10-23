@@ -38,11 +38,15 @@
  * consumer's install, so an exact-pin check of our declaration does not
  * describe what actually gets installed.
  *
- * Trust boundary: the gate reads bun.lock as written and assumes a lock that
- * `bun install --frozen-lockfile` accepts; the same CI job runs that install,
- * which refuses a lock that does not match its manifests (measured with bun
- * 1.3.10: a `workspaces` array, a workspace entry with no `name`, a missing
- * workspace entry and a wrong workspace `name` each exit 1).
+ * Trust boundary: the gate reads bun.lock as written and age-checks the
+ * versions it records. The same CI job then runs `bun install
+ * --frozen-lockfile`, which with bun 1.3.10 refused a `workspaces` array, a
+ * workspace entry with no `name`, a missing workspace entry and a wrong
+ * workspace `name` (exit 1), and, for a lock recording a workspace's range at
+ * a version outside that range, installed the recorded version, the one the
+ * gate checks; it does not check a recorded version against its declared
+ * range, nor a recorded peer (flair#1936). The test suite "bun install
+ * --frozen-lockfile on the locks the gate reads" measures these cases.
  */
 
 /** Specifiers that name no registry version, so there is no publish date to check. */

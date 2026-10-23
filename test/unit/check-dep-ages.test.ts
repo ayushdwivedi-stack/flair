@@ -887,6 +887,182 @@ describe("CLI — a real bun.lock: aliases, nested overrides and declaration lin
   }, 60_000);
 });
 
+/** A gzipped tar holding `files` under `package/`, the shape an npm tarball has. */
+function npmTarball(files: Record<string, string>): Uint8Array {
+  const encoder = new TextEncoder();
+  const blocks: Uint8Array[] = [];
+  for (const [path, content] of Object.entries(files)) {
+    const data = encoder.encode(content);
+    const header = new Uint8Array(512);
+    const put = (text: string, offset: number) => header.set(encoder.encode(text), offset);
+    put(`package/${path}`, 0);
+    put("0000644\0", 100);
+    put("0000000\0", 108);
+    put("0000000\0", 116);
+    put(`${data.length.toString(8).padStart(11, "0")}\0`, 124);
+    put("00000000000\0", 136);
+    put("        ", 148);
+    put("0", 156);
+    put("ustar\0", 257);
+    put("00", 263);
+    const checksum = header.reduce((sum, byte) => sum + byte, 0);
+    put(`${checksum.toString(8).padStart(6, "0")}\0 `, 148);
+    blocks.push(header, data, new Uint8Array((512 - (data.length % 512)) % 512));
+  }
+  blocks.push(new Uint8Array(1024));
+  const tar = new Uint8Array(blocks.reduce((size, block) => size + block.length, 0));
+  let offset = 0;
+  for (const block of blocks) {
+    tar.set(block, offset);
+    offset += block.length;
+  }
+  return Bun.gzipSync(tar);
+}
+
+/**
+ * The real workspace fixture (root `fixture-dep ^1.0.0`, workspace ws-a
+ * `^2.0.0`) against a registry served from this process that also serves real
+ * tarballs, so `bun install --frozen-lockfile` can run in full. `run` gets the
+ * fixture root and a `bun` runner; the registry lives until it returns.
+ */
+async function withInstallableWorkspace(
+  label: string,
+  run: (root: string, bun: (args: string[]) => Promise<{ exitCode: number; output: string }>) => Promise<void>,
+) {
+  const root = join(scratch, `frozen-install-${label}`);
+  mkdirSync(join(root, "packages", "ws-a"), { recursive: true });
+  mkdirSync(join(root, ".bun-home"), { recursive: true });
+  const tarballs = new Map<string, Uint8Array>();
+  for (const version of ["1.0.0", "1.0.5", "2.0.0", "2.0.5"]) {
+    tarballs.set(version, npmTarball({ "package.json": JSON.stringify({ name: FIXTURE_DEP, version }) }));
+  }
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(req): Response {
+      const url = new URL(req.url);
+      const path = decodeURIComponent(url.pathname.slice(1));
+      const tarball = path.match(/^fixture-dep\/-\/fixture-dep-(\d+\.\d+\.\d+)\.tgz$/);
+      if (tarball) {
+        const data = tarballs.get(tarball[1]);
+        return data ? new Response(new Uint8Array(data)) : new Response("not found", { status: 404 });
+      }
+      if (path !== FIXTURE_DEP) return new Response("{}", { status: 404 });
+      const versions: Record<string, unknown> = {};
+      for (const [version, data] of tarballs) {
+        versions[version] = {
+          name: FIXTURE_DEP,
+          version,
+          dist: {
+            tarball: `${url.origin}/${FIXTURE_DEP}/-/${FIXTURE_DEP}-${version}.tgz`,
+            integrity: `sha512-${new Bun.CryptoHasher("sha512").update(data).digest("base64")}`,
+          },
+        };
+      }
+      return Response.json({ name: FIXTURE_DEP, "dist-tags": { latest: "2.0.5" }, versions });
+    },
+  });
+  if (!server.port) setupFailure("fixture npm registry did not bind a port");
+  const bun = async (args: string[]) => {
+    const proc = Bun.spawn([process.execPath, ...args], {
+      cwd: root,
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: join(root, ".bun-home"),
+        BUN_INSTALL_CACHE_DIR: join(root, ".bun-home", "cache"),
+        TMPDIR: tmpdir(),
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: 30_000,
+      killSignal: "SIGKILL",
+    });
+    const exitCode = await proc.exited;
+    const output = (await new Response(proc.stdout).text()) + (await new Response(proc.stderr).text());
+    return { exitCode, output };
+  };
+  try {
+    writeFileSync(join(root, "package.json"), JSON.stringify({
+      name: "dep-ages-workspace-lock-fixture",
+      version: "0.0.0",
+      workspaces: ["packages/*"],
+      dependencies: { [FIXTURE_DEP]: "^1.0.0" },
+    }));
+    writeFileSync(join(root, "packages", "ws-a", "package.json"), JSON.stringify({
+      name: "ws-a",
+      version: "0.0.0",
+      dependencies: { [FIXTURE_DEP]: "^2.0.0" },
+    }));
+    writeFileSync(join(root, "bunfig.toml"), `[install]\nregistry = "http://127.0.0.1:${server.port}/"\n`);
+    const generated = await bun(["install", "--lockfile-only", "--ignore-scripts"]);
+    if (generated.exitCode !== 0) setupFailure(`bun install --lockfile-only exited ${generated.exitCode}: ${generated.output}`);
+    await run(root, bun);
+  } finally {
+    server.stop(true);
+  }
+}
+
+/** Rewrite a fixture root's bun.lock through `change`, as JSON (which bun reads). */
+function rewriteLock(root: string, change: (lock: Record<string, any>) => void) {
+  const lock = parseBunLockText(readFileSync(join(root, "bun.lock"), "utf8")) as Record<string, any>;
+  change(lock);
+  writeFileSync(join(root, "bun.lock"), JSON.stringify(lock, null, 2));
+}
+
+/*
+ * The trust boundary, measured against the bun CI runs (1.3.10): the gate reads
+ * bun.lock as written; a frozen install refuses these malformed locks, and for
+ * a lock that records a workspace's range outside its declared range it
+ * installs the recorded version, which is the version the gate checks.
+ */
+describe("bun install --frozen-lockfile on the locks the gate reads", () => {
+  const refusedByFrozenInstall: Array<[string, (lock: Record<string, any>) => void]> = [
+    ["a workspaces array", (lock) => { lock.workspaces = []; }],
+    ["a workspace entry with no name", (lock) => { delete lock.workspaces["packages/ws-a"].name; }],
+    ["a missing workspace entry", (lock) => { delete lock.workspaces["packages/ws-a"]; }],
+    ["a wrong workspace name", (lock) => { lock.workspaces["packages/ws-a"].name = "ws-other"; }],
+  ];
+  for (const [label, change] of refusedByFrozenInstall) {
+    it(`refuses ${label}`, async () => {
+      await withInstallableWorkspace(label.replace(/\W+/g, "-"), async (root, bun) => {
+        const before = await bun(["install", "--frozen-lockfile", "--ignore-scripts"]);
+        expect(before.exitCode).toBe(0);
+        rewriteLock(root, change);
+        const after = await bun(["install", "--frozen-lockfile", "--ignore-scripts"]);
+        expect(after.output).toContain("lockfile");
+        expect(after.exitCode).toBe(1);
+      });
+    }, 60_000);
+  }
+
+  const outOfRange: Array<[string, (lock: Record<string, any>) => void]> = [
+    ["the workspace's own copy is removed, leaving the hoisted 1.0.5", (lock) => { delete lock.packages[`ws-a/${FIXTURE_DEP}`]; }],
+    ["the workspace's own copy records 1.0.5", (lock) => { lock.packages[`ws-a/${FIXTURE_DEP}`] = structuredClone(lock.packages[FIXTURE_DEP]); }],
+  ];
+  for (const [label, change] of outOfRange) {
+    it(`installs the version the gate checks when ${label} under ws-a's ^2.0.0`, async () => {
+      await withInstallableWorkspace(label.replace(/\W+/g, "-"), async (root, bun) => {
+        rewriteLock(root, change);
+        const install = await bun(["install", "--frozen-lockfile", "--ignore-scripts"]);
+        expect(install.exitCode).toBe(0);
+        const installedPath = Bun.resolveSync(`${FIXTURE_DEP}/package.json`, join(root, "packages", "ws-a"));
+        const installed = JSON.parse(readFileSync(installedPath, "utf8")).version;
+        const { resolved, unresolved } = resolveRangedDeps(
+          collectRangedDeps([
+            { pkg: JSON.parse(readFileSync(join(root, "package.json"), "utf8")), path: "package.json" },
+            { pkg: JSON.parse(readFileSync(join(root, "packages", "ws-a", "package.json"), "utf8")), path: "packages/ws-a/package.json" },
+          ], new Set()),
+          parseBunLockText(readFileSync(join(root, "bun.lock"), "utf8")),
+        );
+        expect(unresolved).toEqual([]);
+        const checked = resolved.find((r) => r.declaredIn === "packages/ws-a/package.json")?.version;
+        expect(installed).toBe("1.0.5");
+        expect(checked).toBe(installed);
+      });
+    }, 60_000);
+  }
+});
+
 describe("CLI fail-closed exit — dead registry", () => {
   it("exits 2 when FLAIR_NPM_REGISTRY is unreachable", async () => {
     const root = writeFixtureRepo(join(scratch, "dead-registry"));
