@@ -56,7 +56,7 @@
 
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, relative, resolve, sep } from "node:path";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -101,6 +101,7 @@ export const CONSUMER_INSTALLS = [
   { flag: "--openclaw-npm-install-prefix", source: "npm-install-openclaw", package: "@tpsdev-ai/openclaw-flair", dir: "packages/openclaw-flair" },
   { flag: "--pi-npm-install-prefix", source: "npm-install-pi", package: "@tpsdev-ai/pi-flair", dir: "packages/pi-flair" },
   { flag: "--n8n-npm-install-prefix", source: "npm-install-n8n", package: "@tpsdev-ai/n8n-nodes-flair", dir: "packages/n8n-nodes-flair" },
+  { flag: "--bench-npm-install-prefix", source: "npm-install-bench", package: "@tpsdev-ai/flair-bench", dir: "packages/flair-bench" },
 ];
 
 // The observations the gate runs. `bun` is the lockfile observation (`bun
@@ -1471,7 +1472,7 @@ async function main() {
 }
 
 // Only run when executed directly, so the unit tests can import the helpers.
-if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && (import.meta.url === `file://${process.argv[1]}` || import.meta.url === pathToFileURL(process.argv[1]).href)) {
   main().catch((e) => {
     console.error(`audit-gate crashed: ${e?.stack || e}`);
     process.exit(1);
