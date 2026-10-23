@@ -21,8 +21,9 @@
  * is not covered. Classifiers read the unredacted body. A zero-length failure keeps the message `HTTP <status>`,
  * and the credential-less 403 keeps main's hint.
  *
- * Every request goes through the real sendJsonRequest to a node HTTP listener
- * on 127.0.0.1 that this file starts. Two kinds of case spawn the built CLI
+ * Every request that receives a fixture response goes through the real
+ * sendJsonRequest to a node HTTP listener on 127.0.0.1 that this file starts;
+ * the refused-connection case sends to a port whose listener it has closed. Two kinds of case spawn the built CLI
  * with a scratch HOME: the run-once describe names its listener with FLAIR_URL,
  * and the alternate-port case sets no FLAIR_URL, naming one listener in the
  * scratch `~/.flair/data/harper-config.yaml` and another in
