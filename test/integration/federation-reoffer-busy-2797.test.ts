@@ -141,7 +141,6 @@ const retryKey = (id: string) => retryEntryKey(HUB_ID, "Memory", id);
 
 beforeAll(async () => {
   pauseDir = mkdtempSync(join(tmpdir(), "flair-2797-pause-"));
-  process.env.FLAIR_TEST_PAUSE_DIR = pauseDir;
   keystore.setPrivateKeySeed(SENDER_ID, senderSeed);
 
   receiver = await startHarper({
