@@ -28,6 +28,7 @@ import {
   parseBunLockText,
   resolveRangedDeps,
 } from "../../scripts/lib/check-dep-ages-collect.mjs";
+import { checkCoverageGate, parseWorkflows, type Gate, type WorkflowDoc } from "../helpers/workflow-gate";
 
 /* ─────────────────────────── Unit tests ───────────────────────────── */
 
@@ -1879,4 +1880,53 @@ describe("CLI fail-closed exit — unparseable publish time", () => {
   it("a NUMBER publish time fails closed (Date.parse(1) is a finite date)", async () => {
     await assertUnparseable("number", 1);
   }, 30_000);
+});
+
+/* ── CI wiring: the gate in the real workflow ───────────────────────── */
+
+const DEP_AGES_GATE: Gate = { step: "Check dependency bake time (≥7 days)", command: "node scripts/check-dep-ages.mjs --ci" };
+const WORKFLOW_DIR = join(REPO_ROOT, ".github", "workflows");
+
+/** The steps of the `test-unit` job, from the workflow that defines it. */
+function testUnitSteps(docs: WorkflowDoc[]) {
+  const job = docs.map((doc) => doc.jobs?.["test-unit"]).find((found) => found !== undefined);
+  if (!job?.steps) throw new Error("no workflow defines a test-unit job with steps");
+  return job.steps;
+}
+
+/** Throws unless test-unit runs the bake-time step before its frozen install. */
+function checkBakeTimeBeforeFrozenInstall(docs: WorkflowDoc[]): void {
+  const steps = testUnitSteps(docs);
+  const gate = steps.findIndex((step) => step.name === DEP_AGES_GATE.step);
+  const install = steps.findIndex((step) => typeof step.run === "string" && /\bbun install --frozen-lockfile\b/.test(step.run));
+  if (gate < 0) throw new Error(`test-unit has no "${DEP_AGES_GATE.step}" step`);
+  if (install < 0) throw new Error("test-unit has no bun install --frozen-lockfile step");
+  if (gate > install) throw new Error("the bake-time step must run before the frozen install");
+}
+
+describe("CI wiring — the bake-time gate in the real workflow", () => {
+  it("runs the gate with --ci in the required test-unit job, without skip controls, before the frozen install", () => {
+    const docs = parseWorkflows(WORKFLOW_DIR);
+    expect(() => checkCoverageGate(docs, DEP_AGES_GATE)).not.toThrow();
+    expect(() => checkBakeTimeBeforeFrozenInstall(docs)).not.toThrow();
+  });
+
+  it("refuses a workflow with the step removed, set to continue-on-error, or moved after the frozen install", () => {
+    const removed = parseWorkflows(WORKFLOW_DIR);
+    const removedSteps = testUnitSteps(removed);
+    removedSteps.splice(removedSteps.findIndex((step) => step.name === DEP_AGES_GATE.step), 1);
+    expect(() => checkCoverageGate(removed, DEP_AGES_GATE)).toThrow(`no step is named "${DEP_AGES_GATE.step}"`);
+
+    const soft = parseWorkflows(WORKFLOW_DIR);
+    const softStep = testUnitSteps(soft).find((step) => step.name === DEP_AGES_GATE.step);
+    if (!softStep) setupFailure("the bake-time step is missing from the parsed workflow");
+    softStep["continue-on-error"] = true;
+    expect(() => checkCoverageGate(soft, DEP_AGES_GATE)).toThrow("continue-on-error");
+
+    const late = parseWorkflows(WORKFLOW_DIR);
+    const lateSteps = testUnitSteps(late);
+    const [gateStep] = lateSteps.splice(lateSteps.findIndex((step) => step.name === DEP_AGES_GATE.step), 1);
+    lateSteps.push(gateStep);
+    expect(() => checkBakeTimeBeforeFrozenInstall(late)).toThrow("the bake-time step must run before the frozen install");
+  });
 });
