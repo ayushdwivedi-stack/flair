@@ -80,6 +80,14 @@ describe("checked Memory writes under a held lock (flair#2478 part 3a)", () => {
       });
     }
 
+    it(`${verb}: a confirmed field the staged write holds as undefined confirms against a row without it`, async () => {
+      const content = { ...body(verb, "the checked edit"), archivedBy: undefined };
+      const outcome = await withMemoryWriteLock(store, ["m1"], (held) =>
+        withLockedMemoryTransaction(held, ctx(), (tx) => checked[verb](held, tx, { id: "m1", content, confirmFields: ["archivedBy"] })));
+      expect((outcome as any).value.kind).toBe("committed");
+      expect(harnessState.memoryStore.get("m1").archivedBy).toBeUndefined();
+    });
+
     it(`${verb}: refused with no token, another id set's token, a revoked token, or another store's token; nothing is written`, async () => {
       const content = () => ({ id: "m1", content: body(verb, "an unauthorized edit") });
       // No token, inside a live scope for the id.
