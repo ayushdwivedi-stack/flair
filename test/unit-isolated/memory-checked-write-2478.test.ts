@@ -132,7 +132,7 @@ describe("checked Memory writes under a held lock (flair#2478 part 3a)", () => {
 
   it("the write body refuses an entry it did not mint", async () => {
     const resource: any = (Memory as any).getResource({ id: "m1" }, ctx());
-    expect(await reason(resource.putLocked({ ...ROW, content: "forged" }, undefined, Object.freeze({})))).toBe("not_a_transaction");
+    expect(await reason(resource.putLocked({ ...ROW, content: "forged" }, undefined, [], Object.freeze({})))).toBe("not_a_transaction");
     expect(await reason(resource.patchLocked({ content: "forged" }, undefined, {}))).toBe("not_a_transaction");
     expect(harnessState.memoryStore.get("m1")).toEqual(ROW);
   });

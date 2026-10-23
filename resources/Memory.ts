@@ -3297,8 +3297,11 @@ export class Memory extends (databases as any).flair.Memory {
   async put(content: any, query?: any) {
     const ids = putLockIds(this, content);
     if (ids.length === 0) return memoryIdRequiredResponse();
+    // Citation-on-write, queued by putLocked, runs after this lock is released:
+    // it tries each cited id's lock, and the target id's lock is not held then.
+    const afterRelease: Array<() => Promise<void>> = [];
     const outcome = await withMemoryWriteLock(memoryWriteLockStore(), ids, async () => {
-      const result = await this.putLocked(content, query);
+      const result = await this.putLocked(content, query, afterRelease);
       // Test-only: the verb body has returned and the lock is still held. A body
       // that owned its transaction has committed it; a composed or `_reindex` put
       // that joined another transaction has not.
@@ -3306,11 +3309,12 @@ export class Memory extends (databases as any).flair.Memory {
       if (committed) await committed;
       return result;
     }, { phase: "put" });
-    if (outcome.kind === "done") return outcome.value;
-    return memoryLockRefusal(outcome, memoryLockCallerId(this))!;
+    if (outcome.kind !== "done") return memoryLockRefusal(outcome, memoryLockCallerId(this))!;
+    for (const step of afterRelease) await step();
+    return outcome.value;
   }
 
-  private async putLocked(content: any, query?: any, entry?: unknown) {
+  private async putLocked(content: any, query: any, afterRelease: Array<() => Promise<void>>, entry?: unknown) {
     // flair#2478 part 3a: a checked write (putMemoryWithLock) joins its locked
     // transaction; the ordinary verb passes no entry.
     const locked = takeCheckedEntry(entry);
@@ -3544,6 +3548,9 @@ export class Memory extends (databases as any).flair.Memory {
         // below only when present.
         const usedMemoryIds = content?.usedMemoryIds;
         if (content && typeof content === "object") delete content.usedMemoryIds;
+        // A checked write records no citations: they take the cited ids' locks
+        // after the write's lock is released, which its caller holds.
+        if (locked && usedMemoryIds !== undefined) throw uncheckedBodyRefusal("citation-on-write");
 
         // ── flair#1238: refuse an unrecognised durability (mirrors post()) ──
         // put() is the other HTTP-reachable write path (fresh create via CLI, and
@@ -3940,13 +3947,17 @@ export class Memory extends (databases as any).flair.Memory {
     if (putResult.close?.granteeId === undefined) await closeSupersededIfNeeded(ctx, putResult.content, putResult.close, "put");
 
     // flair#744 slice A: citation-on-write — POST-COMMIT, fully
-    // failure-isolated (see post()'s identical comment above).
+    // failure-isolated (see post()'s identical comment above). flair#2478: it
+    // is queued here and put() runs it after releasing this id's lock.
     if (putResult.usedMemoryIds !== undefined) {
-      try {
-        await recordCitations(ctx, putResult.auth, putResult.usedMemoryIds, new Date().toISOString());
-      } catch (err) {
-        console.error("Memory.put: citation recording failed (write already committed)", err);
-      }
+      const { auth: citingAuth, usedMemoryIds } = putResult;
+      afterRelease.push(async () => {
+        try {
+          await recordCitations(ctx, citingAuth, usedMemoryIds, new Date().toISOString());
+        } catch (err) {
+          console.error("Memory.put: citation recording failed (write already committed)", err);
+        }
+      });
     }
 
     return buildWriteResponse(putResult.content, result, putResult.dedupMatch, putResult.redactedValues, putStaged);
@@ -4191,7 +4202,7 @@ function enterCheckedWrite(verb: "put" | "patch", held: MemoryWriteLockToken, tx
     const entry = Object.freeze({});
     checkedEntries.set(entry, { admission, confirmFields: Object.freeze([...(input.confirmFields ?? [])]), stage, used: false });
     const body = { ...input.content };
-    return verb === "put" ? resource.putLocked(body, undefined, entry) : resource.patchLocked(body, undefined, entry);
+    return verb === "put" ? resource.putLocked(body, undefined, [], entry) : resource.patchLocked(body, undefined, entry);
   });
 }
 
