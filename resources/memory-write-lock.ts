@@ -1,7 +1,9 @@
 /**
  * memory-write-lock.ts — the per-memory-id write serialization protocol
  * (flair#2478 slice 1). The ordinary owner PUT and PATCH (resources/Memory.ts,
- * the HTTP re-embed PATCH included) run under it, and so do the automatic
+ * the HTTP re-embed PATCH included), the owner DELETE (with a skill row's live
+ * head) and an untagged owner POST naming an id or a `supersedes` target
+ * (slice 1 part 2) run under it, and so do the automatic
  * writers converted so far: the visibility backfill and the promotion stamps
  * (slice 2), the embedding backfill that follows a Memory write signed by a
  * verified Ed25519 agent (resources/auth-middleware.ts), the embedding-stamp
@@ -63,7 +65,8 @@
  *    dedup repair records the marker when its committed update's confirmation
  *    read fails, and the other automatic writers do not set it for their own
  *    unconfirmed write, which they report or log.
- *    POST and the writers that take no per-id lock do not check the marker.
+ *    A POST that takes the lock checks the ids it locks; a POST that takes
+ *    none, and the writers that take no per-id lock, do not check the marker.
  *
  * The marker is module state, so it is per Harper worker thread. That covers
  * the whole instance only in the supported single-worker mode: flair refuses to
@@ -74,8 +77,9 @@
  * worker is not seen by another.
  *
  * The critical section contains the write paths' embedding calls — the ordinary
- * PUT's regen (and its create-path dedup probe), the re-embed PATCH's compute
- * and its recompute, and the PATCH embedding refresh — and each is bounded by
+ * PUT's regen (and its create-path dedup probe), a locked POST's dedup probe
+ * and embedding, the re-embed PATCH's compute and its recompute, and the PATCH
+ * embedding refresh — and each is bounded by
  * {@link MEMORY_LOCKED_PROVIDER_TIMEOUT_MS} through {@link boundLockedProviderCall};
  * a call still pending when the timeout callback runs, or one that settles after
  * the bound, is refused with `503 memory_provider_timeout` and nothing is
