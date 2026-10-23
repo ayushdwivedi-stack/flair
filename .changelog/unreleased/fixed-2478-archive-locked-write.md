@@ -1,10 +1,11 @@
 - **Basement and restore of a non-skill memory write under the per-id Memory lock they hold.**
 
   For a non-skill row, `POST /MemoryArchive` takes the id's lock (and the lock
-  of the row its `supersedes` names, which the write closes: for its owner or
-  an admin after the commit on a best-effort basis, a failed close logged;
+  of the row its `supersedes` names, which the write may close: for its owner
+  or an admin after the commit on a best-effort basis, a failed close logged;
   under a write grant staged in the write's transaction, so a failed close
-  aborts the write) after its first read. Holding it, the archive re-reads the
+  aborts the write; a non-admin write whose stored predecessor is missing
+  closes nothing) after its first read. Holding it, the archive re-reads the
   row and writes it in one transaction, then confirms the stored row's
   identity and its archive fields (`archived`, `archivedAt`, `archivedBy`)
   before it answers. While the archive holds the id, an owner `PUT` or

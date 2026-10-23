@@ -4183,33 +4183,6 @@ function checkedWriteIds(verb: "put" | "patch", input: CheckedMemoryWriteInput):
   return ids;
 }
 
-/** Does `value` hold a SharedArrayBuffer, directly or through a view, at any
- *  depth? Each object is visited once, so a cycle ends the walk. */
-function holdsSharedMemory(value: unknown): boolean {
-  const seen = new Set<object>();
-  const pending: unknown[] = [value];
-  while (pending.length > 0) {
-    const next = pending.pop();
-    if (next === null || typeof next !== "object" || seen.has(next)) continue;
-    seen.add(next);
-    if (typeof SharedArrayBuffer === "function" && next instanceof SharedArrayBuffer) return true;
-    if (ArrayBuffer.isView(next)) {
-      if (typeof SharedArrayBuffer === "function" && next.buffer instanceof SharedArrayBuffer) return true;
-      continue;
-    }
-    if (next instanceof Map) {
-      for (const [k, v] of next) pending.push(k, v);
-      continue;
-    }
-    if (next instanceof Set) {
-      for (const v of next) pending.push(v);
-      continue;
-    }
-    for (const key of Object.keys(next)) pending.push((next as Record<string, unknown>)[key]);
-  }
-  return false;
-}
-
 function enterCheckedWrite(verb: "put" | "patch", held: MemoryWriteLockToken, tx: LockedMemoryTransaction, input: CheckedMemoryWriteInput): Promise<MemoryWriteReceipt> {
   let admission: LockedWriteAdmission;
   let snapshot: CheckedMemoryWriteInput;
@@ -4219,17 +4192,16 @@ function enterCheckedWrite(verb: "put" | "patch", held: MemoryWriteLockToken, tx
       throw new TypeError("a checked Memory write names a string id and an object body");
     }
     // One snapshot, taken before admission, decides the write set and is the
-    // write: a later change to the caller's input, nested values included,
-    // reaches neither. structuredClone, not a JSON round trip: a body read
-    // from a stored row can hold values JSON would not keep as they are (a
-    // typed-array vector, a Date). A body holding shared memory (which a clone
-    // can still share), or one it cannot clone, is rejected here, before
-    // admission.
-    if (holdsSharedMemory(input.content)) throw new TypeError("a checked Memory write body holds shared memory (a SharedArrayBuffer)");
-    const content = structuredClone(input.content);
+    // write. The write set comes from its id strings, so a later change to
+    // the caller's input cannot change it. The body is a structuredClone
+    // (not a JSON round trip: a body read from a stored row can hold values
+    // JSON would not keep as they are, a typed-array vector or a Date), so
+    // a later change to a nested value does not reach the write either,
+    // except through memory a SharedArrayBuffer shares, which a clone keeps
+    // shared. A body it cannot clone is rejected here, before admission.
     snapshot = Object.freeze({
       id: input.id,
-      content,
+      content: structuredClone(input.content),
       confirmFields: Object.freeze([...(input.confirmFields ?? [])]),
     });
     admission = admitLockedMemoryWrite(held, tx, memoryWriteLockStore(), checkedWriteIds(verb, snapshot));
