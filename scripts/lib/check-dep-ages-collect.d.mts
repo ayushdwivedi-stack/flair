@@ -103,7 +103,7 @@ export function classifyOverrides(overrides: unknown): OverrideRule[];
  * Exemptions: `@tpsdev-ai/*`, keep-current list, `workspace:`, `file:`/`link:`,
  * `git+`/`github:`. A `dependencies` / `optionalDependencies` entry is
  * classified by the same classifier the override grammar uses; only an exact
- * version is age-checked.
+ * version is collected here (collectRangedDeps collects ranges).
  *
  * `peerDependencies` are NOT checked: peers are resolved from a range by the
  * consumer's install, so an exact-pin check of our declaration does not
@@ -123,7 +123,8 @@ export function collectDeps(
  * ranges in `dependencies`, `devDependencies` and `optionalDependencies`, and
  * ranged `overrides` rules (nested rules included), from every given manifest.
  *
- * Exemptions: `@tpsdev-ai/*` and the keep-current list.
+ * Exemptions: `@tpsdev-ai/*` and the keep-current list, matched on `target`,
+ * so an `npm:` alias is exempt only when its target is.
  */
 export function collectRangedDeps(
   pkgs: Array<{ pkg: Record<string, unknown>; path: string }>,

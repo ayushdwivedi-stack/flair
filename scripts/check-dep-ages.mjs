@@ -324,7 +324,7 @@ async function main() {
   }
 
   if (toCheck.size === 0) {
-    console.log("✓ No external pinned production deps to check.");
+    console.log("✓ No external dependency versions to check.");
     if (KEEP_CURRENT.size > 0) {
       console.log(
         `(${KEEP_CURRENT.size} packages on the keep-current allow-list: ${[...KEEP_CURRENT].sort().join(", ")})`,
@@ -334,7 +334,7 @@ async function main() {
   }
 
   console.log(
-    `Checking ${toCheck.size} pinned production deps against ${MIN_AGE_DAYS}-day bake-time policy...`,
+    `Checking ${toCheck.size} external dependency versions against ${MIN_AGE_DAYS}-day bake-time policy...`,
   );
   if (KEEP_CURRENT.size > 0) {
     console.log(
@@ -460,7 +460,7 @@ async function main() {
   }
 
   if (stillFresh.length > 0) {
-    console.error("Pinned production deps younger than the bake-time policy:");
+    console.error("Dependency versions younger than the bake-time policy:");
     console.error("");
     for (const f of stillFresh.sort((a, b) => b.publishedAt - a.publishedAt)) {
       const days = f.ageDays.toFixed(1);
@@ -492,7 +492,7 @@ async function main() {
 
   if (exempted.length === 0) {
     console.log(
-      `All ${toCheck.size} external pinned production deps are at least ${MIN_AGE_DAYS} days old.`,
+      `All ${toCheck.size} external dependency versions are at least ${MIN_AGE_DAYS} days old.`,
     );
   } else {
     const names = exempted
@@ -500,7 +500,7 @@ async function main() {
       .sort()
       .join(", ");
     console.log(
-      `${toCheck.size - exempted.length} of ${toCheck.size} external pinned production deps are at least ${MIN_AGE_DAYS} days old; ${exempted.length} exemption(s) applied: ${names}.`,
+      `${toCheck.size - exempted.length} of ${toCheck.size} external dependency versions are at least ${MIN_AGE_DAYS} days old; ${exempted.length} exemption(s) applied: ${names}.`,
     );
   }
 }

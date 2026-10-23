@@ -27,8 +27,10 @@
  *   are age-checked at the copies in the rule's scope (resolveRangedDeps).
  *   Nested override objects are read too.
  *
- * Exemptions, in all three fields: `@tpsdev-ai/*`, the keep-current list,
- * `workspace:`, `file:`/`link:`, `git+`/`github:`.
+ * Exemptions, in every checked field: `@tpsdev-ai/*` and the keep-current
+ * list, matched on the package a declaration installs (an `npm:` alias's
+ * target, never its key), and `workspace:`, `file:`/`link:`, `git+`/`github:`
+ * specifiers.
  *
  * `peerDependencies` are NOT checked: peers are resolved from a range by the
  * consumer's install, so an exact-pin check of our declaration does not
@@ -204,7 +206,8 @@ function formatOverridePath(path) {
  *
  * Exemptions: `@tpsdev-ai/*`, keep-current list, `workspace:`, `file:`/`link:`,
  * `git+`/`github:`. A `dependencies` / `optionalDependencies` entry is
- * classified by classifyRegistrySpec; only an exact version is age-checked.
+ * classified by classifyRegistrySpec; only an exact version is collected here
+ * (collectRangedDeps collects ranges).
  *
  * `peerDependencies` are NOT checked: peers are resolved from a range by the
  * consumer's install, so an exact-pin check of our declaration does not
@@ -231,7 +234,8 @@ export function collectDeps(pkgs, keepCurrent) {
   function recordDeps(deps, declaredIn) {
     for (const [name, spec] of Object.entries(deps)) {
       if (typeof spec !== "string") continue;
-      // Only exact versions are age-checked; the gate reads manifests, not the lockfile.
+      // Only exact versions are collected here; collectRangedDeps collects
+      // ranges, which resolveRangedDeps resolves through bun.lock.
       const classified = classifyDependencySpec(name, spec);
       if (classified.kind === "exact") record(classified.name, classified.version, declaredIn);
     }
@@ -261,7 +265,8 @@ export function collectDeps(pkgs, keepCurrent) {
  * and `workspaceDir` the manifest's directory ("" for the root). An override
  * entry also carries `path`, its full key path as { name, selector } pairs.
  *
- * Exemptions match collectDeps: `@tpsdev-ai/*` and the keep-current list.
+ * Exemptions match collectDeps: `@tpsdev-ai/*` and the keep-current list,
+ * matched on `target`, so an `npm:` alias is exempt only when its target is.
  * `workspace:`, `file:`/`link:` and `git+`/`github:` specifiers are not ranges
  * and are not collected.
  */
@@ -270,7 +275,7 @@ export function collectRangedDeps(pkgs, keepCurrent) {
   const seen = new Set();
   function add(entry) {
     if (entry.target.startsWith("@tpsdev-ai/")) return;
-    if (keepCurrent.has(entry.target) || keepCurrent.has(entry.name)) return;
+    if (keepCurrent.has(entry.target)) return;
     const key = [entry.kind, entry.spec, entry.declaredIn, entry.at].join("\u0000");
     if (seen.has(key)) return;
     seen.add(key);

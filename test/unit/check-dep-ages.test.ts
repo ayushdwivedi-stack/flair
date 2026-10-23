@@ -764,6 +764,59 @@ describe("CLI — a real bun.lock: aliases, nested overrides and declaration lin
       registry.stop();
     }
   }, 60_000);
+
+  // "harper" is on the default keep-current list; the alias installs a
+  // different, unlisted package under that name, so it is checked.
+  it("age-checks a ranged npm: alias whose key is a keep-current name, at its unlisted target", async () => {
+    const root = join(scratch, "real-lock-keep-current-alias-key");
+    const lock = await bunGeneratedLock(root, {
+      name: "dep-ages-keep-current-alias-fixture",
+      version: "0.0.0",
+      dependencies: { harper: `npm:${FIXTURE_DEP}@^1.0.0` },
+    }, { [FIXTURE_DEP]: { "1.0.0": {}, "1.0.5": {} } });
+    expect(lockResolutions(lock)).toMatchObject({ harper: `${FIXTURE_DEP}@1.0.5` });
+    const registry = registryWithTimes({ "1.0.5": FRESH_TIME });
+    try {
+      const { exitCode, output } = await runGate(CLI_SCRIPT, {
+        FLAIR_CHECK_DEP_AGES_ROOT: root,
+        FLAIR_NPM_REGISTRY: registry.url,
+      });
+      expect(registry.requests).toEqual([`/${FIXTURE_DEP}`]);
+      expect(output).toContain(`${FIXTURE_DEP}@1.0.5    — published ${FRESH_DATE}`);
+      expect(output).toContain(`declared in package.json dependencies["harper"] (range "npm:${FIXTURE_DEP}@^1.0.0")`);
+      expect(exitCode).toBe(1);
+    } finally {
+      registry.stop();
+    }
+  }, 60_000);
+
+  it("age-checks a ranged npm: alias override whose key is a keep-current name, at its unlisted target", async () => {
+    const root = join(scratch, "real-lock-keep-current-alias-override");
+    const lock = await bunGeneratedLock(root, {
+      name: "dep-ages-keep-current-alias-override-fixture",
+      version: "0.0.0",
+      dependencies: { "wrapper-dep": "1.0.0" },
+      overrides: { harper: `npm:${FIXTURE_DEP}@^1.0.0` },
+    }, {
+      [FIXTURE_DEP]: { "1.0.0": {}, "1.0.5": {} },
+      "wrapper-dep": { "1.0.0": { harper: "^1.0.0" } },
+      harper: { "1.0.0": {} },
+    });
+    expect(lockResolutions(lock)).toMatchObject({ harper: `${FIXTURE_DEP}@1.0.5`, "wrapper-dep": "wrapper-dep@1.0.0" });
+    const registry = registryWithTimes({ "1.0.0": OLD_TIME, "1.0.5": FRESH_TIME });
+    try {
+      const { exitCode, output } = await runGate(CLI_SCRIPT, {
+        FLAIR_CHECK_DEP_AGES_ROOT: root,
+        FLAIR_NPM_REGISTRY: registry.url,
+      });
+      expect(registry.requests.sort()).toEqual([`/${FIXTURE_DEP}`, "/wrapper-dep"]);
+      expect(output).toContain(`${FIXTURE_DEP}@1.0.5    — published ${FRESH_DATE}`);
+      expect(output).toContain(`declared in package.json overrides["harper"] (range "npm:${FIXTURE_DEP}@^1.0.0")`);
+      expect(exitCode).toBe(1);
+    } finally {
+      registry.stop();
+    }
+  }, 60_000);
 });
 
 describe("CLI fail-closed exit — dead registry", () => {
@@ -790,7 +843,7 @@ describe("CLI fail-closed exit — too-fresh dep", () => {
       });
       // The gate asked the fixture registry, and reported the dep as too fresh.
       expect(registry.requests).toEqual([`/${FIXTURE_DEP}`]);
-      expect(output).toContain("Pinned production deps younger than the bake-time policy");
+      expect(output).toContain("Dependency versions younger than the bake-time policy");
       expect(output).toContain(`${FIXTURE_DEP}@${FIXTURE_VERSION}`);
       expect(output).toContain("declared in package.json");
       expect(exitCode).toBe(1);
@@ -812,7 +865,7 @@ describe("CLI fail-closed exit — too-fresh dep", () => {
     try {
       const { exitCode, output } = await runGate(script, { FLAIR_NPM_REGISTRY: registry.url });
       expect(registry.requests).toEqual([`/${FIXTURE_DEP}`]);
-      expect(output).toContain("Pinned production deps younger than the bake-time policy");
+      expect(output).toContain("Dependency versions younger than the bake-time policy");
       expect(output).toContain(`${FIXTURE_DEP}@${FIXTURE_VERSION}`);
       expect(exitCode).toBe(1);
     } finally {
@@ -831,7 +884,7 @@ describe("CLI — a pin through overrides and the dated exemption", () => {
         FLAIR_NPM_REGISTRY: registry.url,
       });
       expect(registry.requests).toEqual([`/${FIXTURE_DEP}`]);
-      expect(output).toContain("Pinned production deps younger than the bake-time policy");
+      expect(output).toContain("Dependency versions younger than the bake-time policy");
       expect(output).toContain(`${FIXTURE_DEP}@${FIXTURE_VERSION}`);
       expect(output).toContain("declared in package.json");
       expect(exitCode).toBe(1);
@@ -851,7 +904,7 @@ describe("CLI — a pin through overrides and the dated exemption", () => {
       });
       expect(output).toContain("Exempted fresh dependency versions");
       expect(output).toContain("exempt until 2099-01-01");
-      expect(output).not.toContain("Pinned production deps younger than the bake-time policy");
+      expect(output).not.toContain("Dependency versions younger than the bake-time policy");
       expect(exitCode).toBe(0);
     } finally {
       registry.stop();
@@ -908,7 +961,7 @@ describe("CLI — a pin through overrides and the dated exemption", () => {
     });
     expect(output).toContain("Override ranges with no installed copy in their scope");
     expect(output).toContain(`package.json overrides["${FIXTURE_DEP}"] "^1.0.0"`);
-    expect(output).toContain("No external pinned production deps to check.");
+    expect(output).toContain("No external dependency versions to check.");
     expect(exitCode).toBe(0);
   }, 30_000);
 
@@ -996,7 +1049,7 @@ describe("CLI — a dependency range is age-checked at its lockfile resolution",
         FLAIR_CHECK_DEP_AGES_ROOT: root,
         FLAIR_NPM_REGISTRY: registry.url,
       });
-      expect(output).toContain("Pinned production deps younger than the bake-time policy");
+      expect(output).toContain("Dependency versions younger than the bake-time policy");
       expect(output).toContain(`${FIXTURE_DEP}@1.2.3`);
       expect(output).toContain(`published ${FRESH_DATE}`);
       expect(output).toContain(`declared in package.json dependencies["${FIXTURE_DEP}"] (range "^1.0.0")`);
@@ -1019,7 +1072,7 @@ describe("CLI — a dependency range is age-checked at its lockfile resolution",
         FLAIR_CHECK_DEP_AGES_ROOT: root,
         FLAIR_NPM_REGISTRY: registry.url,
       });
-      expect(output).toContain("All 1 external pinned production deps are at least 7 days old.");
+      expect(output).toContain("All 1 external dependency versions are at least 7 days old.");
       expect(exitCode).toBe(0);
     } finally {
       registry.stop();
@@ -1040,7 +1093,7 @@ describe("CLI — a dependency range is age-checked at its lockfile resolution",
         FLAIR_NPM_REGISTRY: registry.url,
         FLAIR_DEP_KEEP_CURRENT: FIXTURE_DEP,
       });
-      expect(output).toContain("No external pinned production deps to check.");
+      expect(output).toContain("No external dependency versions to check.");
       expect(registry.requests).toEqual([]);
       expect(exitCode).toBe(0);
     } finally {
@@ -1196,7 +1249,7 @@ describe("CLI — a refused dependency form fails the gate before any fetch", ()
     });
     const { exitCode, output } = await runGate(CLI_SCRIPT, { FLAIR_CHECK_DEP_AGES_ROOT: root });
     expect(exitCode).toBe(0);
-    expect(output).toContain("No external pinned production deps to check.");
+    expect(output).toContain("No external dependency versions to check.");
   });
 });
 
@@ -1226,7 +1279,7 @@ describe("CLI — override forms", () => {
         FLAIR_NPM_REGISTRY: registry.url,
       });
       expect(registry.requests).toEqual([`/${FIXTURE_DEP}`]);
-      expect(output).toContain("Pinned production deps younger than the bake-time policy");
+      expect(output).toContain("Dependency versions younger than the bake-time policy");
       expect(output).toContain(`${FIXTURE_DEP}@${FIXTURE_VERSION}`);
       expect(exitCode).toBe(1);
     } finally {
@@ -1251,7 +1304,7 @@ describe("CLI — override forms", () => {
         FLAIR_NPM_REGISTRY: registry.url,
       });
       expect(registry.requests).toEqual([`/${FIXTURE_DEP}`]);
-      expect(output).toContain("Pinned production deps younger than the bake-time policy");
+      expect(output).toContain("Dependency versions younger than the bake-time policy");
       expect(output).toContain("declared in packages/ws-a/package.json");
       expect(exitCode).toBe(1);
     } finally {
@@ -1281,7 +1334,7 @@ describe("CLI — override forms", () => {
     mkdirSync(join(root, "packages", "no-manifest"), { recursive: true });
     const { exitCode, output } = await runGate(CLI_SCRIPT, { FLAIR_CHECK_DEP_AGES_ROOT: root });
     expect(exitCode).toBe(0);
-    expect(output).toContain("No external pinned production deps to check");
+    expect(output).toContain("No external dependency versions to check");
   });
 
   it("age-checks an override range at its resolved version", async () => {
