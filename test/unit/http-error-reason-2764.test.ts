@@ -9,8 +9,10 @@
  * stderr line and the rem display texts, the credential values the CLI reads
  * from the request's Authorization header (a Basic password and a TPS-Ed25519
  * signature read with Flair's server grammar) are replaced with `[redacted]` in
- * the text the server supplied, and that text is withheld when the header names
- * basic, bearer or tps-ed25519 but its credential cannot be read. Scope: redaction removes
+ * the text the server supplied, and a non-empty response's text is withheld
+ * (in the rem display texts too, even when the text derived from it is empty)
+ * when the header names basic, bearer or tps-ed25519 but its credential cannot
+ * be read. Scope: redaction removes
  * the request's credential values from the text the server supplied (literal,
  * inside any JSON string, percent-encoded); text the CLI writes itself (the
  * `HTTP <status>: ` prefix, the debug line's labels, a caller's `Error: `
@@ -39,6 +41,7 @@ import {
   TPS_ED25519_HEADER_GRAMMAR,
   apiErrorBody,
   apiErrorRawBody,
+  boundErrorText,
   credentialsInHeader,
   sendJsonRequest,
 } from "../../src/lib/auth-resolve.ts";
@@ -806,6 +809,54 @@ describe("flair#2764 — the credential values read from the request's header ar
       expect(stderr, header).toBe('[flair] GET /echo answered HTTP 500; response body: "[body withheld]"\n');
       expect(describeReflectError(err).text, header).toBe("[body withheld]");
     }
+  });
+
+  test("a non-empty body whose error string is empty, with an unreadable credential: describeReflectError shows the marker", async () => {
+    const { err } = await failEcho("Bearer", () => JSON.stringify({ error: "" }), false);
+    expect(err.message).toBe("HTTP 500: [body withheld]");
+    expect(err.body).toBe("[body withheld]");
+    expect(describeReflectError(err)).toEqual({ kind: "other", text: "[body withheld]" });
+  });
+
+  test("a non-empty body whose error string is empty, with an unreadable credential: rem's run error shows the marker", async () => {
+    const body = JSON.stringify({ error: "" });
+    const root = mkdtempSync(join(tmpdir(), "flair-2764-runner-"));
+    const routes: Record<string, Reply> = {
+      "GET /Memory": { status: 200, body: JSON.stringify([{ id: "m1", agentId: AGENT_ID, content: "first memory" }]) },
+      "GET /Soul": { status: 200, body: "[]" },
+      "POST /MemoryMaintenance": { status: 200, body: JSON.stringify({ expired: 0, archived: 0, total: 0, errors: 0 }) },
+      "POST /ReflectMemories": { status: 502, body },
+      "POST /MemoryDedupStats": {
+        status: 200,
+        body: JSON.stringify({ clusterCount: 0, largestClusterSize: 0, totalMemoriesInClusters: 0, computedAt: "2026-07-22T03:00:00.000Z" }),
+      },
+    };
+    const own = await startListener((line) => routes[line.split("?")[0]] ?? { status: 404, body: `no route for ${line}` });
+    try {
+      const apiCall = (method: string, path: string, sent?: unknown) =>
+        sendJsonRequest(new URL(path, `http://127.0.0.1:${own.port}`), method, sent, "Bearer", true);
+      const r = await runNightlyCycle({
+        agentId: AGENT_ID,
+        flairVersion: "0.0.0-test",
+        apiCall,
+        snapshotRoot: join(root, "snapshots"),
+        logPath: join(root, "rem-nightly.jsonl"),
+        pauseFlagPath: join(root, "rem.paused"),
+        envPaused: false,
+        healthProbe: async () => ({ ok: true, elapsedMs: 1 }),
+      });
+      expect(r.logRow.errors, own.seen.join("\n")).toEqual(["distillation: [body withheld]"]);
+    } finally {
+      await own.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+    // An empty response is not withheld: there is no server text to hide, and
+    // describeReflectError shows the message.
+    const empty = ApiHttpError.fromResponse(500, "", ["Bearer"], true);
+    expect(empty.message).toBe("HTTP 500");
+    expect(empty.body).toBe("");
+    expect(boundErrorText(empty, "")).toBe("");
+    expect(describeReflectError(empty)).toEqual({ kind: "other", text: "HTTP 500" });
   });
 
   test("a body that carries no credential value is unchanged", async () => {

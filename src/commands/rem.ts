@@ -646,7 +646,8 @@ export function candidateIncompleteFlag(claim: unknown): string | null {
  * redacts the credential values read from the request's Authorization header
  * (credentialsInHeader) from the server's text within the scope stated on
  * ApiHttpError, or withholds that text when the header's credential could not
- * be read (the prefix the caller prints is outside the scope). The two
+ * be read and the response text was non-empty, even when the text derived
+ * from it is empty (the prefix the caller prints is outside the scope). The two
  * classified distillation failures are:
  *   503 no-backend:        { error: "No generative backend configured..." }
  *   502 distillation_failed: { error: "distillation_failed", detail: "..." }

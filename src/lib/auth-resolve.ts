@@ -105,7 +105,9 @@ import { resolveHome } from "./home.js";
  *     prefix is not passed through redaction. Classifiers read the unredacted
  *     text through `apiErrorRawBody`; the rem formatters that derive display
  *     text from it pass that text through `boundErrorText`, which redacts it,
- *     or withholds it when the header's credential could not be read. Within
+ *     or withholds it when the header's credential could not be read and the
+ *     response text was non-empty (even when the text derived from it is
+ *     empty). Within
  *     the scope below, each of those values becomes `[redacted]` in the
  *     server's text as displayed.
  * Scope: redaction removes the request's credential values from the text the
@@ -605,12 +607,14 @@ export function apiErrorRawBody(err: unknown): string | undefined {
  * the credential values credentialsInHeader read from `err`'s request header
  * redacted from it (boundAndRedact, within the scope on ApiHttpError), or
  * BODY_WITHHELD when credentialsInHeader set `withhold` for that header and
- * `text` is non-empty (an empty `text` stays empty). For an error that has no sent values,
- * boundServerText(text) (flair#2764).
+ * the response text `err` was built from is non-empty, whatever `text` is
+ * (an empty `text` derived from it, such as an empty `error` string, included).
+ * When that response text is empty nothing is withheld. For an error that has
+ * no sent values, boundServerText(text) (flair#2764).
  */
 export function boundErrorText(err: unknown, text: string): string {
   const kept = err instanceof ApiHttpError ? privateText.get(err) : undefined;
-  if (kept?.withhold && text.length > 0) return BODY_WITHHELD;
+  if (kept?.withhold && kept.raw.length > 0) return BODY_WITHHELD;
   return boundAndRedact(text, kept?.sentValues ?? []);
 }
 
