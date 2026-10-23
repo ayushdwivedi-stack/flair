@@ -196,7 +196,7 @@ jobs:
         # dist-tag pin here rots the listing (flair#1307: 0.44.13 while
         # npm latest was 0.46.0). Unpinning is the policy.
         run: node scripts/check-plugin-mcp-unpinned.mjs
-      - name: "Check production dep bake time (≥7 days)"
+      - name: "Check dependency bake time (≥7 days)"
         # Supply-chain bake-time guard. See docs/supply-chain-policy.md.
         # Tunable via FLAIR_DEP_MIN_AGE_DAYS env. Workspace-internal deps exempt.
         # --ci marks THIS invocation as the gate: it refuses to run if

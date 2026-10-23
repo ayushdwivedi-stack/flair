@@ -23,6 +23,8 @@ export interface RangedDep {
   at: string;
   /** The manifest's directory; "" for the repo root. */
   workspaceDir: string;
+  /** For a dependency range, the declaring manifest's `name`, which the lock's workspace entry must match. */
+  manifestName?: string;
   /** For an override, its full key path from the top of `overrides`. */
   path?: Array<{ name: string; selector: string }>;
   /** For a dependency range, the field it was declared in. */

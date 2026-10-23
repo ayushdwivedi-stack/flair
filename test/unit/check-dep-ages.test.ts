@@ -267,7 +267,7 @@ describe("resolveRangedDeps", () => {
   });
 
   it("prefers the workspace's own resolution over the hoisted one", () => {
-    const deps = collectRangedDeps([{ pkg: { dependencies: { "some-pin": "^1.0.0" } }, path: "packages/ws-a/package.json" }], new Set());
+    const deps = collectRangedDeps([{ pkg: { name: "ws-a", dependencies: { "some-pin": "^1.0.0" } }, path: "packages/ws-a/package.json" }], new Set());
     expect(resolveRangedDeps(deps, lock).resolved[0].version).toBe("2.0.0");
   });
 
@@ -813,6 +813,7 @@ describe("CLI — a real bun.lock: aliases, nested overrides and declaration lin
     ["not-an-object", (lock) => { lock.workspaces = []; }, 'bun.lock "workspaces" must be an object, not an array'],
     ["no-name", (lock) => { delete lock.workspaces["packages/ws-a"].name; }, 'bun.lock workspaces["packages/ws-a"] must have a non-empty string "name"'],
     ["missing-entry", (lock) => { delete lock.workspaces["packages/ws-a"]; }, 'packages/ws-a/package.json dependencies["fixture-dep"] "^2.0.0": bun.lock "workspaces" has no entry for "packages/ws-a"'],
+    ["wrong-name", (lock) => { lock.workspaces["packages/ws-a"].name = "ws-other"; }, 'packages/ws-a/package.json dependencies["fixture-dep"] "^2.0.0": bun.lock workspaces["packages/ws-a"] names "ws-other", but packages/ws-a/package.json names "ws-a"'],
   ];
   for (const [label, corrupt, message] of malformedWorkspaceCases) {
     it(`exits 2 on a real workspace lock whose workspaces map is malformed (${label}), never checking the hoisted copy`, async () => {

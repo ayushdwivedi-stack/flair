@@ -37,6 +37,12 @@
  * `peerDependencies` are NOT checked: peers are resolved from a range by the
  * consumer's install, so an exact-pin check of our declaration does not
  * describe what actually gets installed.
+ *
+ * Trust boundary: the gate reads bun.lock as written and assumes a lock that
+ * `bun install --frozen-lockfile` accepts; the same CI job runs that install,
+ * which refuses a lock that does not match its manifests (measured with bun
+ * 1.3.10: a `workspaces` array, a workspace entry with no `name`, a missing
+ * workspace entry and a wrong workspace `name` each exit 1).
  */
 
 /** Specifiers that name no registry version, so there is no publish date to check. */
@@ -309,6 +315,7 @@ export function collectRangedDeps(pkgs, keepCurrent) {
           declaredIn: path,
           at: `${field}[${JSON.stringify(name)}]`,
           workspaceDir,
+          manifestName: typeof pkg.name === "string" ? pkg.name : undefined,
         });
       }
     }
@@ -529,10 +536,12 @@ function overrideScope(entry, byKey, byName) {
  * Resolve every ranged declaration to the lockfile entries it installs:
  * - a dependency range resolves through its workspace's own entry
  *   (`<workspace name>/<declared name>`) when the lock carries one, else the
- *   hoisted entry (`<declared name>`); an `npm:` alias is installed under its
- *   alias, so it is looked up by the alias. The declaring manifest must have
- *   an entry in the lock's `workspaces` map (lockWorkspaces validates it), or
- *   the range is unresolved;
+ *   hoisted entry (`<declared name>`); a root range through the hoisted entry;
+ *   an `npm:` alias is installed under its alias, so it is looked up by the
+ *   alias. The declaring manifest must have an entry in the lock's
+ *   `workspaces` map (lockWorkspaces validates it), and for a workspace other
+ *   than the root that entry's `name` must be the manifest's, or the range is
+ *   unresolved;
  * - an overrides range covers the copies in its scope (overrideScope).
  * Each entry found must resolve the registry package the declaration names
  * (an alias's target); a different package is unresolved.
@@ -577,7 +586,24 @@ export function resolveRangedDeps(entries, lock) {
         });
         continue;
       }
-      const copy = byKey.get(`${workspace.name}/${entry.name}`) ?? byKey.get(entry.name);
+      // The root's dependencies are installed at the top level, so a root range
+      // resolves through the hoisted entry alone. A workspace's own copies sit
+      // under its name, so the lock's name must be the declaring manifest's:
+      // a wrong name would hide the workspace's copy behind the hoisted one.
+      let copy;
+      if (entry.workspaceDir === "") {
+        copy = byKey.get(entry.name);
+      } else {
+        if (workspace.name !== entry.manifestName) {
+          const declared = entry.manifestName === undefined ? "has no name" : `names ${JSON.stringify(entry.manifestName)}`;
+          unresolved.push({
+            ...where,
+            reason: `bun.lock workspaces[${JSON.stringify(entry.workspaceDir)}] names ${JSON.stringify(workspace.name)}, but ${entry.declaredIn} ${declared}`,
+          });
+          continue;
+        }
+        copy = byKey.get(`${workspace.name}/${entry.name}`) ?? byKey.get(entry.name);
+      }
       if (!copy) {
         unresolved.push({ ...where, reason: `bun.lock has no entry for ${entry.name}` });
         continue;
