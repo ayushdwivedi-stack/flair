@@ -11,10 +11,41 @@ export interface DepEntry {
   declaredIn: string[];
 }
 
-export interface NonExactDep {
+export interface RangedDep {
+  kind: "dependency" | "override";
+  /** The declared key (an `npm:` alias differs from `target`). */
+  name: string;
+  /** The registry package the declaration installs. */
+  target: string;
+  spec: string;
+  declaredIn: string;
+  /** The manifest's directory; "" for the repo root. */
+  workspaceDir: string;
+  /** For a nested override, the enclosing package's name. */
+  parent?: string | null;
+  /** For a dependency range, the field it was declared in. */
+  field?: "dependencies" | "devDependencies" | "optionalDependencies";
+}
+
+export interface ResolvedRange {
+  name: string;
+  version: string;
+  spec: string;
+  declaredIn: string;
+  kind: "dependency" | "override";
+}
+
+export interface UnresolvedRange {
+  kind: "dependency" | "override";
   name: string;
   spec: string;
   declaredIn: string;
+  reason: string;
+}
+
+export interface BunLock {
+  workspaces?: Record<string, { name?: string }>;
+  packages?: Record<string, unknown>;
 }
 
 export interface UnsupportedOverride {
@@ -27,7 +58,7 @@ export interface UnsupportedOverride {
 /** One rule of a manifest's `overrides`, nested rules included. */
 export type OverrideRule =
   | { path: string[]; kind: "exact"; name: string; version: string }
-  | { path: string[]; kind: "range"; name: string; spec: string }
+  | { path: string[]; kind: "range"; name: string; spec: string; target?: string }
   | { path: string[]; kind: "exempt"; name: string; spec: string }
   | { path: string[]; kind: "none"; name: string }
   | { path: string[]; kind: "refused"; reason: string };
@@ -64,13 +95,34 @@ export function collectDeps(
 ): Map<string, DepEntry>;
 
 /**
- * The `dependencies`, `optionalDependencies` and `overrides` entries the
- * bake-time gate does not age-check because they are ranges. The CLI prints
- * them; the gate does not fail on them.
+ * Every ranged declaration the bake-time gate age-checks at its lockfile
+ * resolution: `dependencies`, `devDependencies`, `optionalDependencies` and
+ * `overrides` (nested rules included), from every given manifest.
+ *
+ * Exemptions: `@tpsdev-ai/*` and the keep-current list.
  */
-export function collectNonExactDeps(
+export function collectRangedDeps(
   pkgs: Array<{ pkg: Record<string, unknown>; path: string }>,
-): NonExactDep[];
+  keepCurrent: Set<string>,
+): RangedDep[];
+
+/** Parse bun.lock (JSON with trailing commas); an unparsable lock throws. */
+export function parseBunLockText(text: string): BunLock;
+
+/** Index a parsed lockfile's `packages` by key and by package name. */
+export function lockCopies(lock: BunLock): {
+  byKey: Map<string, { key: string; name: string; prefix: string; version: string }>;
+  byName: Map<string, Array<{ key: string; name: string; prefix: string; version: string }>>;
+};
+
+/**
+ * Resolve every ranged declaration to the lockfile entries it installs. A
+ * declaration with none is returned in `unresolved`.
+ */
+export function resolveRangedDeps(
+  entries: RangedDep[],
+  lock: BunLock,
+): { resolved: ResolvedRange[]; unresolved: UnresolvedRange[] };
 
 export interface UnsupportedDep {
   declaredIn: string;

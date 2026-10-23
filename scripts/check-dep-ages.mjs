@@ -2,9 +2,10 @@
 /**
  * check-dep-ages.mjs — supply-chain bake-time gate.
  *
- * The checked fields are `dependencies`, `optionalDependencies` and
- * `overrides` (root and every workspace package.json). The gate checks exact
- * override declarations, including conditional rules, not installed versions.
+ * The checked fields are `dependencies`, `devDependencies`,
+ * `optionalDependencies` and `overrides` (root and every workspace
+ * package.json). An exact pin is checked at its declared version; a range is
+ * checked at the version bun.lock resolves it to.
  *
  * THIS SCRIPT IS THE CLI ENTRY POINT. It imports the pure gate logic from
  * scripts/lib/check-dep-ages-collect.mjs and always runs the gate.
@@ -40,9 +41,11 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   collectDeps,
-  collectNonExactDeps,
+  collectRangedDeps,
   collectUnsupportedDeps,
   collectUnsupportedOverrides,
+  parseBunLockText,
+  resolveRangedDeps,
 } from "./lib/check-dep-ages-collect.mjs";
 
 const ARGS = process.argv.slice(2);
@@ -160,6 +163,12 @@ function readAllowlist(root) {
 
 // ── Main gate logic (always runs — no main-detection guard) ──────────────────
 
+/** The declaration's own range, for a version the lockfile resolved. */
+function rangeSuffix(entry, declaredIn) {
+  const spec = entry.ranges?.get(declaredIn);
+  return spec === undefined ? "" : ` (range "${spec}")`;
+}
+
 async function main() {
   // The CI gate scans the CHECKED-OUT repository, whatever the environment
   // says. FLAIR_CHECK_DEP_AGES_ROOT exists so tests can point the gate at a
@@ -241,7 +250,61 @@ async function main() {
   }
 
   const toCheck = collectDeps(allPkgs, KEEP_CURRENT);
-  const nonExact = collectNonExactDeps(allPkgs);
+
+  // Ranges are checked at the version bun.lock resolves them to. The lock is
+  // read only when a ranged declaration exists, so a repo with exact pins only
+  // needs no lockfile.
+  const ranged = collectRangedDeps(allPkgs, KEEP_CURRENT);
+  if (ranged.length > 0) {
+    let lockText;
+    try {
+      lockText = readFileSync(join(REPO_ROOT, "bun.lock"), "utf8");
+    } catch (err) {
+      console.error("Cannot read bun.lock, which ranged declarations are age-checked against:");
+      console.error("");
+      for (const r of ranged) {
+        console.error(`    ${r.declaredIn} ${r.name} "${r.spec}"`);
+      }
+      console.error("");
+      console.error(`${err?.message ?? err}`);
+      process.exit(2);
+    }
+    const { resolved, unresolved } = resolveRangedDeps(ranged, parseBunLockText(lockText));
+    // A dependency range with no lock entry means the declared package is not
+    // resolved: fail closed. An overrides rule whose package is not installed
+    // covers no copy, so there is no version to check; name it in the output.
+    const uninstalledOverrides = unresolved.filter((u) => u.kind === "override");
+    const unresolvedDeps = unresolved.filter((u) => u.kind !== "override");
+    if (unresolvedDeps.length > 0) {
+      console.error("Ranged declarations bun.lock does not resolve:");
+      console.error("");
+      for (const u of unresolvedDeps) {
+        console.error(`    ${u.declaredIn} ${u.name} "${u.spec}": ${u.reason}`);
+      }
+      console.error("");
+      console.error("Every ranged entry is age-checked at its resolved version; an entry with no");
+      console.error("lockfile resolution cannot be checked, so the gate fails closed.");
+      process.exit(2);
+    }
+    if (uninstalledOverrides.length > 0) {
+      console.log("Override ranges with no installed copy (nothing to age-check):");
+      for (const u of uninstalledOverrides) {
+        console.log(`    ${u.declaredIn} ${u.name} "${u.spec}"`);
+      }
+      console.log("");
+    }
+    for (const r of resolved) {
+      const key = `${r.name}@${r.version}`;
+      let entry = toCheck.get(key);
+      if (!entry) {
+        entry = { name: r.name, version: r.version, declaredIn: [] };
+        toCheck.set(key, entry);
+      }
+      if (!entry.declaredIn.includes(r.declaredIn)) entry.declaredIn.push(r.declaredIn);
+      if (!entry.ranges) entry.ranges = new Map();
+      entry.ranges.set(r.declaredIn, r.spec);
+    }
+  }
 
   const allowlist = readAllowlist(REPO_ROOT);
   if (allowlist.expired.length > 0) {
@@ -253,14 +316,6 @@ async function main() {
     console.error("");
     console.error("Re-read the reason, then remove the entry or re-date it in a new one.");
     process.exit(2);
-  }
-
-  if (nonExact.length > 0) {
-    console.log("Not age-checked (ranges):");
-    for (const o of nonExact) {
-      console.log(`    ${o.name} "${o.spec}" (declared in ${o.declaredIn})`);
-    }
-    console.log("");
   }
 
   if (toCheck.size === 0) {
@@ -387,14 +442,15 @@ async function main() {
   }
 
   if (exempted.length > 0) {
-    console.log("Exempted fresh pins (dated exemption, see docs/supply-chain-policy.md):");
-    console.log("");
+    console.log("Exempted fresh pins (dated exemption, see docs/supply-chain-policy.md):");    console.log("");
     for (const f of exempted.sort((a, b) => b.publishedAt - a.publishedAt)) {
       const days = f.ageDays.toFixed(1);
       console.log(
-        `    ${f.name}@${f.version}    — published ${days} days ago (policy: >=${MIN_AGE_DAYS} days); exempt until ${f.entry.expires} (${f.entry.ghsa.join(", ")})`,
+        `    ${f.name}@${f.version}    — published ${new Date(f.publishedAt).toISOString().slice(0, 10)} (${days} days ago; policy: >=${MIN_AGE_DAYS} days); exempt until ${f.entry.expires} (${f.entry.ghsa.join(", ")})`,
       );
-      for (const p of f.declaredIn) console.log(`    declared in ${p}`);
+      for (const p of f.declaredIn) {
+        console.log(`    declared in ${p}${rangeSuffix(f, p)}`);
+      }
     }
     console.log("");
   }
@@ -404,8 +460,10 @@ async function main() {
     console.error("");
     for (const f of stillFresh.sort((a, b) => b.publishedAt - a.publishedAt)) {
       const days = f.ageDays.toFixed(1);
-      console.error(`    ${f.name}@${f.version}    — published ${days} days ago (policy: >=${MIN_AGE_DAYS} days)`);
-      for (const p of f.declaredIn) console.error(`    declared in ${p}`);
+      console.error(
+        `    ${f.name}@${f.version}    — published ${new Date(f.publishedAt).toISOString().slice(0, 10)} (${days} days ago; policy: >=${MIN_AGE_DAYS} days)`,
+      );
+      for (const p of f.declaredIn) console.error(`    declared in ${p}${rangeSuffix(f, p)}`);
     }
     console.error(
       "",

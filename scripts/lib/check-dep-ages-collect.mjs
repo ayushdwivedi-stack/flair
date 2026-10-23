@@ -8,20 +8,23 @@
  * Internal `@tpsdev-ai/*` deps are exempt — we publish ourselves and the
  * 0.8.0 / 0.8.1 patch sequence already shipped same-day.
  *
- * This gate checks external, exact-pinned entries in `dependencies`,
+ * This gate checks external entries in `dependencies`, `devDependencies`,
  * `optionalDependencies` AND `overrides` (root and every workspace
- * package.json).
+ * package.json), for exact pins and for ranges.
  * - `dependencies` / `optionalDependencies`: npm and bun install
  *   optionalDependencies by default (a failed install is non-fatal, not
  *   skipped), so they install just like any other dep and represent the same
  *   supply-chain risk. An entry is classified by the same classifier the
  *   override grammar uses (classifyRegistrySpec): an exact version is
- *   age-checked, a range such as `1.x` is not, a form the classifier refuses
- *   fails the gate (collectUnsupportedDeps), and an `npm:` alias is checked
- *   against its target.
+ *   age-checked, a range is age-checked at the version bun.lock resolves it
+ *   to, a form the classifier refuses fails the gate (collectUnsupportedDeps),
+ *   and an `npm:` alias is checked against its target.
+ * - `devDependencies`: ranges are age-checked at their lock resolution, like
+ *   dependencies; exact pins are not age-checked, as before.
  * - `overrides`: exact declarations are age-checked, including conditional
- *   rules; the gate reads declarations, not installed versions. An `npm:`
- *   alias is checked against its target. Nested override objects are read too.
+ *   rules; range declarations are age-checked at every lockfile copy they
+ *   cover. An `npm:` alias is checked against its target. Nested override
+ *   objects are read too.
  *
  * Exemptions, in all three fields: `@tpsdev-ai/*`, the keep-current list,
  * `workspace:`, `file:`/`link:`, `git+`/`github:`.
@@ -122,7 +125,7 @@ function classifyOverrideValue(name, spec) {
     if (!PACKAGE_NAME_RE.test(target)) return refused(`"${spec}" does not alias a registry package`);
     const subClass = sub === "*" ? { kind: "range" } : classifyRegistrySpec(target, sub);
     if (subClass.kind === "exact") return subClass;
-    if (subClass.kind === "range") return { kind: "range", name, spec };
+    if (subClass.kind === "range") return { kind: "range", name, spec, target };
     return refused(`"${spec}": ${subClass.reason}`);
   }
   return classifyRegistrySpec(name, spec);
@@ -142,7 +145,8 @@ const describeType = (v) => (v === null ? "null" : Array.isArray(v) ? "an array"
  * included. Each rule is { path, kind, ... } where `path` is the list of keys
  * from the top of `overrides` and `kind` is one of:
  * - "exact": declares an exact target (an alias reports its target);
- * - "range": `name` is overridden with the range `spec`;
+ * - "range": `name` is overridden with the range `spec` (an `npm:` alias
+ *   carries its target package in `target`);
  * - "exempt": `spec` names no registry version (workspace:, file:, link:, git+, github:);
  * - "none": the rule overrides nothing (a "*" or "" value);
  * - "refused": a form this gate does not support, with a `reason`.
@@ -246,37 +250,189 @@ export function collectDeps(pkgs, keepCurrent) {
 }
 
 /**
- * The `dependencies`, `optionalDependencies` and `overrides` entries the
- * bake-time gate does not age-check because they are ranges. The CLI prints
- * them; the gate does not fail on them. One line per (name, spec, declaredIn).
+ * Every ranged declaration the bake-time gate age-checks through the lockfile:
+ * `dependencies`, `devDependencies` and `optionalDependencies` of every
+ * manifest, and every `overrides` rule, nested rules included. Each entry is
+ * { kind, name, target, spec, declaredIn, workspaceDir } where `name` is the
+ * declared key, `target` the registry package it installs (an `npm:` alias
+ * differs) and `workspaceDir` the manifest's directory ("" for the root).
  *
- * @param pkgs — package objects with paths
- * @returns Array<{ name, spec, declaredIn }>
+ * Exemptions match collectDeps: `@tpsdev-ai/*` and the keep-current list.
+ * `workspace:`, `file:`/`link:` and `git+`/`github:` specifiers are not ranges
+ * and are not collected.
  */
-export function collectNonExactDeps(pkgs) {
-  const gaps = [];
+export function collectRangedDeps(pkgs, keepCurrent) {
+  const out = [];
   const seen = new Set();
-  function add(name, spec, declaredIn) {
-    const key = `${name}\u0000${spec}\u0000${declaredIn}`;
+  function add(entry) {
+    if (entry.target.startsWith("@tpsdev-ai/")) return;
+    if (keepCurrent.has(entry.target) || keepCurrent.has(entry.name)) return;
+    const key = [entry.kind, entry.name, entry.target, entry.spec, entry.declaredIn, entry.parent ?? ""].join("\u0000");
     if (seen.has(key)) return;
     seen.add(key);
-    gaps.push({ name, spec, declaredIn });
+    out.push(entry);
   }
-  function recordDeps(deps, declaredIn) {
-    for (const [name, spec] of Object.entries(deps)) {
-      if (typeof spec !== "string") continue;
-      if (classifyDependencySpec(name, spec).kind === "range") add(name, spec, declaredIn);
-    }
-  }
+  const workspaceDirOf = (path) => (path === "package.json" ? "" : path.replace(/\/package\.json$/, ""));
   for (const { pkg, path } of pkgs) {
-    if (pkg.dependencies) recordDeps(pkg.dependencies, path);
-    if (pkg.optionalDependencies) recordDeps(pkg.optionalDependencies, path);
+    const workspaceDir = workspaceDirOf(path);
+    for (const field of ["dependencies", "devDependencies", "optionalDependencies"]) {
+      const deps = pkg[field];
+      if (!isPlainObject(deps)) continue;
+      for (const [name, spec] of Object.entries(deps)) {
+        if (typeof spec !== "string") continue;
+        const classified = classifyDependencySpec(name, spec);
+        if (classified.kind !== "range") continue;
+        add({
+          kind: "dependency",
+          field,
+          name,
+          target: classified.target ?? name,
+          spec,
+          declaredIn: path,
+          workspaceDir,
+        });
+      }
+    }
     if (pkg.overrides === undefined) continue;
     for (const rule of classifyOverrides(pkg.overrides)) {
-      if (rule.kind === "range") add(rule.name, rule.spec, path);
+      if (rule.kind !== "range") continue;
+      // A nested rule applies to copies under its enclosing package; the
+      // parent key may carry a selector, so resolve it to the package name.
+      const parentKey = rule.path.length > 1 ? rule.path[rule.path.length - 2] : null;
+      const parent = parentKey === null ? null : parseOverrideKey(parentKey);
+      add({
+        kind: "override",
+        name: rule.name,
+        target: rule.target ?? rule.name,
+        spec: rule.spec,
+        declaredIn: path,
+        workspaceDir,
+        parent: parent ? parent.name : null,
+      });
     }
   }
-  return gaps;
+  return out;
+}
+
+/**
+ * bun.lock is JSON with trailing commas (the text lockfile Bun writes). Parse
+ * it; an unparsable lock is an error, never an empty tree.
+ */
+export function parseBunLockText(text) {
+  try {
+    return JSON.parse(text.replace(/,(\s*[}\]])/g, "$1"));
+  } catch (err) {
+    throw new Error(`bun.lock is not parsable: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * The package name a lock `packages` key resolves, and the path of parent
+ * packages it is nested under. A key is a path of package names, so a scoped
+ * package takes the last two segments (`@scope/name`) and its parents the
+ * rest.
+ */
+function splitLockKey(key) {
+  const parts = key.split("/");
+  const last = parts[parts.length - 1];
+  if (!last) return null;
+  const scoped = parts.length >= 2 && parts[parts.length - 2].startsWith("@");
+  const name = scoped ? `${parts[parts.length - 2]}/${last}` : last;
+  const prefix = parts.slice(0, scoped ? parts.length - 2 : parts.length - 1).join("/");
+  return { name, prefix };
+}
+
+/** The version in a lock entry's `name@version` spec, or null. */
+function lockEntryVersion(entry) {
+  if (!Array.isArray(entry) || typeof entry[0] !== "string") return null;
+  const at = entry[0].lastIndexOf("@");
+  return at > 0 ? entry[0].slice(at + 1) || null : null;
+}
+
+/** Index a parsed lockfile's `packages` by key and by package name. */
+export function lockCopies(lock) {
+  const byKey = new Map();
+  const byName = new Map();
+  const packages = lock?.packages ?? {};
+  if (!isPlainObject(packages)) return { byKey, byName };
+  for (const [key, entry] of Object.entries(packages)) {
+    const version = lockEntryVersion(entry);
+    const split = splitLockKey(key);
+    if (version === null || split === null) continue;
+    const copy = { key, name: split.name, prefix: split.prefix, version };
+    byKey.set(key, copy);
+    if (!byName.has(copy.name)) byName.set(copy.name, []);
+    byName.get(copy.name).push(copy);
+  }
+  return { byKey, byName };
+}
+
+/**
+ * Resolve every ranged declaration to the lockfile entries it installs:
+ * - a dependency range resolves through its workspace's own entry
+ *   (`<workspace name>/<package>`) when the lock carries one, else the hoisted
+ *   entry (`<package>`);
+ * - an overrides range covers every copy of the package in the lock, since an
+ *   override applies to each of them. A nested rule is limited to copies under
+ *   its enclosing package when the lock has such copies.
+ *
+ * Every declaration with no entry is returned in `unresolved` (the CLI fails
+ * closed on a dependency with none, and names an overrides rule whose package
+ * is not installed), never silently skipped.
+ *
+ * @returns {{ resolved: Array<{name, version, spec, declaredIn}>, unresolved: Array<{name, spec, declaredIn, reason}> }}
+ */
+export function resolveRangedDeps(entries, lock) {
+  const { byKey, byName } = lockCopies(lock);
+  const workspaces = isPlainObject(lock?.workspaces) ? lock.workspaces : {};
+  const resolved = [];
+  const unresolved = [];
+  const seen = new Set();
+  for (const entry of entries) {
+    let copies = [];
+    if (entry.kind === "override") {
+      const all = byName.get(entry.target) ?? [];
+      if (entry.parent) {
+        copies = all.filter((c) => c.prefix === entry.parent || c.prefix.endsWith(`/${entry.parent}`));
+        if (copies.length === 0) copies = all;
+      } else {
+        copies = all;
+      }
+    } else {
+      const workspaceName = workspaces[entry.workspaceDir]?.name;
+      if (typeof workspaceName === "string" && workspaceName !== "") {
+        const own = byKey.get(`${workspaceName}/${entry.target}`);
+        if (own) copies = [own];
+      }
+      if (copies.length === 0) {
+        const hoisted = byKey.get(entry.target);
+        if (hoisted) copies = [hoisted];
+      }
+    }
+    if (copies.length === 0) {
+      unresolved.push({
+        kind: entry.kind,
+        name: entry.name,
+        spec: entry.spec,
+        declaredIn: entry.declaredIn,
+        reason: `bun.lock has no entry for ${entry.target}`,
+      });
+      continue;
+    }
+    for (const copy of copies) {
+      const key = [entry.target, copy.version, entry.spec, entry.declaredIn, entry.kind].join("\u0000");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      resolved.push({
+        name: entry.target,
+        version: copy.version,
+        spec: entry.spec,
+        declaredIn: entry.declaredIn,
+        kind: entry.kind,
+      });
+    }
+  }
+  return { resolved, unresolved };
 }
 
 /**
