@@ -397,20 +397,53 @@ function lockEntryDependencyNames(entry, version, workspaces) {
   return names;
 }
 
+/** A lock `workspaces` key: "" (the root) or a relative path with no empty, "." or ".." segment. */
+function isWorkspacePath(key) {
+  if (key === "") return true;
+  if (key.startsWith("/") || key.includes("\\")) return false;
+  return key.split("/").every((segment) => segment !== "" && segment !== "." && segment !== "..");
+}
+
+/**
+ * The lock's `workspaces` map, validated: an object whose keys are workspace
+ * paths and whose values are objects with a non-empty string `name` and, when
+ * present, object `dependencies`, `devDependencies`, `optionalDependencies`
+ * and `peerDependencies`. Anything else throws, so a workspace's resolution
+ * never falls back to a hoisted copy on a map the gate cannot read.
+ */
+export function lockWorkspaces(lock) {
+  const workspaces = lock?.workspaces;
+  if (workspaces === undefined) throw new Error(`bun.lock has no "workspaces" object`);
+  if (!isPlainObject(workspaces)) throw new Error(`bun.lock "workspaces" must be an object, not ${describeType(workspaces)}`);
+  for (const [key, workspace] of Object.entries(workspaces)) {
+    const where = `bun.lock workspaces[${JSON.stringify(key)}]`;
+    if (!isWorkspacePath(key)) throw new Error(`${where}: the key is not a relative workspace path`);
+    if (!isPlainObject(workspace)) throw new Error(`${where} must be an object, not ${describeType(workspace)}`);
+    if (typeof workspace.name !== "string" || workspace.name === "") throw new Error(`${where} must have a non-empty string "name"`);
+    for (const field of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
+      if (workspace[field] !== undefined && !isPlainObject(workspace[field])) {
+        throw new Error(`${where}.${field} must be an object, not ${describeType(workspace[field])}`);
+      }
+    }
+  }
+  return workspaces;
+}
+
 /**
  * Index a parsed lockfile's `packages` by key and by installed name. Each copy
  * is { key, name, segments, registryName, version, dependencies } where `name`
  * is the name it is installed under (the last key segment), `registryName` the
  * package its entry resolves (an `npm:` alias differs) and `dependencies` the
  * dependency names it declares (null when the lock does not record them).
+ * An unreadable `packages` map or entry, or `workspaces` map, throws.
  */
 export function lockCopies(lock) {
   const byKey = new Map();
   const byName = new Map();
   const packages = lock?.packages;
-  const workspaces = isPlainObject(lock?.workspaces) ? lock.workspaces : {};
   // A copy the gate cannot read could be one a range covers: refuse, never skip it.
   if (!isPlainObject(packages)) throw new Error(`bun.lock "packages" must be an object, not ${describeType(packages)}`);
+  const workspaces = lockWorkspaces(lock);
   for (const [key, entry] of Object.entries(packages)) {
     const resolution = lockEntryResolution(entry);
     const segments = lockKeySegments(key);
@@ -497,7 +530,9 @@ function overrideScope(entry, byKey, byName) {
  * - a dependency range resolves through its workspace's own entry
  *   (`<workspace name>/<declared name>`) when the lock carries one, else the
  *   hoisted entry (`<declared name>`); an `npm:` alias is installed under its
- *   alias, so it is looked up by the alias;
+ *   alias, so it is looked up by the alias. The declaring manifest must have
+ *   an entry in the lock's `workspaces` map (lockWorkspaces validates it), or
+ *   the range is unresolved;
  * - an overrides range covers the copies in its scope (overrideScope).
  * Each entry found must resolve the registry package the declaration names
  * (an alias's target); a different package is unresolved.
@@ -511,7 +546,7 @@ function overrideScope(entry, byKey, byName) {
  */
 export function resolveRangedDeps(entries, lock) {
   const { byKey, byName } = lockCopies(lock);
-  const workspaces = isPlainObject(lock?.workspaces) ? lock.workspaces : {};
+  const workspaces = lockWorkspaces(lock);
   const resolved = [];
   const unresolved = [];
   const uninstalled = [];
@@ -531,11 +566,18 @@ export function resolveRangedDeps(entries, lock) {
       }
       copies = scope.copies;
     } else {
-      const workspaceName = workspaces[entry.workspaceDir]?.name;
-      const own = typeof workspaceName === "string" && workspaceName !== ""
-        ? byKey.get(`${workspaceName}/${entry.name}`)
-        : undefined;
-      const copy = own ?? byKey.get(entry.name);
+      // The manifest declaring this range must be a workspace the lock
+      // records; without its name the gate cannot find the workspace's own
+      // copy, and the hoisted one may be a different version.
+      const workspace = Object.hasOwn(workspaces, entry.workspaceDir) ? workspaces[entry.workspaceDir] : undefined;
+      if (workspace === undefined) {
+        unresolved.push({
+          ...where,
+          reason: `bun.lock "workspaces" has no entry for ${JSON.stringify(entry.workspaceDir)}, the manifest that declares this range`,
+        });
+        continue;
+      }
+      const copy = byKey.get(`${workspace.name}/${entry.name}`) ?? byKey.get(entry.name);
       if (!copy) {
         unresolved.push({ ...where, reason: `bun.lock has no entry for ${entry.name}` });
         continue;

@@ -336,8 +336,26 @@ describe("resolveRangedDeps", () => {
   it("refuses an unreadable packages map or lock entry instead of skipping it", () => {
     const deps = collectRangedDeps([{ pkg: { overrides: { "some-pin": "^1.0.0" } }, path: "package.json" }], new Set());
     expect(() => resolveRangedDeps(deps, { packages: [] } as never)).toThrow('bun.lock "packages" must be an object, not an array');
-    expect(() => resolveRangedDeps(deps, { packages: { "some-pin": ["some-pin"] } })).toThrow(
+    expect(() => resolveRangedDeps(deps, { workspaces: { "": { name: "root-ws" } }, packages: { "some-pin": ["some-pin"] } })).toThrow(
       'bun.lock packages["some-pin"] does not name a package and version',
+    );
+  });
+
+  it("refuses a workspaces map it cannot read: not an object, a bad key, a missing name, a non-object field", () => {
+    const deps = collectRangedDeps([{ pkg: { dependencies: { "some-pin": "^1.0.0" } }, path: "package.json" }], new Set());
+    const withWorkspaces = (workspaces: unknown) => ({ workspaces, packages: { "some-pin": ["some-pin@1.2.3", "", {}, "sha512-x"] } }) as never;
+    expect(() => resolveRangedDeps(deps, withWorkspaces(undefined))).toThrow('bun.lock has no "workspaces" object');
+    expect(() => resolveRangedDeps(deps, withWorkspaces("root-ws"))).toThrow('bun.lock "workspaces" must be an object, not a string');
+    expect(() => resolveRangedDeps(deps, withWorkspaces({ "": { name: "root-ws" }, "/abs/ws": { name: "ws" } }))).toThrow(
+      'bun.lock workspaces["/abs/ws"]: the key is not a relative workspace path',
+    );
+    expect(() => resolveRangedDeps(deps, withWorkspaces({ "": { name: "root-ws" }, "packages/../ws": { name: "ws" } }))).toThrow(
+      'bun.lock workspaces["packages/../ws"]: the key is not a relative workspace path',
+    );
+    expect(() => resolveRangedDeps(deps, withWorkspaces({ "": "root-ws" }))).toThrow('bun.lock workspaces[""] must be an object, not a string');
+    expect(() => resolveRangedDeps(deps, withWorkspaces({ "": { name: "" } }))).toThrow('bun.lock workspaces[""] must have a non-empty string "name"');
+    expect(() => resolveRangedDeps(deps, withWorkspaces({ "": { name: "root-ws", dependencies: [] } }))).toThrow(
+      'bun.lock workspaces[""].dependencies must be an object, not an array',
     );
   });
 
@@ -435,15 +453,18 @@ function writeLock(root: string, lock: Record<string, unknown>): void {
   if (!existsSync(join(root, "bun.lock"))) setupFailure(`fixture bun.lock not written under ${root}`);
 }
 
-/** A lockfile whose `packages` map is one entry per `{ key: version }`, each resolving the key's own package. */
-function lockWithPackages(versions: Record<string, string>, workspaces?: Record<string, unknown>) {
+/**
+ * A lockfile whose `packages` map is one entry per `{ key: version }`, each
+ * resolving the key's own package; `workspaces` defaults to the root alone.
+ */
+function lockWithPackages(versions: Record<string, string>, workspaces: Record<string, unknown> = { "": { name: "dep-ages-fixture" } }) {
   const packages: Record<string, unknown> = {};
   for (const [key, version] of Object.entries(versions)) {
     const parts = key.split("/");
     const name = parts.length > 1 && parts[parts.length - 2].startsWith("@") ? parts.slice(-2).join("/") : parts[parts.length - 1];
     packages[key] = [`${name}@${version}`, "", {}, "sha512-fixture"];
   }
-  return workspaces === undefined ? { packages } : { workspaces, packages };
+  return { workspaces, packages };
 }
 
 /** Write the gate's dated exemption allowlist under a fixture root's .github/. */
@@ -764,6 +785,52 @@ describe("CLI — a real bun.lock: aliases, nested overrides and declaration lin
       registry.stop();
     }
   }, 60_000);
+
+  // The same real workspace lock, then a malformed `workspaces` map. The
+  // hoisted copy (1.0.5) is old and the workspace's own (2.0.5) is fresh, so
+  // a fallback to the hoisted copy would pass: the gate must refuse instead.
+  async function writeMalformedWorkspaceLock(label: string, corrupt: (lock: Record<string, any>) => void) {
+    const root = join(scratch, `real-lock-workspace-${label}`);
+    mkdirSync(join(root, "packages", "ws-a"), { recursive: true });
+    writeFileSync(join(root, "packages", "ws-a", "package.json"), JSON.stringify({
+      name: "ws-a",
+      version: "0.0.0",
+      dependencies: { [FIXTURE_DEP]: "^2.0.0" },
+    }));
+    const lock = await bunGeneratedLock(root, {
+      name: "dep-ages-workspace-lock-fixture",
+      version: "0.0.0",
+      workspaces: ["packages/*"],
+      dependencies: { [FIXTURE_DEP]: "^1.0.0" },
+    }, { [FIXTURE_DEP]: { "1.0.0": {}, "1.0.5": {}, "2.0.0": {}, "2.0.5": {} } });
+    expect(lockResolutions(lock)).toMatchObject({ [`ws-a/${FIXTURE_DEP}`]: `${FIXTURE_DEP}@2.0.5` });
+    corrupt(lock as Record<string, any>);
+    writeLock(root, lock as Record<string, unknown>);
+    return root;
+  }
+
+  const malformedWorkspaceCases: Array<[string, (lock: Record<string, any>) => void, string]> = [
+    ["not-an-object", (lock) => { lock.workspaces = []; }, 'bun.lock "workspaces" must be an object, not an array'],
+    ["no-name", (lock) => { delete lock.workspaces["packages/ws-a"].name; }, 'bun.lock workspaces["packages/ws-a"] must have a non-empty string "name"'],
+    ["missing-entry", (lock) => { delete lock.workspaces["packages/ws-a"]; }, 'packages/ws-a/package.json dependencies["fixture-dep"] "^2.0.0": bun.lock "workspaces" has no entry for "packages/ws-a"'],
+  ];
+  for (const [label, corrupt, message] of malformedWorkspaceCases) {
+    it(`exits 2 on a real workspace lock whose workspaces map is malformed (${label}), never checking the hoisted copy`, async () => {
+      const root = await writeMalformedWorkspaceLock(label, corrupt);
+      const registry = registryWithTimes({ "1.0.5": OLD_TIME, "2.0.5": FRESH_TIME });
+      try {
+        const { exitCode, output } = await runGate(CLI_SCRIPT, {
+          FLAIR_CHECK_DEP_AGES_ROOT: root,
+          FLAIR_NPM_REGISTRY: registry.url,
+        });
+        expect(output).toContain(message);
+        expect(registry.requests).toEqual([]);
+        expect(exitCode).toBe(2);
+      } finally {
+        registry.stop();
+      }
+    }, 60_000);
+  }
 
   // "harper" is on the default keep-current list; the alias installs a
   // different, unlisted package under that name, so it is checked.

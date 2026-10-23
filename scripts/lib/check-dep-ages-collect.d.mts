@@ -135,7 +135,14 @@ export function collectRangedDeps(
 /** Parse bun.lock (JSON with trailing commas); an unparsable lock throws. */
 export function parseBunLockText(text: string): BunLock;
 
-/** Index a parsed lockfile's `packages` by key and by installed name. */
+/**
+ * The lock's `workspaces` map, validated: an object whose keys are workspace
+ * paths ("" or a relative path) and whose values are objects with a non-empty
+ * string `name` and object dependency fields when present. Anything else throws.
+ */
+export function lockWorkspaces(lock: BunLock): Record<string, { name: string }>;
+
+/** Index a parsed lockfile's `packages` by key and by installed name; an unreadable lock throws. */
 export function lockCopies(lock: BunLock): {
   byKey: Map<string, LockCopy>;
   byName: Map<string, LockCopy[]>;
@@ -143,8 +150,10 @@ export function lockCopies(lock: BunLock): {
 
 /**
  * Resolve every ranged declaration to the lockfile entries it installs. A
- * declaration the gate cannot resolve is returned in `unresolved`; an
- * overrides range with no installed copy in its scope in `uninstalled`.
+ * declaration the gate cannot resolve (including a dependency range whose
+ * manifest has no entry in the lock's `workspaces`) is returned in
+ * `unresolved`; an overrides range with no installed copy in its scope in
+ * `uninstalled`.
  */
 export function resolveRangedDeps(
   entries: RangedDep[],
