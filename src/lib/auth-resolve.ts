@@ -91,19 +91,21 @@ import { resolveHome } from "./home.js";
  *     `authedRequest` uses to decide whether tier 5 (the floor) applies.
  *   - `body` (flair#2764): the response body for display, set by
  *     `fromResponse` (`displayBody`): a JSON body re-serialized with every
- *     string in it redacted after decoding, any other body redacted as text,
- *     with the credential values the request sent. The message's reason is
+ *     string in it redacted after decoding, or withheld when it cannot be;
+ *     any other body redacted as text, with the credential values the request
+ *     sent. The message's reason is
  *     built from the unredacted text and redacted (`describeHttpFailure`); its
  *     `HTTP <status>` prefix is not passed through redaction.
  *     Classifiers read the unredacted text through `apiErrorRawBody`; the rem
  *     formatters that derive display text from it pass that text through
- *     `boundErrorText`, which redacts. In each redacted part a credential value
- *     becomes `[redacted]`, or nothing where `[redacted]` itself holds a sent
- *     value, and the part holds no occurrence credentialIntervals finds.
- * Scope: redaction covers a response that repeats the request's credential
- * values literally, inside any JSON string (whatever escaping the JSON uses),
- * or percent-encoded (either hex case). A server that transforms a credential
- * some other way is not covered; that server already received the credential.
+ *     `boundErrorText`, which redacts. A credential value in the server's text
+ *     becomes `[redacted]`.
+ * Scope: redaction removes the request's credential values from the text the
+ * server supplied (literal, inside any JSON string, percent-encoded); text the
+ * CLI writes itself (the `HTTP <status>: ` prefix, the debug line's labels, a
+ * caller's `Error: ` prefix) is never altered, so a credential that matches the
+ * CLI's own wording, or matches only once that wording is joined to the
+ * server's text, is not covered.
  */
 export class ApiHttpError extends Error {
   readonly status: number;
@@ -144,7 +146,7 @@ export class ApiHttpError extends Error {
  */
 const privateText = new WeakMap<ApiHttpError, { raw: string; sentValues: readonly string[] }>();
 
-/** What a credential value the request sent becomes in output, unless this text itself holds a sent value. */
+/** What a credential value the request sent becomes in the server's text as displayed. */
 export const REDACTED_CREDENTIAL = "[redacted]";
 
 /**
@@ -267,68 +269,64 @@ function credentialIntervals(text: string, sentValues: readonly string[]): Array
   return merged;
 }
 
-/** The most redaction passes redactSentCredentials makes before it gives up on a text. */
-const MAX_REDACTION_PASSES = 4;
+/** `text` with each interval replaced by `marker`. */
+function replaceIntervals(text: string, intervals: Array<[number, number]>, marker: string): string {
+  if (intervals.length === 0) return text;
+  let out = "";
+  let at = 0;
+  for (const [start, end] of intervals) {
+    out += text.slice(at, start) + marker;
+    at = end;
+  }
+  return out + text.slice(at);
+}
 
 /** `text` when credentialIntervals finds no sent value in it, else `fallback` (flair#2764). */
-function withoutOccurrence(text: string, sentValues: readonly string[], fallback = ""): string {
+function withoutOccurrence(text: string, sentValues: readonly string[], fallback: string): string {
   return credentialIntervals(text, sentValues).length === 0 ? text : fallback;
 }
 
 /**
- * `text` with each merged interval of credentialIntervals replaced once by a
- * marker (flair#2764): REDACTED_CREDENTIAL, or nothing when that marker itself
- * holds a sent value. A replacement can join the text around it into a new
- * occurrence, so the pass repeats until credentialIntervals finds none, at most
- * MAX_REDACTION_PASSES times; a text that still holds one is returned as "".
- * The result therefore holds no occurrence credentialIntervals finds. The
- * message's reason, `body`, the FLAIR_DEBUG line's path and body, and the text
- * boundErrorText returns are built with it; the scope is the one on
- * ApiHttpError.
+ * Server-supplied `text` with each merged interval of credentialIntervals
+ * replaced once by REDACTED_CREDENTIAL (flair#2764), in one pass: the server's
+ * text left in the result holds no occurrence credentialIntervals finds. The
+ * marker, and anything the CLI writes around the result, is not checked. The
+ * scope is the one on ApiHttpError.
  */
 export function redactSentCredentials(text: string, sentValues: readonly string[]): string {
-  const marker = withoutOccurrence(REDACTED_CREDENTIAL, sentValues);
-  let current = text;
-  for (let pass = 0; pass < MAX_REDACTION_PASSES; pass++) {
-    const merged = credentialIntervals(current, sentValues);
-    if (merged.length === 0) return current;
-    let out = "";
-    let at = 0;
-    for (const [start, end] of merged) {
-      out += current.slice(at, start) + marker;
-      at = end;
-    }
-    current = out + current.slice(at);
-  }
-  return withoutOccurrence(current, sentValues);
+  return replaceIntervals(text, credentialIntervals(text, sentValues), REDACTED_CREDENTIAL);
 }
 
-/** A parsed JSON value with every string in it, object keys included, redacted (flair#2764). */
-function redactJsonStrings(value: unknown, sentValues: readonly string[]): unknown {
+/**
+ * A parsed JSON value with every string in it, object keys included, redacted,
+ * and every number, boolean or null whose JSON text holds a sent value replaced
+ * by the string REDACTED_CREDENTIAL (flair#2764).
+ */
+function redactJsonValues(value: unknown, sentValues: readonly string[]): unknown {
   if (typeof value === "string") return redactSentCredentials(value, sentValues);
-  if (Array.isArray(value)) return value.map((item) => redactJsonStrings(item, sentValues));
+  if (Array.isArray(value)) return value.map((item) => redactJsonValues(item, sentValues));
   if (value && typeof value === "object") {
     const out: Record<string, unknown> = Object.create(null);
     for (const [key, item] of Object.entries(value)) {
-      out[redactSentCredentials(key, sentValues)] = redactJsonStrings(item, sentValues);
+      out[redactSentCredentials(key, sentValues)] = redactJsonValues(item, sentValues);
     }
     return out;
   }
-  return value;
+  return credentialIntervals(JSON.stringify(value), sentValues).length === 0 ? value : REDACTED_CREDENTIAL;
 }
 
 /** What displayBody shows for a body it cannot show: see displayBody. */
 export const BODY_WITHHELD = "[body withheld]";
 
 /**
- * A response body for display (flair#2764). A body that parses as JSON is
- * shown re-serialized (JSON.stringify), every string in it, keys included,
- * redacted after JSON decoding; a body that is not JSON (JSON.parse throws a
- * SyntaxError) is shown as received. Either way the result is redacted as text
- * as its last step. When parsing fails any other way (for example a nesting
- * too deep to parse), or the redaction or re-serialization of parsed JSON
- * fails, the body is shown as BODY_WITHHELD, or as "" when that text holds a
- * sent value.
+ * A response body for display (flair#2764). A body JSON.parse rejects with a
+ * SyntaxError (not JSON) is shown as received, redacted as text. A JSON body
+ * is shown re-serialized, with every string in it (keys included) redacted
+ * after JSON decoding and any other value whose JSON text holds a sent value
+ * replaced; or as BODY_WITHHELD when it cannot be: when parsing fails any
+ * other way (for example a nesting too deep to parse), when its redaction or
+ * re-serialization fails, or when the re-serialized JSON still holds a sent
+ * value (for example a value that occurs in JSON syntax).
  */
 function displayBody(body: string, sentValues: readonly string[]): string {
   let parsed: unknown;
@@ -336,12 +334,12 @@ function displayBody(body: string, sentValues: readonly string[]): string {
     parsed = JSON.parse(body);
   } catch (err) {
     if (err instanceof SyntaxError) return redactSentCredentials(body, sentValues);
-    return withoutOccurrence(BODY_WITHHELD, sentValues);
+    return BODY_WITHHELD;
   }
   try {
-    return redactSentCredentials(JSON.stringify(redactJsonStrings(parsed, sentValues)), sentValues);
+    return withoutOccurrence(JSON.stringify(redactJsonValues(parsed, sentValues)), sentValues, BODY_WITHHELD);
   } catch {
-    return withoutOccurrence(BODY_WITHHELD, sentValues);
+    return BODY_WITHHELD;
   }
 }
 
@@ -354,16 +352,16 @@ const CONTROL_CHARACTER = /[\u0000-\u001F\u007F-\u009F\u2028\u2029]/;
 /**
  * A request path for display (flair#2764): percent-decoded, then redacted.
  * PATH_WITHHELD when it does not decode or the decoded path holds a
- * CONTROL_CHARACTER, or "" when PATH_WITHHELD itself holds a sent value.
+ * CONTROL_CHARACTER.
  */
 function displayPath(path: string, sentValues: readonly string[]): string {
   let decoded: string;
   try {
     decoded = decodeURIComponent(path);
   } catch {
-    return withoutOccurrence(PATH_WITHHELD, sentValues);
+    return PATH_WITHHELD;
   }
-  if (CONTROL_CHARACTER.test(decoded)) return withoutOccurrence(PATH_WITHHELD, sentValues);
+  if (CONTROL_CHARACTER.test(decoded)) return PATH_WITHHELD;
   return redactSentCredentials(decoded, sentValues);
 }
 
@@ -405,25 +403,49 @@ export function boundServerText(text: string): string {
 }
 
 /**
- * The first SERVER_TEXT_MAX_CHARS characters of `line`, or fewer so that the
- * cut does not fall inside a %XX or JSON string escape that credentialIntervals
- * decodes (viewUnit), with trailing whitespace trimmed; null when `line` is not
- * longer than SERVER_TEXT_MAX_CHARS characters (flair#2764).
+ * A private-use character no value in `sentValues` contains, standing in for
+ * REDACTED_CREDENTIAL while boundAndRedact works: line-making leaves it alone
+ * and no sent value can match it, so the second pass does not alter the marker.
+ * The private-use ranges hold over 137,000 characters, more than an
+ * Authorization header the transport sends can contain; were none free, the
+ * marker itself would stand in.
  */
-function keptBeforeCut(line: string): string | null {
+function standInFor(sentValues: readonly string[]): string {
+  for (const [first, last] of [[0xe000, 0xf8ff], [0xf0000, 0xffffd], [0x100000, 0x10fffd]]) {
+    for (let cp = first; cp <= last; cp++) {
+      const ch = String.fromCodePoint(cp);
+      if (!sentValues.some((value) => value.includes(ch))) return ch;
+    }
+  }
+  return REDACTED_CREDENTIAL;
+}
+
+/**
+ * The text of `line` (holding stand-ins `standIn`, each displayed as
+ * REDACTED_CREDENTIAL) that fits SERVER_TEXT_MAX_CHARS displayed characters,
+ * ending before a stand-in that does not fit and never inside a %XX or JSON
+ * string escape credentialIntervals decodes (viewUnit), with trailing
+ * whitespace trimmed; null when all of `line` fits (flair#2764).
+ */
+function keptBeforeCut(line: string, standIn: string): string | null {
   let count = 0;
   let index = 0;
+  let cut = -1;
   for (const ch of line) {
-    if (count === SERVER_TEXT_MAX_CHARS) break;
-    count++;
+    const width = ch === standIn ? REDACTED_CREDENTIAL.length : 1;
+    if (count + width > SERVER_TEXT_MAX_CHARS) {
+      cut = index;
+      break;
+    }
+    count += width;
     index += ch.length;
   }
-  if (index >= line.length) return null;
-  let boundary = index;
+  if (cut === -1) return null;
+  let boundary = cut;
   if (line.includes("%") || line.includes("\\")) {
-    for (let i = 0; i < index; ) {
+    for (let i = 0; i < cut; ) {
       const width = viewUnit(line, i).width;
-      if (i + width > index) {
+      if (i + width > cut) {
         boundary = i;
         break;
       }
@@ -434,41 +456,36 @@ function keptBeforeCut(line: string): string | null {
 }
 
 /**
- * boundServerText for output, with `sentValues` redacted (flair#2764), in this
- * order: redact, make one line, redact, then cut. The first pass catches a
- * credential before line-making can change it (a whitespace run collapsed, a
- * control character removed); the second catches one that line-making forms.
- * After it the line holds no occurrence that credentialIntervals finds. The cut
- * (keptBeforeCut) ends between view units, so the kept text holds none either;
- * it is checked, and replaced by "" if it does. The "..." the cut appends is
- * never passed through redaction: where it would complete an occurrence, the
- * kept text is shortened to end before that occurrence, and where "..." alone
- * would be one, the cut text ends without it.
+ * boundServerText for output, with `sentValues` redacted from the server's
+ * text (flair#2764). Order: redact, make one line, redact again, cut. Each
+ * occurrence is replaced by a stand-in character (standInFor) while this
+ * works; the first pass catches a credential before line-making can change it
+ * (a whitespace run collapsed, a control character removed), and the second
+ * catches one that line-making forms. The cut (keptBeforeCut) counts each
+ * stand-in as the marker's length and falls between view units, so it splits
+ * neither the marker nor an occurrence; then the stand-ins become
+ * REDACTED_CREDENTIAL and "..." is appended to a cut text. Neither the marker
+ * nor "..." is passed through redaction.
  */
 function boundAndRedact(text: string, sentValues: readonly string[]): string {
   if (sentValues.length === 0) return boundServerText(text);
-  const line = redactSentCredentials(oneLine(redactSentCredentials(text, sentValues)), sentValues);
-  const cutText = keptBeforeCut(line);
-  if (cutText === null) return line;
-  let kept = withoutOccurrence(cutText, sentValues);
-  for (;;) {
-    const marked = `${kept}...`;
-    const reach = credentialIntervals(marked, sentValues).filter(([, end]) => end > kept.length);
-    if (reach.length === 0) return marked;
-    const start = Math.min(...reach.map(([from]) => from));
-    if (start >= kept.length) return kept;
-    kept = kept.slice(0, start).trimEnd();
-  }
+  const standIn = standInFor(sentValues);
+  let line = oneLine(replaceIntervals(text, credentialIntervals(text, sentValues), standIn));
+  line = replaceIntervals(line, credentialIntervals(line, sentValues), standIn);
+  const shown = (t: string) => t.split(standIn).join(REDACTED_CREDENTIAL);
+  const kept = keptBeforeCut(line, standIn);
+  return kept === null ? shown(line) : `${shown(kept)}...`;
 }
 
 /**
  * The message of an ApiHttpError built from a response body (flair#2764):
  * `HTTP <status>`, then the body's named error when the body is a JSON object
  * with an `error`, else `code`, else `message` string that is non-empty once
- * bounded; otherwise an excerpt of the body as displayBody shows it. The named
- * error is read from the unredacted body; either reason goes through
- * boundAndRedact with `sentValues`. The `HTTP <status>` prefix is written by
- * this function and is not passed through redaction.
+ * bounded; otherwise an excerpt of the body, or BODY_WITHHELD when displayBody
+ * withholds the body. The named error and the excerpt are read from the
+ * unredacted body and go through boundAndRedact with `sentValues`. The
+ * `HTTP <status>` prefix and BODY_WITHHELD are written by this function and
+ * are not passed through redaction.
  */
 export function describeHttpFailure(status: number, body: string, sentValues: readonly string[] = []): string {
   let reason = "";
@@ -485,7 +502,9 @@ export function describeHttpFailure(status: number, body: string, sentValues: re
       if (reason) break;
     }
   }
-  if (!reason) reason = boundAndRedact(displayBody(body, sentValues), sentValues);
+  if (!reason) {
+    reason = displayBody(body, sentValues) === BODY_WITHHELD ? BODY_WITHHELD : boundAndRedact(body, sentValues);
+  }
   return reason ? `HTTP ${status}: ${reason}` : `HTTP ${status}`;
 }
 
@@ -512,8 +531,8 @@ export function apiErrorRawBody(err: unknown): string | undefined {
 
 /**
  * `text` (taken from apiErrorRawBody) as one bounded line for output, with
- * the credential values `err`'s request sent redacted (boundAndRedact, within
- * the scope on ApiHttpError). For an error that has none,
+ * the credential values `err`'s request sent redacted from it (boundAndRedact,
+ * within the scope on ApiHttpError). For an error that has none,
  * boundServerText(text) (flair#2764).
  */
 export function boundErrorText(err: unknown, text: string): string {
@@ -525,13 +544,13 @@ export function boundErrorText(err: unknown, text: string): string {
  * With FLAIR_DEBUG set (any non-empty value), write a failed response's body
  * to stderr as one JSON string (flair#2764). The path is shown by displayPath
  * (percent-decoded, then redacted, or withheld) and the body by displayBody (a
- * JSON body re-serialized), each redacted within the scope on ApiHttpError;
- * the method and status are written by this function. In the JSON-encoded body,
- * DEL, C1 control characters and the Unicode line and paragraph separators are
- * escaped as well, so the line holds no CONTROL_CHARACTER but its final
- * newline. The JSON-encoded body is checked once more and shown as `""` if the
- * encoding formed a sent value. `sendJsonRequest` calls it where it builds the
- * error from the body. `env` and `write` are injectable for tests.
+ * JSON body re-serialized, or withheld), each redacted within the scope on
+ * ApiHttpError; the labels, method, status and the JSON encoding of the body
+ * are written by this function and are not passed through redaction. In the
+ * JSON-encoded body, DEL, C1 control characters and the Unicode line and
+ * paragraph separators are escaped as well, so the line holds no
+ * CONTROL_CHARACTER but its final newline. `sendJsonRequest` calls it where it
+ * builds the error from the body. `env` and `write` are injectable for tests.
  */
 export function emitHttpErrorBodyDebug(
   method: string,
@@ -543,11 +562,10 @@ export function emitHttpErrorBodyDebug(
   write: (s: string) => void = (s) => { process.stderr.write(s); },
 ): void {
   if (!env.FLAIR_DEBUG) return;
-  const encoded = JSON.stringify(displayBody(body, sentValues)).replace(
+  const shownBody = JSON.stringify(displayBody(body, sentValues)).replace(
     /[\u007F-\u009F\u2028\u2029]/g,
     (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
   );
-  const shownBody = withoutOccurrence(encoded, sentValues, '""');
   write(`[flair] ${method} ${displayPath(path, sentValues)} answered HTTP ${status}; response body: ${shownBody}\n`);
 }
 

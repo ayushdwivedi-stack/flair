@@ -4,15 +4,16 @@
  * response with `Content-Length: 0`), the ApiHttpError message is
  * `HTTP <status>` plus the JSON body's named error, or else a bounded one-line
  * excerpt of the body, and the error keeps the body, which sendJsonRequest
- * writes to stderr only with FLAIR_DEBUG set (a JSON body shown re-serialized).
- * The message, `body`, that stderr line and the rem display texts replace the
- * credential values the request sent with `[redacted]` (with nothing where
- * `[redacted]` itself holds a sent value). Scope: redaction
- * covers a response that repeats the request's credential values literally,
- * inside any JSON string (whatever escaping the JSON uses), or percent-encoded
- * (either hex case). A server that transforms a credential some other way is
- * not covered; that server already received the credential. Classifiers read
- * the unredacted body. A zero-length failure keeps the message `HTTP <status>`,
+ * writes to stderr only with FLAIR_DEBUG set (a JSON body shown re-serialized,
+ * or withheld when it cannot be). In the message, `body`, that stderr line and
+ * the rem display texts, the credential values the request sent are replaced
+ * with `[redacted]` in the text the server supplied. Scope: redaction removes
+ * the request's credential values from the text the server supplied (literal,
+ * inside any JSON string, percent-encoded); text the CLI writes itself (the
+ * `HTTP <status>: ` prefix, the debug line's labels, a caller's `Error: `
+ * prefix) is never altered, so a credential that matches the CLI's own
+ * wording, or matches only once that wording is joined to the server's text,
+ * is not covered. Classifiers read the unredacted body. A zero-length failure keeps the message `HTTP <status>`,
  * and the credential-less 403 keeps main's hint.
  *
  * Every request goes through the real sendJsonRequest to a node HTTP listener
@@ -446,7 +447,7 @@ describe("flair#2764 — an ApiHttpError is never a connect failure", () => {
   }, 30_000);
 });
 
-describe("flair#2764 — the request's credential values are redacted in every output, within the stated scope", () => {
+describe("flair#2764 — the request's credential values are removed from the server's text in every output, within the stated scope", () => {
   const PASSWORD = "s3cret-pass-2764-fixture";
   const BASIC_CREDENTIAL = Buffer.from(`admin:${PASSWORD}`).toString("base64");
   const BASIC = `Basic ${BASIC_CREDENTIAL}`;
@@ -633,15 +634,14 @@ describe("flair#2764 — the request's credential values are redacted in every o
     }
   }, 30_000);
 
-  test("the HTTP prefix and the cut marker are not passed through redaction", async () => {
+  test("the HTTP prefix and the cut marker are written as they are, never passed through redaction", async () => {
     const prefixPass = await failEcho(`Basic ${Buffer.from("admin:HTTP").toString("base64")}`, () => "HTTP gateway down", false);
     expect(prefixPass.err.message).toBe("HTTP 500: [redacted] gateway down");
-    // A password of "..." is never printed as the marker: the cut text ends without it.
+    // A password that equals the marker, or that the marker completes, is CLI wording: out of scope.
     const dots = await failEcho(`Basic ${Buffer.from("admin:...").toString("base64")}`, () => "x".repeat(300), false);
-    expect(dots.err.message).toBe(`HTTP 500: ${"x".repeat(200)}`);
-    // Where the marker would complete the password, the kept text ends before it.
+    expect(dots.err.message).toBe(`HTTP 500: ${"x".repeat(200)}...`);
     const tail = await failEcho(`Basic ${Buffer.from("admin:x...").toString("base64")}`, () => `${"a".repeat(199)}xq${"b".repeat(50)}`, false);
-    expect(tail.err.message).toBe(`HTTP 500: ${"a".repeat(199)}...`);
+    expect(tail.err.message).toBe(`HTTP 500: ${"a".repeat(199)}x...`);
     for (const { err } of [prefixPass, dots, tail]) expect(err.message.length).toBeLessThanOrEqual("HTTP 500: ".length + 200 + 3);
   });
 
@@ -682,36 +682,47 @@ describe("flair#2764 — the request's credential values are redacted in every o
     }
   });
 
-  test("a password equal to the marker: nothing stands in for it, and no output holds it", async () => {
+  test("a password equal to the marker: the server's echo is replaced, and the marker the CLI writes is not altered", async () => {
     const { err, stderr } = await failEcho(
       `Basic ${Buffer.from("admin:[redacted]").toString("base64")}`,
       () => JSON.stringify({ error: "bad [redacted]", detail: "[redacted]" }),
       true,
     );
-    const display = describeReflectError(err).text;
-    expect(err.message).toBe("HTTP 500: bad");
-    expect(err.body).toBe('{"error":"bad ","detail":""}');
-    expect(stderr).toBe(`[flair] GET /echo answered HTTP 500; response body: ${JSON.stringify('{"error":"bad ","detail":""}')}\n`);
-    expect(display).toBe("bad");
-    for (const text of [err.message, err.body!, stderr, display]) expect(text).not.toContain("[redacted]");
+    expect(err.message).toBe("HTTP 500: bad [redacted]");
+    expect(err.body).toBe("[body withheld]");
+    expect(stderr).toBe('[flair] GET /echo answered HTTP 500; response body: "[body withheld]"\n');
+    expect(describeReflectError(err).text).toBe("bad [redacted]");
   });
 
-  test("a password inside the withheld text: the withheld body is shown as nothing", async () => {
+  test("a password inside the withheld text: the withheld text is written as it is", async () => {
     const depth = 1_000_000;
     const { err, stderr } = await failEcho(
       `Basic ${Buffer.from("admin:withheld").toString("base64")}`,
       () => `${"[".repeat(depth)}1${"]".repeat(depth)}`,
       true,
     );
-    expect(err.body).toBe("");
-    expect(err.message).toBe("HTTP 500");
-    expect(stderr).toBe('[flair] GET /echo answered HTTP 500; response body: ""\n');
+    expect(err.body).toBe("[body withheld]");
+    expect(err.message).toBe("HTTP 500: [body withheld]");
+    expect(stderr).toBe('[flair] GET /echo answered HTTP 500; response body: "[body withheld]"\n');
   }, 30_000);
 
-  test("a replacement that joins its neighbours into a new occurrence is redacted again", async () => {
+  test("a credential that matches only once the marker is joined to the server's text is not redacted again", async () => {
     const { err, stderr } = await failEcho("Bearer x[red", () => "xx[red", true);
-    expect(err.body).toBe("[redacted]acted]");
-    for (const text of [err.message, err.body!, stderr]) expect(text).not.toContain("x[red");
+    expect(err.body).toBe("x[redacted]");
+    expect(err.message).toBe("HTTP 500: x[redacted]");
+    expect(stderr).toBe('[flair] GET /echo answered HTTP 500; response body: "x[redacted]"\n');
+  });
+
+  test("a Basic password of a quote: a JSON body whose re-serialization would hold it is withheld", async () => {
+    const { err, stderr } = await failEcho(
+      `Basic ${Buffer.from('admin:"').toString("base64")}`,
+      () => JSON.stringify({ error: 'bad "', detail: "x" }),
+      true,
+    );
+    expect(err.message).toBe("HTTP 500: bad [redacted]");
+    expect(err.body).toBe("[body withheld]");
+    expect(stderr).toBe('[flair] GET /echo answered HTTP 500; response body: "[body withheld]"\n');
+    expect(describeReflectError(err).text).toBe("bad [redacted]");
   });
 
   test("the cut does not fall inside an escape the search decodes", async () => {
