@@ -163,7 +163,8 @@ function isCandidateRoute404(err: unknown): boolean {
 /**
  * One agent's leftover candidates, read through the same `apiCall` restore
  * uses for its deletes and writes, so the listing and those operations reach
- * one endpoint. The route returns ids only; restore needs nothing else.
+ * one endpoint. Each candidate object carries only an id; the reply also
+ * carries `hasMore`.
  */
 async function listAgentCandidates(apiCall: ApiCall, agentId: string): Promise<Array<{ id: string }>> {
   let body: any;
@@ -184,13 +185,13 @@ async function listAgentCandidates(apiCall: ApiCall, agentId: string): Promise<A
   // The route has no paging parameter, so a partial listing is refused.
   if (body.hasMore === true) {
     throw new Error(
-      `the target holds more than ${CANDIDATE_LIST_LIMIT} leftover MemoryCandidate rows for agent ${agentId}; no target rows were deleted or written`,
+      `GET /AdminMemoryCandidates reported hasMore: true for agent ${agentId} at limit ${CANDIDATE_LIST_LIMIT}, and restore does not page that listing; no target rows were deleted or written`,
     );
   }
   return body.candidates;
 }
 
-/** What is wrong with a candidate-route body, or null for `{ candidates: [{ id }], hasMore }`. */
+/** The first required field a candidate-route body lacks or mistypes, or null when `candidates` and `hasMore` check out. */
 function candidateListDefect(body: any): string | null {
   if (!body || typeof body !== "object" || Array.isArray(body)) return "the body is not an object";
   if (!Array.isArray(body.candidates)) return "candidates is not an array";

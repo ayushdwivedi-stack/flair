@@ -4,8 +4,8 @@
  *
  * GET /AdminMemoryCandidates/{agentId}?limit=N
  *
- * Returns `{ candidates: [{ id }], hasMore }`. Only the id is returned:
- * restore uses the id to delete the row through the same endpoint.
+ * Returns `{ candidates: [{ id }], hasMore }`: each candidate object carries
+ * only its id, which restore uses to delete the row through the same endpoint.
  * `limit` defaults to 200 and is capped at 500; `hasMore` reports whether the
  * agent holds more rows than this response carries.
  *
@@ -61,7 +61,7 @@ export class AdminMemoryCandidates extends Resource {
     const rawLimit = requestUrl(this)?.searchParams.get("limit") ?? null;
     const parsedLimit = rawLimit === null ? ADMIN_MEMORY_CANDIDATES_DEFAULT_LIMIT : Number(rawLimit);
     if (!Number.isInteger(parsedLimit) || parsedLimit < 1) {
-      return badRequest(`limit must be a positive integer, at most ${ADMIN_MEMORY_CANDIDATES_MAX_LIMIT}`);
+      return badRequest(`limit must be a positive integer; a value above ${ADMIN_MEMORY_CANDIDATES_MAX_LIMIT} is capped at ${ADMIN_MEMORY_CANDIDATES_MAX_LIMIT}`);
     }
     const limit = Math.min(parsedLimit, ADMIN_MEMORY_CANDIDATES_MAX_LIMIT);
 

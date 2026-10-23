@@ -339,8 +339,7 @@ function resolveUrlRestoreTarget(
           + `Set FLAIR_OPS_PORT to the operations port of the instance serving HTTP port ${httpPort}, or unset it to derive the operations port from FLAIR_URL.`,
       );
     }
-    // Both endpoints on 127.0.0.1, the address the OS listener check proves
-    // (src/lib/local-instance-pair.ts), whichever loopback name the URL uses.
+    // Both endpoints on 127.0.0.1, whichever loopback name the URL uses.
     const pinned = new URL(base);
     pinned.hostname = "127.0.0.1";
     return { baseUrl: pinned.toString().replace(/\/$/, ""), opsUrl: `http://127.0.0.1:${opsPort}`, httpPort, opsPort, loopback };

@@ -4,16 +4,15 @@
  *
  * The CLI tests run the real CLI against stub instances, each its own process
  * serving an HTTP port and an operations port (test/helpers/
- * rem-restore-stub-instance.ts), so restore's loopback pair check reads the
- * real OS listener table. Instance A is the default config's instance when a
+ * rem-restore-stub-instance.ts). Instance A is the default config's instance when a
  * test writes one; instance B is the FLAIR_URL target. Every CLI run loads
  * test/helpers/fetch-request-log-preload.ts, which records each request the
  * CLI sends, so a refusal can be shown to have sent nothing at all.
  *
- * The resolver tests are pure. The non-loopback pair check and the REST transport's
- * redirect refusal run against real local HTTP servers with the real fetch:
- * the servers stand in for a non-loopback target's two endpoints and for a redirect
- * destination, and record every request they receive.
+ * The resolver tests are pure. The REST transport's redirect refusal runs
+ * against real local HTTP servers with the real fetch: one answers with a
+ * redirect, and the other, the redirect destination, records every request it
+ * receives.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";

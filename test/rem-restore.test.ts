@@ -523,7 +523,7 @@ describe("applySnapshot — real restore", () => {
     ["a non-boolean hasMore", { candidates: [{ id: "cand-1" }], hasMore: "false" }, "unexpected response shape: hasMore is missing or not a boolean"],
     ["an entry without an id", { candidates: [{ id: "cand-1" }, {}], hasMore: false }, "unexpected response shape: candidates[1].id is not a non-empty string"],
     ["a non-string id", { candidates: [{ id: 7 }], hasMore: false }, "unexpected response shape: candidates[0].id is not a non-empty string"],
-    ["hasMore true (the route has no paging)", { candidates: [{ id: "cand-1" }], hasMore: true }, "more than 500 leftover MemoryCandidate rows"],
+    ["hasMore true (the route has no paging)", { candidates: [{ id: "cand-1" }], hasMore: true }, "reported hasMore: true for agent test-agent at limit 500"],
   ];
   for (const [name, body, message] of malformedListings) {
     it(`refuses a candidate listing with ${name} before any delete or write`, async () => {

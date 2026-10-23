@@ -6,8 +6,7 @@
  * port-1 convention restore derives an operations port by). The script is
  * written to `<tmp>/node_modules/harper/dist/bin/harper.js` and run as
  * `bun <that path>`, so the OS listener table shows one process with a
- * Harper-shaped command line on both ports, as for a real instance; restore's
- * loopback pair check (src/lib/local-instance-pair.ts) reads exactly that.
+ * Harper-shaped command line on both ports, as for a real instance.
  *
  * The operations port answers `get_configuration` with the process's own two
  * ports and `search_by_conditions` on MemoryCandidate from the seeded rows.
