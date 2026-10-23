@@ -140,9 +140,10 @@ export class ApiHttpError extends Error {
 
 /**
  * An ApiHttpError's unredacted response text and the credential values its
- * request sent (flair#2764). No field of the error carries them; only
+ * request sent (flair#2764), kept for classification and redaction: only
  * apiErrorRawBody (the text) and boundErrorText (which uses the values to
- * redact) read this map.
+ * redact) read this map. No field of the error holds the sent values; `body`
+ * and the message are display forms of the raw text, which may equal it.
  */
 const privateText = new WeakMap<ApiHttpError, { raw: string; sentValues: readonly string[] }>();
 
@@ -150,23 +151,27 @@ const privateText = new WeakMap<ApiHttpError, { raw: string; sentValues: readonl
 export const REDACTED_CREDENTIAL = "[redacted]";
 
 /**
- * The credential values an Authorization header carries (flair#2764): the
- * header value, the part after its scheme, for Basic the decoded
+ * The credential values an Authorization header carries (flair#2764), read
+ * from the value Fetch sends: the header with leading and trailing HTTP
+ * whitespace (tab, line feed, carriage return, space) removed, as Fetch
+ * normalizes it. The values are that header value, the part after its scheme
+ * (as written and with surrounding whitespace trimmed), for Basic the decoded
  * `user:password` and the password, and for TPS-Ed25519 the signature (its
  * last `:`-separated field). Empty values are left out.
  */
 function sentCredentialValues(authHeader: string | undefined): string[] {
   if (!authHeader) return [];
-  const space = authHeader.indexOf(" ");
-  const scheme = space === -1 ? "" : authHeader.slice(0, space);
-  const credential = space === -1 ? authHeader : authHeader.slice(space + 1);
-  const values = [authHeader, credential];
+  const sent = authHeader.replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, "");
+  const space = sent.indexOf(" ");
+  const scheme = space === -1 ? "" : sent.slice(0, space);
+  const credential = space === -1 ? sent : sent.slice(space + 1);
+  const values = [sent, credential, credential.trim()];
   if (scheme === "Basic") {
-    const decoded = Buffer.from(credential, "base64").toString("utf8");
+    const decoded = Buffer.from(credential.trim(), "base64").toString("utf8");
     const colon = decoded.indexOf(":");
     if (colon !== -1) values.push(decoded, decoded.slice(colon + 1));
   } else if (scheme === "TPS-Ed25519") {
-    values.push(credential.slice(credential.lastIndexOf(":") + 1));
+    values.push(credential.slice(credential.lastIndexOf(":") + 1).trim());
   }
   return values.filter((value) => value.length > 0);
 }

@@ -731,6 +731,18 @@ describe("flair#2764 — the request's credential values are removed from the se
     expect(err.message).toBe(`HTTP 500: ${"x".repeat(195)}%41...`);
   });
 
+  test("a Bearer header with surrounding whitespace: the values come from the header Fetch sends", async () => {
+    for (const header of ["Bearer secret-2764-tail ", "Bearer  secret-2764-tail", "Bearer secret-2764-tail\t"]) {
+      const { err, stderr } = await failEcho(header, (sent) => JSON.stringify({ error: `bad ${sent}`, detail: "secret-2764-tail" }), true);
+      // The listener saw the header as Fetch sent it, surrounding whitespace removed.
+      expect(apiErrorRawBody(err), JSON.stringify(header)).toContain(`"bad ${header.trim()}"`);
+      const display = describeReflectError(err).text;
+      expect(err.message, JSON.stringify(header)).toBe("HTTP 500: bad [redacted]");
+      expect(err.body, JSON.stringify(header)).toBe('{"error":"bad [redacted]","detail":"[redacted]"}');
+      for (const text of [err.message, err.body!, stderr, display]) expect(text, JSON.stringify(header)).not.toContain("secret-2764-tail");
+    }
+  });
+
   test("a body that carries no credential value is unchanged", async () => {
     const { err, stderr } = await failEcho(BASIC, () => "upstream unavailable", true);
     expect(err.message).toBe("HTTP 500: upstream unavailable");
