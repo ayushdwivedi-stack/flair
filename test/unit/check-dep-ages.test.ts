@@ -1170,6 +1170,77 @@ describe("CLI — a dependency range is age-checked at its lockfile resolution",
   }, 30_000);
 });
 
+describe("CLI — devDependencies: a refused form fails the gate, an exact pin stays unchecked", () => {
+  // An unreachable registry: a refusal needs no registry call, and any call
+  // would fail the run with a fetch error instead of the refusal.
+  const DEAD_REGISTRY = "http://127.0.0.1:1";
+  const refusedDevForms: Array<[string, string]> = [
+    ["a dist-tag", "latest"],
+    ["a v prefix", "v1.0.0"],
+    ["surrounding whitespace", "^1.0.0 "],
+  ];
+  for (const [label, spec] of refusedDevForms) {
+    it(`exits 2 naming the field and spec for ${label} in devDependencies`, async () => {
+      const root = writeManifestRepo(join(scratch, `dev-refused-${label.replace(/\W+/g, "-")}`), {
+        name: "dep-ages-dev-refused-fixture",
+        version: "0.0.0",
+        devDependencies: { [FIXTURE_DEP]: spec },
+      });
+      const { exitCode, output } = await runGate(CLI_SCRIPT, {
+        FLAIR_CHECK_DEP_AGES_ROOT: root,
+        FLAIR_NPM_REGISTRY: DEAD_REGISTRY,
+      });
+      expect(output).toContain("Unsupported dependency entries:");
+      expect(output).toContain(`package.json devDependencies ${FIXTURE_DEP} "${spec}":`);
+      expect(output).not.toContain("Failed to fetch publish times");
+      expect(exitCode).toBe(2);
+    }, 30_000);
+  }
+
+  it("exits 2 naming the field for a non-string devDependencies specifier", async () => {
+    const root = writeManifestRepo(join(scratch, "dev-refused-non-string"), {
+      name: "dep-ages-dev-refused-fixture",
+      version: "0.0.0",
+      devDependencies: { [FIXTURE_DEP]: 1 },
+    });
+    const { exitCode, output } = await runGate(CLI_SCRIPT, {
+      FLAIR_CHECK_DEP_AGES_ROOT: root,
+      FLAIR_NPM_REGISTRY: DEAD_REGISTRY,
+    });
+    expect(output).toContain(`package.json devDependencies ${FIXTURE_DEP} "1": the specifier must be a string, not a number`);
+    expect(exitCode).toBe(2);
+  }, 30_000);
+
+  it("exits 2 naming the field for a devDependencies value that is not an object", async () => {
+    const root = writeManifestRepo(join(scratch, "dev-refused-non-object"), {
+      name: "dep-ages-dev-refused-fixture",
+      version: "0.0.0",
+      devDependencies: "latest",
+    });
+    const { exitCode, output } = await runGate(CLI_SCRIPT, {
+      FLAIR_CHECK_DEP_AGES_ROOT: root,
+      FLAIR_NPM_REGISTRY: DEAD_REGISTRY,
+    });
+    expect(output).toContain('package.json devDependencies devDependencies "": it must be an object, not a string');
+    expect(exitCode).toBe(2);
+  }, 30_000);
+
+  it("leaves an exact devDependencies pin unchecked and exits 0", async () => {
+    const root = writeManifestRepo(join(scratch, "dev-exact-unchecked"), {
+      name: "dep-ages-dev-exact-fixture",
+      version: "0.0.0",
+      devDependencies: { [FIXTURE_DEP]: FIXTURE_VERSION },
+    });
+    const { exitCode, output } = await runGate(CLI_SCRIPT, {
+      FLAIR_CHECK_DEP_AGES_ROOT: root,
+      FLAIR_NPM_REGISTRY: DEAD_REGISTRY,
+    });
+    expect(output).toContain("No external dependency versions to check.");
+    expect(output).not.toContain("Unsupported dependency entries");
+    expect(exitCode).toBe(0);
+  }, 30_000);
+});
+
 describe("CLI — a refused dependency form fails the gate before any fetch", () => {
   const refusedForms: Array<[string, string]> = [
     ["build metadata", "1.0.0+build"],

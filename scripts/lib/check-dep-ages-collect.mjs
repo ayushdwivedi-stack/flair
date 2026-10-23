@@ -21,7 +21,8 @@
  *   (collectUnsupportedDeps), and an exact `npm:` alias is checked at its
  *   target's version.
  * - `devDependencies`: ranges are age-checked at their lock resolution, like
- *   dependencies; exact pins are not age-checked, as before.
+ *   dependencies; exact pins are not age-checked, as before; a form the
+ *   classifier refuses fails the gate (collectUnsupportedDeps).
  * - `overrides`: exact declarations are age-checked, including conditional
  *   rules, an exact `npm:` alias at its target's version; range declarations
  *   are age-checked at the copies in the rule's scope (resolveRangedDeps).
@@ -242,6 +243,9 @@ export function collectDeps(pkgs, keepCurrent) {
   }
 
   for (const { pkg, path } of pkgs) {
+    // Exact `devDependencies` pins are deliberately not age-checked, so that
+    // field is not read here; its ranges are (collectRangedDeps) and its
+    // refused forms fail the gate (collectUnsupportedDeps).
     if (pkg.dependencies) recordDeps(pkg.dependencies, path);
     if (pkg.optionalDependencies) recordDeps(pkg.optionalDependencies, path);
     if (pkg.overrides !== undefined) {
@@ -286,6 +290,9 @@ export function collectRangedDeps(pkgs, keepCurrent) {
     const workspaceDir = workspaceDirOf(path);
     for (const field of ["dependencies", "devDependencies", "optionalDependencies"]) {
       const deps = pkg[field];
+      // A non-object field, a non-string specifier and a refused form are
+      // skipped here because collectUnsupportedDeps fails the gate on each
+      // first, in the same three fields.
       if (!isPlainObject(deps)) continue;
       for (const [name, spec] of Object.entries(deps)) {
         if (typeof spec !== "string") continue;
@@ -371,6 +378,8 @@ function lockEntryResolution(entry) {
  */
 function lockEntryDependencyNames(entry, version, workspaces) {
   let meta = entry.slice(1).find(isPlainObject);
+  // An installed package's devDependencies are not installed with it, so they
+  // are not edges of the tree; a workspace's are, so they count for one.
   const fields = ["dependencies", "optionalDependencies", "peerDependencies"];
   if (meta === undefined && version.startsWith("workspace:")) {
     meta = workspaces[version.slice("workspace:".length)];
@@ -577,8 +586,9 @@ export function collectUnsupportedOverrides(pkgs) {
 }
 
 /**
- * The dependencies and optionalDependencies entries in a form this gate does
- * not support. The CLI refuses to run while any exist.
+ * The dependencies, devDependencies and optionalDependencies entries in a form
+ * this gate does not support, a non-string specifier or a field that is not an
+ * object. The CLI refuses to run while any exist.
  *
  * @param pkgs — package objects with paths
  * @returns Array<{ declaredIn, field, name, spec, reason }>
@@ -586,7 +596,7 @@ export function collectUnsupportedOverrides(pkgs) {
 export function collectUnsupportedDeps(pkgs) {
   const unsupported = [];
   for (const { pkg, path } of pkgs) {
-    for (const field of ["dependencies", "optionalDependencies"]) {
+    for (const field of ["dependencies", "devDependencies", "optionalDependencies"]) {
       const deps = pkg[field];
       if (deps === undefined) continue;
       if (!isPlainObject(deps)) {

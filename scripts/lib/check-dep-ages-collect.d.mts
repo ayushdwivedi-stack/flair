@@ -152,15 +152,16 @@ export function resolveRangedDeps(
 
 export interface UnsupportedDep {
   declaredIn: string;
-  field: "dependencies" | "optionalDependencies";
+  field: "dependencies" | "devDependencies" | "optionalDependencies";
   name: string;
   spec: string;
   reason: string;
 }
 
 /**
- * The dependencies and optionalDependencies entries in a form this gate does
- * not support. The CLI refuses to run while any exist.
+ * The dependencies, devDependencies and optionalDependencies entries in a form
+ * this gate does not support, a non-string specifier or a field that is not an
+ * object. The CLI refuses to run while any exist.
  */
 export function collectUnsupportedDeps(
   pkgs: Array<{ pkg: Record<string, unknown>; path: string }>,
