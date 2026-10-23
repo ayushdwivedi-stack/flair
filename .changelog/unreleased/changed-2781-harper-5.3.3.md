@@ -3,3 +3,6 @@
   copies sit under `node_modules/harper/node_modules` in a bun install too, where
   root overrides do not replace them and `bun audit` reads only `bun.lock`, where they do not appear;
   `node scripts/ci/list-harper-bundled.mjs` prints each copy and its version.
+
+  > **Heads-up:** over MQTT 5, a SUBSCRIBE without a login now gets SUBACK
+  > `0x87` (Not authorized) instead of `0x80`, from Harper 5.3.3.
