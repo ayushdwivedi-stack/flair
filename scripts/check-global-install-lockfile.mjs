@@ -190,6 +190,9 @@ function enclosingNodeModules(flairDir) {
  * Returns the resolved real directory, or null when nothing is installed there.
  */
 function resolveDependencyDir(fromDir, name, root) {
+  if (!fromDir.startsWith(`${root}${sep}`)) {
+    throw new Error(`package ${fromDir} is outside the install root ${root}`);
+  }
   const last = dirname(root);
   let dir = fromDir;
   for (;;) {
@@ -257,6 +260,11 @@ export function countFlairTree(flairDir, root = enclosingNodeModules(flairDir)) 
       if (resolved === null) {
         if (isOptionalOnly) continue;
         throw new Error(`dependency ${name} of ${manifest.name}@${manifest.version} did not resolve from ${dir}`);
+      }
+      if (!resolved.startsWith(`${rootReal}${sep}`)) {
+        throw new Error(
+          `dependency ${name} of ${manifest.name}@${manifest.version} resolves outside ${rootReal} (${resolved})`,
+        );
       }
       visit(resolved, depth + 1);
     }
