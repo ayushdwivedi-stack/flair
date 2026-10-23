@@ -12,8 +12,9 @@
  * The operations port answers `get_configuration` with the process's own two
  * ports and `search_by_conditions` on MemoryCandidate from the seeded rows.
  * The HTTP port serves GET/PUT/DELETE on Memory, Soul and MemoryCandidate, the
- * admin-only `/AdminMemoryCandidates/{agentId}` listing, or answers every PUT
- * and DELETE with a 307 when `redirectWritesTo` is seeded.
+ * admin-only `/AdminMemoryCandidates/{agentId}` listing, or answers an
+ * authorized DELETE, and an authorized PUT with a JSON body, with a 307 when
+ * `redirectWritesTo` is seeded.
  *
  * Every request either port receives is appended to a log file that
  * `requests()` reads: each handler first reads the body as text (the

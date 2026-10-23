@@ -105,9 +105,8 @@ function relativeTime(iso: string | null | undefined): string {
  * rem commands. `search_by_conditions` is an ops-API operation, not a Harper
  * REST route — Harper's REST dispatcher maps `POST /<table>` to
  * `resource.post()` and never routes a URL suffix, so `/MemoryCandidate/
- * search_by_conditions` 405s. Both the nightly pending-candidate count and
- * the restore-time candidate cleanup must reach the ops port this way.
- * `opsUrl` (restore's operations URL) takes precedence over `opsPort` (a
+ * search_by_conditions` 405s. The nightly pending-candidate count reaches the
+ * ops port this way. `opsUrl`, when given, takes precedence over `opsPort` (a
  * loopback port). A redirect is refused, so the admin credential goes only to
  * the URL built here. `fetchImpl` is injectable for tests.
  */
@@ -168,8 +167,8 @@ export interface RestoreTargetEnv {
   opsPort?: string;
   /**
    * FLAIR_OPS_TARGET: an operations endpoint other commands use. It does not
-   * select restore's listing endpoint; restore compares it with the one it
-   * resolves, and refuses unless the two are the same root URL.
+   * select restore's listing endpoint; restore compares it with the operations
+   * URL it resolves, and refuses unless the two are the same root URL.
    */
   opsTarget?: string;
 }
@@ -322,7 +321,7 @@ function resolveUrlRestoreTarget(
     } catch (err: any) {
       throw new Error(
         `restore target ${shown} has no derivable operations API URL (${err?.message ?? String(err)}). `
-          + "Restore lists candidates through the operations API on its target's host, and derives that API's port from FLAIR_URL when FLAIR_OPS_PORT is unset. "
+          + "Restore resolves an operations port for its target, from FLAIR_URL when FLAIR_OPS_PORT is unset. "
           + "Set FLAIR_OPS_PORT to that instance's operations port, or set FLAIR_URL to the instance's base URL with its HTTP port.",
       );
     }
@@ -365,16 +364,15 @@ function normalizedRoot(u: URL): string {
  * or a path other than `/` refuses even on the same scheme, host and port, and
  * the message prints only the override's scheme, host and port. A value of
  * only whitespace is set, not unset, and is refused; an empty value counts as
- * unset. The setting does not select restore's listing endpoint, which is
- * always the one resolved from restore's own target; when the two are the same
- * root URL, the listing goes to that endpoint.
+ * unset. The setting does not select restore's listing endpoint, which is the
+ * target's base URL.
  */
 function refuseOtherOpsTarget(opsTargetEnv: string | undefined, target: RestoreTarget): void {
   if (opsTargetEnv === undefined || opsTargetEnv === "") return;
   const raw = opsTargetEnv.trim();
   if (!raw) {
     throw new Error(
-      `FLAIR_OPS_TARGET is set but holds only whitespace, so it names no operations endpoint to compare with the one restore lists candidates on (${target.opsUrl}); `
+      `FLAIR_OPS_TARGET is set but holds only whitespace, so it names no operations endpoint to compare with the one restore resolves for its target (${target.opsUrl}); `
         + `nothing was sent. Unset FLAIR_OPS_TARGET for this command, or set it to ${target.opsUrl}.`,
     );
   }
@@ -389,7 +387,7 @@ function refuseOtherOpsTarget(opsTargetEnv: string | undefined, target: RestoreT
   const remedy = `Unset FLAIR_OPS_TARGET for this command, or set it to ${target.opsUrl}.`;
   if (named === null || !httpLike) {
     throw new Error(
-      `FLAIR_OPS_TARGET is not an http(s) URL, so it cannot be the operations API restore lists candidates on (${target.opsUrl}); nothing was sent to it. ${remedy}`,
+      `FLAIR_OPS_TARGET is not an http(s) URL, so it cannot be the operations API restore resolves for its target (${target.opsUrl}); nothing was sent to it. ${remedy}`,
     );
   }
   const carried: string[] = [];
@@ -400,13 +398,13 @@ function refuseOtherOpsTarget(opsTargetEnv: string | undefined, target: RestoreT
   if (carried.length > 0) {
     throw new Error(
       `FLAIR_OPS_TARGET ${shown} carries ${carried.join(" and ")}. Restore accepts FLAIR_OPS_TARGET only when it is exactly the root URL `
-        + `of the operations API it lists candidates on (${target.opsUrl}), prints none of its user info, path, query or fragment, and sent nothing to it. ${remedy}`,
+        + `of the operations API it resolves for its target (${target.opsUrl}), prints none of its user info, path, query or fragment, and sent nothing to it. ${remedy}`,
     );
   }
   if (normalizedRoot(named) !== normalizedRoot(new URL(target.opsUrl))) {
     throw new Error(
-      `FLAIR_OPS_TARGET names the operations endpoint ${shown}, but restore lists candidates only on the operations API it resolves `
-        + `from its own target ${target.baseUrl}, which is ${target.opsUrl}; nothing was sent to FLAIR_OPS_TARGET. ${remedy}`,
+      `FLAIR_OPS_TARGET names the operations endpoint ${shown}, but the operations API restore resolves `
+        + `from its own target ${target.baseUrl} is ${target.opsUrl}; nothing was sent to FLAIR_OPS_TARGET. ${remedy}`,
     );
   }
 }

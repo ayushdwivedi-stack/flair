@@ -463,7 +463,7 @@ describe("applySnapshot — real restore", () => {
     expect(calls.some((c) => c.path === "/MemoryCandidate/other-endpoint-candidate")).toBe(false);
   });
 
-  it("an older target without the candidate route is refused with the server version needed, before any delete or write", async () => {
+  it("a candidate-route 404 is refused with the server version that adds the route, before any delete or write", async () => {
     const snapshotPath = await makeTestSnapshot();
     const { api, calls } = recordingApi({
       "GET:/Memory": () => [{ id: "mem-1", agentId: "test-agent" }],

@@ -156,7 +156,7 @@ function soulWrite(opts: RestoreOpts): ApiCall {
   return opts.soulApiCall ?? opts.apiCall;
 }
 
-function olderServerCandidateRoute(err: unknown): boolean {
+function isCandidateRoute404(err: unknown): boolean {
   return err instanceof ApiHttpError && err.status === 404;
 }
 
@@ -173,8 +173,8 @@ async function listAgentCandidates(apiCall: ApiCall, agentId: string): Promise<A
       `/AdminMemoryCandidates/${encodeURIComponent(agentId)}?limit=${CANDIDATE_LIST_LIMIT}`,
     );
   } catch (err) {
-    // Only this GET's 404 is reported as a target that predates the route.
-    if (olderServerCandidateRoute(err)) throw new Error(olderServerCandidateMessage(err as ApiHttpError));
+    // Only this GET's 404 gets the candidate-route 404 guidance.
+    if (isCandidateRoute404(err)) throw new Error(candidateRoute404Guidance(err as ApiHttpError));
     throw err;
   }
   const defect = candidateListDefect(body);
@@ -202,10 +202,10 @@ function candidateListDefect(body: any): string | null {
   return null;
 }
 
-/** The operator message for a target that predates the admin candidate route. */
-function olderServerCandidateMessage(err: ApiHttpError): string {
+/** The candidate-route 404 guidance: the operator message when GET /AdminMemoryCandidates answers 404. */
+function candidateRoute404Guidance(err: ApiHttpError): string {
   return `restore lists leftover MemoryCandidate rows through GET /AdminMemoryCandidates on the restore target, and the target answered HTTP ${err.status}. `
-    + `That route is part of Flair server ${CANDIDATE_LIST_MIN_SERVER_VERSION}; upgrade the target to ${CANDIDATE_LIST_MIN_SERVER_VERSION} or newer, then retry. `
+    + `That route is part of Flair server ${CANDIDATE_LIST_MIN_SERVER_VERSION}; if the target runs an older server, upgrade it to ${CANDIDATE_LIST_MIN_SERVER_VERSION} or newer, then retry. `
     + "No target rows were deleted or written.";
 }
 

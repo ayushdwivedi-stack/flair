@@ -382,7 +382,7 @@ OAuth rate limits and env vars: [docs/auth.md](auth.md#rate-limiting).
 
 ### Admin UI
 
-All `/Admin*` routes require **Admin Basic**.
+Reads of the `/Admin*` routes below are admin-only: **Admin Basic**, or a `TPS-Ed25519` signature from an admin agent.
 
 | Path | Purpose |
 |------|---------|

@@ -550,7 +550,7 @@ describe("flair#2708 — resolveRestoreTarget", () => {
     const deps = { resolvePair: recordingPair([]), deriveOpsUrl: resolveOpsUrlFromTarget };
     for (const opsTarget of [" ", "   ", "\t", " \n "]) {
       expect(() => resolveRestoreTarget({ flairUrl: "https://flair.example:9926", opsTarget }, deps)).toThrow(
-        "FLAIR_OPS_TARGET is set but holds only whitespace, so it names no operations endpoint to compare with the one restore lists candidates on (https://flair.example:9925); nothing was sent. Unset FLAIR_OPS_TARGET for this command, or set it to https://flair.example:9925.",
+        "FLAIR_OPS_TARGET is set but holds only whitespace, so it names no operations endpoint to compare with the one restore resolves for its target (https://flair.example:9925); nothing was sent. Unset FLAIR_OPS_TARGET for this command, or set it to https://flair.example:9925.",
       );
     }
     expect(resolveRestoreTarget({ flairUrl: "https://flair.example:9926", opsTarget: "" }, deps).opsUrl).toBe("https://flair.example:9925");
