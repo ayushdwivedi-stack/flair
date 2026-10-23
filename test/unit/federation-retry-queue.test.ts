@@ -1,0 +1,110 @@
+/**
+ * federation-retry-queue.test.ts — the sender's generic-Memory retry decisions
+ * (flair#2797). Pure: no Harper, no filesystem.
+ *
+ * The retryable-name list is compared against the receiver's own classification
+ * (RETRYABLE_SKIP_REASONS), so the sender cannot start (or stop) treating a
+ * reason as retryable without this test failing.
+ */
+import { describe, expect, test } from "bun:test";
+import {
+  MEMORY_RETRY_BACKOFF_MS,
+  MEMORY_RETRY_REASONS,
+  dueRetryRows,
+  retryBackoffMs,
+  retryRowForRefusal,
+  terminalRetryRow,
+  type RetryQueueRow,
+} from "../../src/lib/federation-retry-queue.js";
+import { retryEntryKey } from "../../src/lib/federation-retry-key.js";
+import { RETRYABLE_SKIP_REASONS } from "../../resources/federation-classify.js";
+
+const PEER = "peer-a";
+const ROW = "record-a";
+const NOW = "2026-10-23T12:00:00.000Z";
+
+function pending(over: Partial<RetryQueueRow> = {}): RetryQueueRow {
+  return {
+    id: retryEntryKey(PEER, "Memory", ROW),
+    peerId: PEER,
+    table: "Memory",
+    recordId: ROW,
+    state: "pending",
+    firstRefusedAt: NOW,
+    attempts: 1,
+    lastReason: "merge_target_busy",
+    createdAt: NOW,
+    lastAttemptAt: NOW,
+    ...over,
+  };
+}
+
+describe("flair#2797 — the sender's retryable reason list matches the receiver's", () => {
+  test("every retryable SkipReason is in the sender list and nothing else is", () => {
+    expect([...MEMORY_RETRY_REASONS].sort()).toEqual([...RETRYABLE_SKIP_REASONS].sort());
+  });
+});
+
+describe("flair#2797 — retry backoff and due selection", () => {
+  test("the first re-offer is immediate and later ones back off", () => {
+    expect(retryBackoffMs(1)).toBe(0);
+    expect(retryBackoffMs(2)).toBe(MEMORY_RETRY_BACKOFF_MS[1]);
+    expect(retryBackoffMs(3)).toBe(MEMORY_RETRY_BACKOFF_MS[2]);
+    expect(retryBackoffMs(99)).toBe(MEMORY_RETRY_BACKOFF_MS[MEMORY_RETRY_BACKOFF_MS.length - 1]);
+    expect(retryBackoffMs(0)).toBe(0);
+  });
+
+  test("a due pending row is offered; a backoff, a terminal row and a wrong tuple are not", () => {
+    const at = Date.parse(NOW);
+    expect(dueRetryRows([pending()], at).map((r) => r.recordId)).toEqual([ROW]);
+    expect(dueRetryRows([pending({ attempts: 2 })], at)).toEqual([]);
+    expect(dueRetryRows([pending({ attempts: 2 })], at + retryBackoffMs(2))).toHaveLength(1);
+    expect(dueRetryRows([pending({ state: "terminal" })], at)).toEqual([]);
+    expect(dueRetryRows([pending({ id: retryEntryKey(PEER, "Memory", "another") })], at)).toEqual([]);
+    expect(dueRetryRows([pending({ table: "Soul" })], at)).toEqual([]);
+  });
+
+  test("a pending row with no readable last attempt is due", () => {
+    expect(dueRetryRows([pending({ lastAttemptAt: null })], Date.parse(NOW))).toHaveLength(1);
+    expect(dueRetryRows([pending({ lastAttemptAt: "not-a-date" })], Date.parse(NOW))).toHaveLength(1);
+  });
+});
+
+describe("flair#2797 — retry row transitions", () => {
+  test("a first refusal creates a pending row with attempts 1", () => {
+    const row = retryRowForRefusal({ peerId: PEER, recordId: ROW, reason: "merge_target_busy", nowIso: NOW });
+    expect(row).toEqual({
+      id: retryEntryKey(PEER, "Memory", ROW),
+      peerId: PEER,
+      table: "Memory",
+      recordId: ROW,
+      state: "pending",
+      firstRefusedAt: NOW,
+      attempts: 1,
+      lastReason: "merge_target_busy",
+      lastAttemptAt: NOW,
+      createdAt: NOW,
+      updatedAt: NOW,
+    });
+  });
+
+  test("a later refusal keeps the first timestamp and increments attempts", () => {
+    const first = pending({ attempts: 2, firstRefusedAt: "2026-10-20T00:00:00.000Z", createdAt: "2026-10-20T00:00:00.000Z" });
+    const row = retryRowForRefusal({ peerId: PEER, recordId: ROW, reason: "merge_target_busy", nowIso: NOW, existing: first });
+    expect(row.firstRefusedAt).toBe("2026-10-20T00:00:00.000Z");
+    expect(row.createdAt).toBe("2026-10-20T00:00:00.000Z");
+    expect(row.attempts).toBe(3);
+  });
+
+  test("a terminal row carries the declared fields and a null bound", () => {
+    const row = terminalRetryRow(pending({ attempts: 4 }), "merged", NOW);
+    expect(row.state).toBe("terminal");
+    expect(row.resolution).toBe("merged");
+    expect(row.bound).toBeNull();
+    expect(row.completedAt).toBe(NOW);
+    expect(row.attempts).toBe(4);
+    expect(Object.keys(row).sort()).toEqual(
+      ["attempts", "bound", "completedAt", "createdAt", "firstRefusedAt", "id", "lastAttemptAt", "lastReason", "peerId", "recordId", "resolution", "state", "table", "updatedAt"].sort(),
+    );
+  });
+});

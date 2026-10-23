@@ -40,6 +40,14 @@ import {
 } from "../lib/auth-resolve.js";
 import { DEFAULT_INTERVAL_SECONDS as FEDERATION_SYNC_DEFAULT_INTERVAL } from "../federation/scheduler.js";
 import { FEDERATION_MEMORY_SELECT } from "../lib/federation-memory-attributes.js";
+import { retryEntryKey } from "../lib/federation-retry-key.js";
+import {
+  MEMORY_RETRY_REASONS,
+  dueRetryRows,
+  retryRowForRefusal,
+  terminalRetryRow,
+  type RetryQueueRow,
+} from "../lib/federation-retry-queue.js";
 import {
   presenceCursorMs,
   presenceSendEnabled,
@@ -821,6 +829,126 @@ export async function runFederationSyncOnce(opts: any): Promise<{ pushed: number
     const auth = `Basic ${Buffer.from(`${resolveAdminUser(opts.adminUser)}:${adminPass}`).toString("base64")}`;
     const tables = ["Memory", "Soul", "Agent", "Relationship"];
     const instance = await api("GET", "/FederationInstance", undefined, apiOpts);
+
+    // ── federation retry bookkeeping (flair#2797) ─────────────────────────
+    // A generic Memory row the hub refused for a retryable reason is kept in
+    // FederationRetry and offered again on a later cycle, independent of the
+    // since cursor. A non-retryable refusal ends the obligation.
+    const retryHeaders = { "Content-Type": "application/json", Authorization: auth };
+    const pendingRetries = new Map<string, RetryQueueRow>();
+
+    async function loadPendingRetries(): Promise<void> {
+      const res = await fetch(`${opsEndpoint}/`, {
+        method: "POST",
+        headers: retryHeaders,
+        body: JSON.stringify({
+          operation: "search_by_conditions",
+          schema: "flair",
+          table: "FederationRetry",
+          operator: "and",
+          conditions: [
+            { search_attribute: "peerId", search_type: "equals", search_value: hub.id },
+            { search_attribute: "table", search_type: "equals", search_value: "Memory" },
+            { search_attribute: "state", search_type: "equals", search_value: "pending" },
+          ],
+          get_attributes: ["*"],
+        }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) throw new Error(`FederationRetry read failed (${res.status})`);
+      const list = await res.json() as unknown;
+      if (!Array.isArray(list)) throw new Error("FederationRetry read failed: body is not a row list");
+      for (const row of list as RetryQueueRow[]) pendingRetries.set(row.id, row);
+    }
+
+    /** Write one retry row; an unconfirmed write is an error, never a silent success. */
+    async function writeRetryRow(operation: "upsert" | "update", record: Record<string, unknown>): Promise<void> {
+      const res = await fetch(`${opsEndpoint}/`, {
+        method: "POST",
+        headers: retryHeaders,
+        body: JSON.stringify({ operation, database: "flair", table: "FederationRetry", records: [record] }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) throw new Error(`FederationRetry ${operation} failed (${res.status})`);
+      const body = await res.json().catch(() => null) as any;
+      if (operation === "update") {
+        if (!Array.isArray(body?.update_hashes) || !body.update_hashes.map(String).includes(String(record.id))) {
+          throw new Error(`FederationRetry update was not confirmed for ${String(record.id)}`);
+        }
+        return;
+      }
+      // The upsert answer does not name the row. Confirm it by reading it back:
+      // a write the sender cannot see is not a recorded obligation.
+      const read = await fetch(`${opsEndpoint}/`, {
+        method: "POST",
+        headers: retryHeaders,
+        body: JSON.stringify({ operation: "search_by_hash", database: "flair", table: "FederationRetry", hash_values: [record.id], get_attributes: ["*"] }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!read.ok) throw new Error(`FederationRetry read-back failed (${read.status})`);
+      const rows = await read.json() as unknown;
+      const stored = Array.isArray(rows) ? (rows as any[]).find((r) => r.id === record.id) : null;
+      if (!stored || stored.state !== record.state || stored.lastReason !== record.lastReason) {
+        throw new Error(`FederationRetry upsert was not confirmed for ${String(record.id)}`);
+      }
+    }
+
+    async function retireRetry(row: RetryQueueRow, resolution: string, nowIso = new Date().toISOString()): Promise<void> {
+      await writeRetryRow("update", terminalRetryRow(row, resolution, nowIso));
+      pendingRetries.delete(row.id);
+    }
+
+    async function loadMemoryRow(id: string): Promise<any | null> {
+      const res = await fetch(`${opsEndpoint}/`, {
+        method: "POST",
+        headers: retryHeaders,
+        body: JSON.stringify({ operation: "search_by_hash", database: "flair", table: "Memory", hash_values: [id], get_attributes: ["*"] }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) throw new Error(`Memory read failed (${res.status})`);
+      const rows = await res.json() as unknown;
+      if (!Array.isArray(rows)) throw new Error("Memory read failed: body is not a row list");
+      return (rows as any[])[0] ?? null;
+    }
+
+    async function applyMemoryOutcomes(
+      batch: any[],
+      result: { refused: Array<{ table: string; id: string; reason: string }>; indeterminate: Array<{ table: string; id: string }> },
+    ): Promise<void> {
+      const keyOf = (table: string, id: string) => JSON.stringify([table, id]);
+      const refused = new Map(result.refused.map((r) => [keyOf(r.table, r.id), r.reason]));
+      const undecided = new Set(result.indeterminate.map((r) => keyOf(r.table, r.id)));
+      const nowIso = new Date().toISOString();
+      for (const record of batch) {
+        if (record.table !== "Memory") continue;
+        const key = retryEntryKey(hub.id, "Memory", record.id);
+        const prior = pendingRetries.get(key) ?? null;
+        if (undecided.has(keyOf(record.table, record.id))) {
+          // The receiver did not decide this record. Offering it again is safe
+          // (the merge is idempotent); `retry_unknown` is the sender's own name.
+          if (prior) {
+            const row = retryRowForRefusal({ peerId: hub.id, recordId: record.id, reason: "retry_unknown", nowIso, existing: prior });
+            await writeRetryRow("upsert", row);
+            pendingRetries.set(String(row.id), row as unknown as RetryQueueRow);
+          }
+          continue;
+        }
+        const reason = refused.get(keyOf(record.table, record.id));
+        if (reason !== undefined) {
+          if (MEMORY_RETRY_REASONS.has(reason)) {
+            const row = retryRowForRefusal({ peerId: hub.id, recordId: record.id, reason, nowIso, existing: prior });
+            await writeRetryRow("upsert", row);
+            pendingRetries.set(String(row.id), row as unknown as RetryQueueRow);
+          } else if (prior) {
+            await retireRetry(prior, "refused_terminal", nowIso);
+          }
+          continue;
+        }
+        if (prior) await retireRetry(prior, "merged", nowIso);
+      }
+    }
+
+    await loadPendingRetries();
     // A stored endpoint with a trailing slash still yields `<hub>/FederationSync`.
     const hubUrl = normalizeHubUrl(hub.endpoint ?? hub.id);
 
@@ -977,6 +1105,26 @@ export async function runFederationSyncOnce(opts: any): Promise<{ pushed: number
         if (table === "Memory") privateHeldBack += sinceCursor.length - federable.length;
         rows = rows.concat(federable);
       }
+      if (table === "Memory" && pendingRetries.size > 0) {
+        // Re-offer the pending rows whose backoff has elapsed. A row still
+        // selected by the since cursor is offered once (the set below). A row
+        // that is gone or has become private ends its obligation here.
+        const seen = new Set(rows.map((r: any) => r.id));
+        for (const pending of dueRetryRows([...pendingRetries.values()], Date.now())) {
+          if (seen.has(pending.recordId)) continue;
+          const row = await loadMemoryRow(pending.recordId);
+          if (!row) {
+            await retireRetry(pending, "source_deleted");
+            continue;
+          }
+          if (isFederationPrivateVisibility(row.visibility)) {
+            await retireRetry(pending, "source_ineligible");
+            continue;
+          }
+          rows.push(row);
+          seen.add(pending.recordId);
+        }
+      }
       if (rows.length === 0) continue;
 
       // Records are signed (below) before they're batched, so the secret key
@@ -1039,6 +1187,7 @@ export async function runFederationSyncOnce(opts: any): Promise<{ pushed: number
 
         if (batch.length >= BUDGET_RECORDS || (batch.length > 0 && batchBytes + srBytes > BUDGET_BYTES)) {
           const result = await sendBatch(batch);
+          if (table === "Memory") await applyMemoryOutcomes(batch, result);
           totalMerged += result.merged;
           totalSkipped += result.skipped;
           totalBatches++;
@@ -1053,6 +1202,7 @@ export async function runFederationSyncOnce(opts: any): Promise<{ pushed: number
       // Send final partial batch for this table
       if (batch.length > 0) {
         const result = await sendBatch(batch);
+        if (table === "Memory") await applyMemoryOutcomes(batch, result);
         totalMerged += result.merged;
         totalSkipped += result.skipped;
         totalBatches++;

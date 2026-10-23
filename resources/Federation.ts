@@ -34,7 +34,7 @@ import { verifyFederationRequestBody } from "./replay-store.js";
 import { CommittedRowChanged, confirmCommittedRow, verifyCommittedFields, withoutHarperManagedFields, writeBackCommittedRow, WriteBackConflictError } from "./write-back.js";
 import { withKeyLock } from "./key-lock.js";
 import { withOwnedTransaction } from "./request-transaction.js";
-import { txnPausePoint } from "./txn-pause-point.js";
+import { txnFault, txnPausePoint } from "./txn-pause-point.js";
 import { withMemoryWriteLockOnce, writeOutcomeUnknownResponse } from "./memory-write-lock.js";
 import { isDeepStrictEqual } from "node:util";
 import { retryRowProblem } from "./federation-retry-lib.js";
@@ -1548,9 +1548,10 @@ export class FederationSync extends Resource {
         // flair#2450 set `wholeRow` for Soul, Agent, Relationship and Message;
         // flair#2475 extends it to Memory: Memory's identity fields
         // (instanceToken, contentHash, createdAt, agentId) do not move on a
-        // field-only update, and the merge writes the whole row, so an
-        // identity-only check let it put back the changed field's pre-change
-        // value.
+        // field-only update, so an identity-only check let the merge put back
+        // a changed field's pre-change value. Memory writes the fields that
+        // differ from the in-transaction row as an incremental update, and
+        // rewrites the whole row only when a stripped field must be removed.
         let outcome: any;
         writeBackStarted = true;
         try {
@@ -1729,8 +1730,11 @@ export class FederationSync extends Resource {
     await (databases as any).flair.Peer.put(peerUpdate);
 
     // Log sync operation with skip-reason breakdown so the partial state
-    // is debuggable instead of a black box.
+    // is debuggable instead of a black box. The response says whether the row
+    // was written: a failed write is reported, never assumed.
+    let syncLogWritten = false;
     try {
+      if (txnFault("federation-synclog")) throw new Error("injected SyncLog write failure");
       const errorParts: string[] = [];
       if (Object.keys(skippedReasons).length > 0) {
         errorParts.push(
@@ -1760,7 +1764,10 @@ export class FederationSync extends Resource {
         durationMs: Date.now() - startTime,
         createdAt: nowIso,
       });
-    } catch { /* non-fatal */ }
+      syncLogWritten = true;
+    } catch (err) {
+      console.warn(`[Federation] SyncLog write failed for ${instanceId}: ${String(err)}`);
+    }
 
     return {
       merged,
@@ -1770,6 +1777,7 @@ export class FederationSync extends Resource {
       indeterminate,
       total: records.length,
       durationMs: Date.now() - startTime,
+      syncLogWritten,
     };
   }
 }

@@ -1,0 +1,2 @@
+- **A synced Memory row the hub refused because the row was locked is offered again on a later sync.** 
+  The sender keeps one pending row per (hub, Memory, record) in `FederationRetry` when the hub's refusal is retryable, and offers it again independent of its sync cursor, so the refusal no longer waits for the row itself to change. A non-retryable refusal is never re-offered. The federation sync response also says whether its SyncLog row was written (#2797, #2792).
