@@ -17,7 +17,7 @@ import { existsSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 
 import { dirname, resolve } from "node:path";
 import * as render from "../render.js";
-import { isLocalBase, resolveAdminUser, resolveLocalAdminPass, resolveAdminPassFromSources, AdminPassSourceError, ADMIN_PASS_FILE_FLAG, ADMIN_PASS_FILE_HELP, ADMIN_PASS_FLAG, ADMIN_PASS_HELP, apiErrorBody, boundServerText } from "../lib/auth-resolve.js";
+import { isLocalBase, resolveAdminUser, resolveLocalAdminPass, resolveAdminPassFromSources, AdminPassSourceError, ADMIN_PASS_FILE_FLAG, ADMIN_PASS_FILE_HELP, ADMIN_PASS_FLAG, ADMIN_PASS_HELP, apiErrorRawBody, boundErrorText } from "../lib/auth-resolve.js";
 import type { OpsSearch } from "../rem/restore.js";
 import { proveLocalInstancePair, type LocalInstancePairDeps } from "../lib/local-instance-pair.js";
 import { decideInstanceAnswer, readableInstanceRows, INSTANCE_ROWS_SQL, type InstanceIdentityRow } from "../lib/instance-identity-row.js";
@@ -637,9 +637,10 @@ export function candidateIncompleteFlag(claim: unknown): string | null {
 
 /**
  * Classifies a thrown /ReflectMemories execute-mode error for CLI display.
- * `api()` throws an ApiHttpError whose `body` is the response text, with the
- * request's credential values replaced, for a non-2xx response with a body
- * (flair#2764) — the two classified distillation failures are:
+ * `api()` throws an ApiHttpError for a non-2xx response with a body
+ * (flair#2764). The kind is read from its unredacted text (apiErrorRawBody);
+ * the text shown goes through boundErrorText, which redacts the credential
+ * values the request sent. The two classified distillation failures are:
  *   503 no-backend:        { error: "No generative backend configured..." }
  *   502 distillation_failed: { error: "distillation_failed", detail: "..." }
  * The 503 pause refusal ({ error: "rem_aborted", detail: "..." }, sent while the
@@ -653,17 +654,17 @@ export function candidateIncompleteFlag(claim: unknown): string | null {
 export function describeReflectError(err: unknown): { kind: "no-backend" | "distillation-failed" | "other"; text: string } {
   const message = typeof err === "string" ? err : String((err as { message?: unknown })?.message ?? err);
   try {
-    const parsed = JSON.parse(apiErrorBody(err) || message);
+    const parsed = JSON.parse(apiErrorRawBody(err) || message);
     if (parsed && typeof parsed === "object") {
       if (parsed.error === "distillation_failed") {
         const detail = typeof parsed.detail === "string" ? parsed.detail : "";
-        return { kind: "distillation-failed", text: boundServerText(detail || parsed.error) };
+        return { kind: "distillation-failed", text: boundErrorText(err, detail || parsed.error) };
       }
       if (typeof parsed.error === "string" && parsed.error.startsWith("No generative backend configured")) {
-        return { kind: "no-backend", text: boundServerText(parsed.error) };
+        return { kind: "no-backend", text: boundErrorText(err, parsed.error) };
       }
       if (typeof parsed.error === "string") {
-        return { kind: "other", text: boundServerText(parsed.error) };
+        return { kind: "other", text: boundErrorText(err, parsed.error) };
       }
     }
   } catch {

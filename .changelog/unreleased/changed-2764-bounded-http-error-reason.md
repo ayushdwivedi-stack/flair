@@ -7,11 +7,13 @@
   message from a response body it read and `FLAIR_DEBUG` is set, it also writes
   that body to stderr, encoded as one JSON string (#2764).
 
-  Before the message or that stderr line is built, every occurrence in the
-  response body of a credential value the request sent is replaced with
-  `[redacted]`: the Authorization header value, the part after its scheme, a
-  Basic header's decoded `user:password` and password, and a TPS-Ed25519
-  signature.
+  The message, that stderr line (its request path included) and the error's
+  displayed body are each redacted as their last step: every credential value
+  the request sent (the Authorization header value, the part after its scheme,
+  a Basic header's decoded `user:password` and password, a TPS-Ed25519
+  signature) is replaced with `[redacted]` in its literal, JSON-escaped and
+  percent-encoded forms. The reason is cut to its 200 characters only after
+  that replacement, so the cut never splits one of those forms.
 
   An HTTP error response whose body mentions `fetch failed` or `unable to
   connect` is no longer treated as a failed connection: the CLI no longer

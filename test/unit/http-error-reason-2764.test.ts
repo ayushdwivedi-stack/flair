@@ -4,10 +4,12 @@
  * response with `Content-Length: 0`), the ApiHttpError message is
  * `HTTP <status>` plus the JSON body's named error, or else a bounded one-line
  * excerpt of the body, and the error keeps the body, which sendJsonRequest
- * writes to stderr only with FLAIR_DEBUG set. Each credential value the request
- * sent is replaced by `[redacted]` in that body, and so in the message and the
- * stderr line. A zero-length failure keeps the message `HTTP <status>`, and the
- * credential-less 403 keeps main's hint.
+ * writes to stderr only with FLAIR_DEBUG set. The message, `body` and that
+ * stderr line are each redacted as their last step: every credential value the
+ * request sent, in its literal, JSON-escaped and percent-encoded forms, becomes
+ * `[redacted]`. Classifiers read the unredacted body. A zero-length failure
+ * keeps the message `HTTP <status>`, and the credential-less 403 keeps main's
+ * hint.
  *
  * Every request goes through the real sendJsonRequest to a node HTTP listener
  * on 127.0.0.1 that this file starts. Two kinds of case spawn the built CLI
@@ -440,13 +442,13 @@ describe("flair#2764 — an ApiHttpError is never a connect failure", () => {
   }, 30_000);
 });
 
-describe("flair#2764 — credential values the request sent are replaced before either output", () => {
+describe("flair#2764 — each printed string is redacted with the request's credential values as its last step", () => {
   const PASSWORD = "s3cret-pass-2764-fixture";
   const BASIC_CREDENTIAL = Buffer.from(`admin:${PASSWORD}`).toString("base64");
   const BASIC = `Basic ${BASIC_CREDENTIAL}`;
 
   /** GET /echo from a listener that answers 500 with a body built from the request's Authorization header. */
-  async function failEcho(authHeader: string, bodyOf: (sent: string) => string, debug: boolean) {
+  async function failEcho(authHeader: string, bodyOf: (sent: string) => string, debug: boolean, path = "/echo") {
     const echo = await startListener((_line, req) => ({ status: 500, body: bodyOf(String(req.headers.authorization ?? "")) }));
     const written: string[] = [];
     const spy = spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
@@ -458,7 +460,7 @@ describe("flair#2764 — credential values the request sent are replaced before 
     try {
       if (debug) process.env.FLAIR_DEBUG = "1";
       else delete process.env.FLAIR_DEBUG;
-      await sendJsonRequest(new URL("/echo", `http://127.0.0.1:${echo.port}`), "GET", undefined, authHeader, true);
+      await sendJsonRequest(new URL(path, `http://127.0.0.1:${echo.port}`), "GET", undefined, authHeader, true);
     } catch (err) {
       caught = err;
     } finally {
@@ -513,6 +515,54 @@ describe("flair#2764 — credential values the request sent are replaced before 
     const long = await failEcho(`Bearer ${longToken}`, () => longToken, false);
     expect(long.err.message).toBe("HTTP 500: [redacted]");
     expect(long.err.message).not.toContain("kkkk");
+  });
+
+  test("a Basic password holding a quote and a backslash, echoed JSON-escaped, is redacted in the message, body and debug line", async () => {
+    const password = 'p"ss\\w0rd-2764';
+    const credential = Buffer.from(`admin:${password}`).toString("base64");
+    const escaped = JSON.stringify(password).slice(1, -1);
+    const { err, stderr } = await failEcho(
+      `Basic ${credential}`,
+      (sent) => JSON.stringify({ error: `bad password ${password}`, detail: `header ${sent}` }),
+      true,
+    );
+    const shown = JSON.stringify({ error: "bad password [redacted]", detail: "header [redacted]" });
+    expect(err.message).toBe("HTTP 500: bad password [redacted]");
+    expect(err.body).toBe(shown);
+    expect(stderr).toBe(`[flair] GET /echo answered HTTP 500; response body: ${JSON.stringify(shown)}\n`);
+    for (const text of [err.message, err.body!, stderr]) {
+      expect(text).not.toContain(password);
+      expect(text).not.toContain(escaped);
+      expect(text).not.toContain(credential);
+      expect(text).toContain("[redacted]");
+    }
+  });
+
+  test("a password equal to a JSON key: the reflect classifier's kind comes from the raw body, and its text is redacted", async () => {
+    const { err } = await failEcho(
+      `Basic ${Buffer.from("admin:error").toString("base64")}`,
+      () => JSON.stringify({ error: "distillation_failed", detail: "model error" }),
+      false,
+    );
+    expect(describeReflectError(err)).toEqual({ kind: "distillation-failed", text: "model [redacted]" });
+    expect(err.message).toBe("HTTP 500: distillation_failed");
+    expect(err.body).toBe('{"[redacted]":"distillation_failed","detail":"model [redacted]"}');
+  });
+
+  test("a request path holding the Bearer value: the debug line shows [redacted]", async () => {
+    const token = `tok-2764-path-${"p".repeat(20)}`;
+    const { err, stderr } = await failEcho(`Bearer ${token}`, () => "nope", true, `/echo/${token}`);
+    expect(stderr).toBe(`[flair] GET /echo/[redacted] answered HTTP 500; response body: "nope"\n`);
+    expect(err.message).toBe("HTTP 500: nope");
+  });
+
+  test("a credential across the 200-character bound leaves no fragment in the message, body or debug line", async () => {
+    const token = "Zq7mK2vR9tX4wB6nL1pH8sD3fG5jC0yA";
+    const { err, stderr } = await failEcho(`Bearer ${token}`, () => `${"x".repeat(190)}${token} tail`, true);
+    expect(err.message).toBe(`HTTP 500: ${"x".repeat(190)}[redacted]...`);
+    for (const text of [err.message, err.body!, stderr]) {
+      for (let i = 0; i + 8 <= token.length; i++) expect(text).not.toContain(token.slice(i, i + 8));
+    }
   });
 
   test("a body that carries no credential value is unchanged", async () => {
