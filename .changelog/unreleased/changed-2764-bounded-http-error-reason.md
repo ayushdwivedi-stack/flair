@@ -16,7 +16,8 @@
   Basic header in the form Flair's server accepts, and a TPS-Ed25519 header,
   are read with the server's own grammar. When the header names the Basic,
   Bearer or TPS-Ed25519 scheme but no credential can be read from it, the
-  server's text is shown as `[body withheld]` instead. The stderr line shows a
+  server's non-empty text is shown as `[body withheld]` instead (an empty body
+  stays empty and the message is the status alone). The stderr line shows a
   JSON body re-serialized, or withheld when it cannot be, and the request path
   percent-decoded (withheld when it does not decode or holds a control
   character). Redaction removes the request's credential values from the text

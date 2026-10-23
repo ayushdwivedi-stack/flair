@@ -94,8 +94,9 @@ import { resolveHome } from "./home.js";
  *     `credentialsInHeader` read from the request's Authorization header: a
  *     JSON body re-serialized with every string in it redacted after decoding,
  *     or withheld when it cannot be; any other body redacted as text; and any
- *     body withheld when that header names basic, bearer or tps-ed25519 but
- *     its credential could not be read. The message's reason is decided
+ *     non-empty body withheld when that header names basic, bearer or
+ *     tps-ed25519 but its credential could not be read (an empty body stays
+ *     empty, and the message is then the status alone). The message's reason is decided
  *     separately (`describeHttpFailure`), from the unredacted text:
  *     BODY_WITHHELD for any non-empty body when the header's credential could
  *     not be read; otherwise the JSON body's named error, redacted, even when
@@ -131,7 +132,7 @@ export class ApiHttpError extends Error {
    * `sentValues` are the credential values `credentialsInHeader` read from the
    * request's Authorization header: the message and `body` are redacted with them
    * (within the scope on ApiHttpError). `withhold` is credentialsInHeader's
-   * flag: when set, the server's text is shown as BODY_WITHHELD in the message
+   * flag: when set, the server's non-empty text is shown as BODY_WITHHELD in the message
    * and `body`. The unredacted text, the values and the flag are kept in a
    * module-private map for apiErrorRawBody and boundErrorText.
    */
@@ -603,7 +604,8 @@ export function apiErrorRawBody(err: unknown): string | undefined {
  * `text` (taken from apiErrorRawBody) as one bounded line for output, with
  * the credential values credentialsInHeader read from `err`'s request header
  * redacted from it (boundAndRedact, within the scope on ApiHttpError), or
- * BODY_WITHHELD when credentialsInHeader set `withhold` for that header. For an error that has no sent values,
+ * BODY_WITHHELD when credentialsInHeader set `withhold` for that header and
+ * `text` is non-empty (an empty `text` stays empty). For an error that has no sent values,
  * boundServerText(text) (flair#2764).
  */
 export function boundErrorText(err: unknown, text: string): string {
@@ -616,8 +618,9 @@ export function boundErrorText(err: unknown, text: string): string {
  * With FLAIR_DEBUG set (any non-empty value), write the display form of a
  * failed response's body to stderr as one JSON string (flair#2764). The path
  * is shown by displayPath (percent-decoded, then redacted, or withheld) and
- * the body by displayBody (a JSON body re-serialized, or withheld; any body
- * withheld when `withhold` is set), each redacted within the scope on
+ * the body by displayBody (a JSON body re-serialized, or withheld; any
+ * non-empty body withheld when `withhold` is set, an empty one shown as ""),
+ * each redacted within the scope on
  * ApiHttpError; the labels, method, status and the JSON encoding of the body
  * are written by this function and are not passed through redaction. In the
  * JSON-encoded body, DEL, C1 control characters and the Unicode line and
