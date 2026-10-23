@@ -11,30 +11,16 @@
  * Instance A is the restore target in the first test. Its rows start different
  * from the snapshot (a changed Memory, an extra Memory, a changed Soul), and it
  * holds a leftover MemoryCandidate for the agent whose claim is the snapshot
- * Soul's value. Restore must find that candidate through A's operations API and
- * delete it, since the learned-content guard refuses the Soul write while the
- * candidate exists, and must end with exactly the snapshot's rows. A candidate
- * search that returned nothing would leave the candidate in place and fail the
- * Soul write. That restore uses only --admin-pass-file; a second one, from a
- * newly drifted state, uses only --admin-pass.
- *
- * The refusal test starts instance B, a second real Harper, and runs with NO
- * configured pair (no config file in HOME): FLAIR_URL names B and
- * FLAIR_OPS_PORT names A's operations port. Restore must refuse before any
- * listing, delete or write, and both instances keep every row. That run loads
- * test/helpers/fetch-request-log-preload.ts through `node --import`, and its
- * request log must hold one request: a POST to A's operations port, the pair
- * check's configuration read.
- *
- * The last test runs the non-loopback branch of the preflight pair check
- * (`establishRestorePair` with a target marked non-loopback) against the two real
- * Harpers: it passes only when the HTTP endpoint and the operations endpoint
- * each report exactly one flair.Instance row with the same id, and refuses
- * with no row on a side or with A's HTTP endpoint and B's operations endpoint
- * once each has its own row.
+ * Soul's value. Restore lists that candidate through
+ * GET /AdminMemoryCandidates/{agentId} on A's HTTP endpoint and deletes it,
+ * since the learned-content guard refuses the Soul write while the candidate
+ * exists, and must end with exactly the snapshot's rows. A candidate search
+ * that returned nothing would leave the candidate in place and fail the Soul
+ * write. That restore uses only --admin-pass-file; a second one, from a newly
+ * drifted state, uses only --admin-pass.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -42,7 +28,6 @@ import { pathToFileURL } from "node:url";
 import { startHarper, stopHarpers, type HarperInstance, HARPER_STOP_BUDGET_MS } from "../helpers/harper-lifecycle";
 import { nodeBin } from "../helpers/node-runtime";
 import { createSnapshot } from "../../src/rem/snapshot.ts";
-import { establishRestorePair, type RestoreTarget } from "../../src/commands/rem.ts";
 
 const CLI = join(process.cwd(), "dist", "cli.js");
 const FETCH_LOG_PRELOAD = join(import.meta.dirname, "..", "helpers", "fetch-request-log-preload.ts");
@@ -54,7 +39,6 @@ const CANDIDATE_ID = "c-leftover";
 const SNAPSHOT_SOUL_VALUE = "restored soul";
 
 let a: HarperInstance;
-let b: HarperInstance | undefined;
 let home: string;
 let passDir: string;
 let passFile: string;
@@ -164,11 +148,11 @@ beforeAll(async () => {
 
 afterAll(async () => {
   try {
-    await stopHarpers([a, b]);
+    await stopHarpers([a]);
   } finally {
     if (home) rmSync(home, { recursive: true, force: true });
     if (passDir) rmSync(passDir, { recursive: true, force: true });
-    for (const h of [a, b]) {
+    for (const h of [a]) {
       if (h?.installDir?.startsWith(tmpdir())) rmSync(h.installDir, { recursive: true, force: true });
     }
   }
@@ -234,80 +218,4 @@ describe("flair#2708 — rem restore on a real instance", () => {
     expect(await agentRows(a, "Memory", ["id", "content"])).toEqual([{ id: MEMORY_ID, content: "restored memory" }]);
     expect(await agentRows(a, "Soul", ["id", "key", "value"])).toEqual([{ id: SOUL_ID, key: "identity", value: SNAPSHOT_SOUL_VALUE }]);
   }, 120_000);
-
-  test("with no configured pair, refuses FLAIR_URL at one instance and FLAIR_OPS_PORT at another before any listing or write", async () => {
-    b = await startHarper();
-    assertOwnInstance(b);
-    expect(existsSync(join(home, ".flair", "config.yaml"))).toBe(false);
-
-    await ops(a, { operation: "insert", table: "MemoryCandidate", records: [candidateRow("c-on-a", "a candidate on instance A")] });
-    await ops(b, {
-      operation: "insert",
-      table: "Memory",
-      records: [{ id: "m-on-b", agentId: AGENT_ID, content: "instance B memory", durability: "persistent", createdAt }],
-    });
-    await ops(b, { operation: "insert", table: "Soul", records: [{ id: SOUL_ID, agentId: AGENT_ID, key: "identity", value: "instance B soul", createdAt }] });
-
-    const tables: Array<[string, string[]]> = [
-      ["Memory", ["id", "content"]],
-      ["Soul", ["id", "value"]],
-      ["MemoryCandidate", ["id", "claim"]],
-    ];
-    const snapshotRows = async () => {
-      const out: Record<string, unknown> = {};
-      for (const h of [a, b!]) for (const [table, attrs] of tables) out[`${h.httpURL} ${table}`] = await agentRows(h, table, attrs);
-      return out;
-    };
-    const before = await snapshotRows();
-    expect(before[`${a.httpURL} MemoryCandidate`]).toContainEqual({ id: "c-on-a", claim: "a candidate on instance A" });
-
-    const aOps = new URL(a.opsURL).port;
-    const fetchLog = join(home, "refusal-fetch-log.jsonl");
-    const result = await runRestore({ FLAIR_URL: b.httpURL, FLAIR_OPS_PORT: aOps }, ["--admin-pass", b.admin.password], snapshotStem, fetchLog);
-
-    expect(result.code, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`).not.toBe(0);
-    expect(result.stderr).toContain(
-      `operations port ${aOps} belongs to the instance serving HTTP port ${new URL(a.httpURL).port}, not restore target ${b.httpURL}`,
-    );
-    expect(result.stderr).toContain("nothing was listed, deleted or written");
-    // The request log holds one request, a POST to A's operations port: the
-    // configuration read whose answer names A's HTTP port in the refusal above.
-    const requests = readFileSync(fetchLog, "utf-8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
-    expect(requests).toEqual([{ method: "POST", host: `127.0.0.1:${aOps}`, path: "/" }]);
-    expect(result.stdout).not.toContain("Deleted:");
-    expect(await snapshotRows()).toEqual(before);
-  }, 300_000);
-
-  test("the non-loopback pair check passes only when both endpoints of real instances report the same single identity", async () => {
-    if (!b) {
-      b = await startHarper();
-      assertOwnInstance(b);
-    }
-    const second = b;
-    const remote = (http: HarperInstance, opsSide: HarperInstance): RestoreTarget => ({
-      baseUrl: http.httpURL.replace(/\/+$/, ""),
-      opsUrl: opsSide.opsURL.replace(/\/+$/, ""),
-      httpPort: Number(new URL(http.httpURL).port),
-      opsPort: Number(new URL(opsSide.opsURL).port),
-      loopback: false,
-    });
-    const admin = { user: a.admin.username, pass: a.admin.password };
-    const instanceRow = (id: string) => ({ id, publicKey: `seed-pub-${id}`, role: "hub", status: "active", createdAt: new Date().toISOString() });
-
-    // A fresh instance has no Instance row, so nothing proves the pair.
-    await expect(establishRestorePair(remote(a, a), admin)).rejects.toThrow(/reports no flair\.Instance row/);
-
-    await ops(a, { operation: "insert", table: "Instance", records: [instanceRow("instance-a-2708")] });
-    await establishRestorePair(remote(a, a), admin);
-
-    // A's HTTP endpoint with B's operations endpoint, B still without a row.
-    await expect(establishRestorePair(remote(a, second), admin)).rejects.toThrow(
-      /the operations endpoint's Instance read reports no flair\.Instance row/,
-    );
-
-    await ops(second, { operation: "insert", table: "Instance", records: [instanceRow("instance-b-2708")] });
-    await expect(establishRestorePair(remote(a, second), admin)).rejects.toThrow(/report different flair\.Instance ids/);
-    await expect(establishRestorePair(remote(second, a), admin)).rejects.toThrow(/report different flair\.Instance ids/);
-    await establishRestorePair(remote(second, second), admin);
-  }, 300_000);
 });

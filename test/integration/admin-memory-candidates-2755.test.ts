@@ -1,0 +1,266 @@
+/**
+ * admin-memory-candidates-2755.test.ts — the admin-only candidate listing a
+ * restore uses (flair#2755), against real Harpers.
+ *
+ * The route is `GET /AdminMemoryCandidates/{agentId}`. It returns the named
+ * agent's candidate ids, refuses an unauthenticated caller (the `/Admin*` path
+ * gate's 401) and a verified non-admin agent (AccessViolation 403), honours its
+ * `limit`, and never returns another agent's rows.
+ *
+ * The restore test starts two instances that hold the same `flair.Instance`
+ * row and different MemoryCandidate rows. The restore is aimed at one, with
+ * FLAIR_OPS_PORT naming the other's operations port. It must list and delete
+ * on the target alone: the target loses its candidate, the other instance
+ * keeps its own.
+ */
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { basename, join } from "node:path";
+import { tmpdir } from "node:os";
+import nacl from "tweetnacl";
+import { randomUUID } from "node:crypto";
+import { startHarper, stopHarpers, type HarperInstance, HARPER_STOP_BUDGET_MS } from "../helpers/harper-lifecycle";
+import { nodeBin } from "../helpers/node-runtime";
+import { createSnapshot } from "../../src/rem/snapshot.ts";
+
+const CLI = join(process.cwd(), "dist", "cli.js");
+const AGENT_ID = "agent-a";
+const OTHER_AGENT_ID = "agent-b";
+const MEMORY_ID = "m-restored";
+const SOUL_ID = `soul-${AGENT_ID}`;
+const createdAt = new Date().toISOString();
+
+let adminHarper: HarperInstance;
+let other: HarperInstance;
+let home: string;
+const plainAgent = mkAgent("plain-2755");
+
+interface TestAgent { id: string; publicKey: string; secretKey: Uint8Array; }
+
+function mkAgent(id: string): TestAgent {
+  const kp = nacl.sign.keyPair();
+  return { id, publicKey: Buffer.from(kp.publicKey).toString("base64"), secretKey: kp.secretKey };
+}
+
+function ed25519Header(agent: TestAgent, method: string, path: string): string {
+  const ts = Date.now().toString();
+  const nonce = randomUUID();
+  const payload = `${agent.id}:${ts}:${nonce}:${method}:${path}`;
+  const sig = nacl.sign.detached(new TextEncoder().encode(payload), agent.secretKey);
+  return `TPS-Ed25519 ${agent.id}:${ts}:${nonce}:${Buffer.from(sig).toString("base64")}`;
+}
+
+function adminAuth(h: HarperInstance): string {
+  return "Basic " + btoa(`${h.admin.username}:${h.admin.password}`);
+}
+
+function assertOwnInstance(h: HarperInstance): void {
+  for (const raw of [h.httpURL, h.opsURL]) {
+    const u = new URL(raw);
+    const port = Number(u.port);
+    if (u.hostname !== "127.0.0.1" || !(port > 0) || port === 9925 || port === 9926) {
+      throw new Error(`refusing to run against ${u.href}: not this test's ephemeral instance`);
+    }
+  }
+  if (!h.process?.pid || !h.installDir.startsWith(tmpdir())) {
+    throw new Error(`refusing to run: ${h.httpURL} is not an instance this test started`);
+  }
+}
+
+async function ops(h: HarperInstance, body: Record<string, unknown>): Promise<any[]> {
+  const res = await fetch(h.opsURL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: adminAuth(h) },
+    body: JSON.stringify({ ...body, database: "flair" }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!res.ok) throw new Error(`ops ${String(body.operation)} returned ${res.status}: ${await res.text()}`);
+  return (await res.json()) as any[];
+}
+
+async function candidateIds(h: HarperInstance, agentId: string): Promise<string[]> {
+  const rows = await ops(h, {
+    operation: "search_by_conditions",
+    table: "MemoryCandidate",
+    operator: "and",
+    conditions: [{ search_attribute: "agentId", search_type: "equals", search_value: agentId }],
+    get_attributes: ["id"],
+  });
+  return rows.map((r) => String(r.id)).sort();
+}
+
+async function seedAgent(h: HarperInstance, agent: TestAgent, role: "admin" | "agent"): Promise<void> {
+  const res = await fetch(h.opsURL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: adminAuth(h) },
+    body: JSON.stringify({
+      operation: "insert",
+      database: "flair",
+      table: "Agent",
+      records: [{ id: agent.id, name: agent.id, role, admin: role === "admin", publicKey: agent.publicKey, createdAt }],
+    }),
+  });
+  if (!res.ok) throw new Error(`seed ${agent.id} returned ${res.status}: ${await res.text()}`);
+}
+
+async function seedCandidate(h: HarperInstance, id: string, agentId: string, claim: string): Promise<void> {
+  await ops(h, {
+    operation: "insert",
+    table: "MemoryCandidate",
+    records: [{ id, agentId, claim, generatedAt: createdAt, status: "pending" }],
+  });
+}
+
+function runRestore(h: HarperInstance, opsSide: HarperInstance, date: string): Promise<{ code: number; stdout: string; stderr: string }> {
+  const childEnv: Record<string, string | undefined> = {
+    ...process.env,
+    HOME: home,
+    FLAIR_URL: h.httpURL,
+    FLAIR_OPS_PORT: new URL(opsSide.opsURL).port,
+    FLAIR_OPS_TARGET: undefined,
+    FLAIR_TARGET: undefined,
+    FLAIR_TOKEN: undefined,
+    FLAIR_ADMIN_PASS: undefined,
+    FLAIR_ADMIN_USER: undefined,
+    HDB_ADMIN_PASSWORD: undefined,
+    FLAIR_AGENT_ID: undefined,
+    NO_COLOR: "1",
+  };
+  for (const [key, value] of Object.entries(childEnv)) if (value === undefined) delete childEnv[key];
+  const child = Bun.spawn(
+    [nodeBin({ env: childEnv as Record<string, string> }), CLI, "rem", "restore", date, "--agent", AGENT_ID, "--apply", "--admin-pass", h.admin.password],
+    { env: childEnv as Record<string, string>, timeout: 90_000, stdout: "pipe", stderr: "pipe" },
+  );
+  return (async () => {
+    const stdout = await new Response(child.stdout).text();
+    const stderr = await new Response(child.stderr).text();
+    const code = await child.exited;
+    return { code, stdout, stderr };
+  })();
+}
+
+beforeAll(async () => {
+  adminHarper = await startHarper();
+  assertOwnInstance(adminHarper);
+  await seedAgent(adminHarper, mkAgent("admin-2755"), "admin");
+  await seedAgent(adminHarper, plainAgent, "agent");
+  await seedCandidate(adminHarper, "c-a-1", AGENT_ID, "first candidate");
+  await seedCandidate(adminHarper, "c-a-2", AGENT_ID, "second candidate");
+  await seedCandidate(adminHarper, "c-a-3", AGENT_ID, "third candidate");
+  await seedCandidate(adminHarper, "c-b-1", OTHER_AGENT_ID, "another agent's candidate");
+  home = mkdtempSync(join(tmpdir(), "flair-2755-real-"));
+  mkdirSync(join(home, ".flair"), { recursive: true });
+}, 300_000);
+
+afterAll(async () => {
+  try {
+    await stopHarpers([adminHarper, other]);
+  } finally {
+    if (home) rmSync(home, { recursive: true, force: true });
+    for (const h of [adminHarper, other]) {
+      if (h?.installDir?.startsWith(tmpdir())) rmSync(h.installDir, { recursive: true, force: true });
+    }
+  }
+}, HARPER_STOP_BUDGET_MS * 2);
+
+describe("flair#2755 — admin-only candidate listing", () => {
+  const path = (agentId: string, query = "") => `/AdminMemoryCandidates/${agentId}${query}`;
+
+  test("returns only the named agent's candidate ids, with the requested bound", async () => {
+    const all = await fetch(`${adminHarper.httpURL}${path(AGENT_ID)}`, { headers: { Authorization: adminAuth(adminHarper) } });
+    expect(all.status).toBe(200);
+    const body = await all.json() as any;
+    expect(body.hasMore).toBe(false);
+    expect(body.candidates.map((c: any) => c.id).sort()).toEqual(["c-a-1", "c-a-2", "c-a-3"]);
+    for (const row of body.candidates) expect(Object.keys(row)).toEqual(["id"]);
+
+    const bounded = await fetch(`${adminHarper.httpURL}${path(AGENT_ID, "?limit=2")}`, { headers: { Authorization: adminAuth(adminHarper) } });
+    expect(bounded.status).toBe(200);
+    const page = await bounded.json() as any;
+    expect(page.candidates).toHaveLength(2);
+    expect(page.hasMore).toBe(true);
+    expect(page.candidates.every((c: any) => c.id.startsWith("c-a-"))).toBe(true);
+  });
+
+  test("refuses an unauthenticated caller with the admin path gate's 401", async () => {
+    const res = await fetch(`${adminHarper.httpURL}${path(AGENT_ID)}`);
+    expect(res.status).toBe(401);
+    expect(await res.text()).toBe("Authentication required.");
+  });
+
+  test("refuses a verified non-admin agent with 403", async () => {
+    const requestPath = path(AGENT_ID);
+    const res = await fetch(`${adminHarper.httpURL}${requestPath}`, {
+      headers: { Authorization: ed25519Header(plainAgent, "GET", requestPath) },
+    });
+    expect(res.status).toBe(403);
+    const body = await res.json() as any;
+    expect(body.code).toBe("AccessViolation");
+    expect(body.status).toBe(403);
+  });
+
+  test("with two instances holding the same Instance row, a restore lists and deletes on its target only", async () => {
+    other = await startHarper();
+    assertOwnInstance(other);
+
+    const instanceRow = {
+      id: "instance-shared-2755",
+      publicKey: "seed-pub-2755",
+      role: "hub",
+      status: "active",
+      createdAt,
+    };
+    await ops(adminHarper, { operation: "insert", table: "Instance", records: [instanceRow] });
+    await ops(other, { operation: "insert", table: "Instance", records: [instanceRow] });
+
+    // The target starts with a candidate and drifted rows; the other instance
+    // holds a different candidate for the same agent.
+    await seedCandidate(adminHarper, "c-on-target", AGENT_ID, "target candidate");
+    await seedCandidate(other, "c-on-other", AGENT_ID, "other candidate");
+    await ops(adminHarper, {
+      operation: "insert",
+      table: "Memory",
+      records: [{ id: "m-drifted", agentId: AGENT_ID, content: "drifted", durability: "persistent", createdAt }],
+    });
+    await ops(other, {
+      operation: "insert",
+      table: "Memory",
+      records: [{ id: "m-on-other", agentId: AGENT_ID, content: "other instance memory", durability: "persistent", createdAt }],
+    });
+
+    const created = await createSnapshot({
+      agentId: AGENT_ID,
+      flairVersion: "0.0.0-test",
+      memories: [{ id: MEMORY_ID, agentId: AGENT_ID, content: "restored memory", durability: "persistent", createdAt }],
+      soul: { id: SOUL_ID, agentId: AGENT_ID, key: "identity", value: "restored soul", createdAt },
+      pendingCandidateCount: null,
+      rootOverride: join(home, ".flair", "snapshots"),
+    });
+    const stem = basename(created.path).replace(/\.tar\.gz$/, "");
+
+    const result = await runRestore(adminHarper, other, stem);
+    expect(result.code, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain("Status:       completed");
+
+    expect(await candidateIds(adminHarper, AGENT_ID)).toEqual([]);
+    expect(await candidateIds(other, AGENT_ID)).toEqual(["c-on-other"]);
+
+    const targetMemories = await ops(adminHarper, {
+      operation: "search_by_conditions",
+      table: "Memory",
+      operator: "and",
+      conditions: [{ search_attribute: "agentId", search_type: "equals", search_value: AGENT_ID }],
+      get_attributes: ["id", "content"],
+    });
+    expect(targetMemories).toEqual([{ id: MEMORY_ID, content: "restored memory" }]);
+
+    const otherMemories = await ops(other, {
+      operation: "search_by_conditions",
+      table: "Memory",
+      operator: "and",
+      conditions: [{ search_attribute: "agentId", search_type: "equals", search_value: AGENT_ID }],
+      get_attributes: ["id", "content"],
+    });
+    expect(otherMemories).toEqual([{ id: "m-on-other", content: "other instance memory" }]);
+  }, 300_000);
+});

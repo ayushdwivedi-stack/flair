@@ -21,7 +21,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import nacl from "tweetnacl";
 import { createSnapshot } from "../../src/rem/snapshot.ts";
-import { establishRestorePair, resolveRestoreTarget, type RestoreTarget } from "../../src/commands/rem.ts";
+import { resolveRestoreTarget } from "../../src/commands/rem.ts";
 import { resolveOpsUrlFromTarget } from "../../src/cli.ts";
 import { ApiHttpError, authedRequest } from "../../src/lib/auth-resolve.ts";
 import { STUB_ADMIN_PASS, startStubInstance, type StubInstance, type StubRequest, type StubSeed } from "../helpers/rem-restore-stub-instance.ts";
@@ -133,7 +133,7 @@ async function runRestore(args: {
 }
 
 const writeMethods = new Set(["DELETE", "PUT", "POST", "PATCH"]);
-const isListing = (r: StubRequest) => r.endpoint === "ops" && r.operation === "search_by_conditions";
+const isListing = (r: StubRequest) => r.endpoint === "http" && r.method === "GET" && r.path.startsWith("/AdminMemoryCandidates/");
 const hostOf = (instance: StubInstance, endpoint: "http" | "ops") =>
   `127.0.0.1:${endpoint === "http" ? instance.httpPort : instance.opsPort}`;
 
@@ -150,11 +150,10 @@ describe("flair#2708 — rem restore target (CLI)", () => {
     expect(result.stdout).toContain("Deleted:      2 memories, 1 souls, 1 candidates");
 
     const bRequests = b.requests();
-    // The pair check read B's configuration on its operations port, then the
-    // candidate listing ran there and found B's leftover candidate.
-    const opsOps = bRequests.filter((r) => r.endpoint === "ops").map((r) => r.operation);
-    expect(opsOps[0]).toBe("get_configuration");
-    expect(bRequests.some((r) => isListing(r) && r.table === "MemoryCandidate")).toBe(true);
+    // The candidate listing and every write ran on B's HTTP endpoint; B's
+    // operations port received nothing.
+    expect(bRequests.some((r) => isListing(r) && r.path === `/AdminMemoryCandidates/${AGENT_ID}`)).toBe(true);
+    expect(bRequests.some((r) => r.endpoint === "ops")).toBe(false);
     expect(bRequests.some((r) => r.endpoint === "http" && r.method === "DELETE" && r.path === "/MemoryCandidate/c-1")).toBe(true);
     expect(bRequests.some((r) => r.endpoint === "http" && r.method === "PUT" && r.path.startsWith("/Soul/"))).toBe(true);
     expect(bRequests.some((r) => r.endpoint === "http" && r.method === "PUT" && r.path === "/Memory/m1")).toBe(true);
@@ -163,10 +162,10 @@ describe("flair#2708 — rem restore target (CLI)", () => {
     // Instance A, named by the default config, received nothing.
     expect(a.requests()).toEqual([]);
 
-    // Every request the CLI sent addressed one of B's two ports (the request
-    // log saw them, so an empty log elsewhere means nothing was sent).
+    // Every request the CLI sent addressed B's HTTP port (the request log saw
+    // them, so an empty log elsewhere means nothing was sent).
     expect(result.fetches.length).toBeGreaterThan(0);
-    expect([...new Set(result.fetches.map((f) => f.host))].sort()).toEqual([hostOf(b, "http"), hostOf(b, "ops")].sort());
+    expect([...new Set(result.fetches.map((f) => f.host))]).toEqual([hostOf(b, "http")]);
   }, 60_000);
 
   test("with only --admin-pass-file and no local admin-password file, every request carries the credential and the restore completes", async () => {
@@ -216,7 +215,7 @@ describe("flair#2708 — rem restore target (CLI)", () => {
     expect(b.requests().some((r) => r.auth === "signature")).toBe(true);
     expect(b.requests().some((r) => r.endpoint === "http" && r.method === "GET" && r.path === "/Memory")).toBe(true);
     // No candidate listing: that read needs the admin credential.
-    expect(b.requests().some((r) => r.endpoint === "ops")).toBe(false);
+    expect(b.requests().some((r) => r.path.startsWith("/AdminMemoryCandidates/"))).toBe(false);
   }, 60_000);
 
   test("flair#2749: the same dry run with no agent key names the agent's key, not FLAIR_ADMIN_PASS", async () => {
@@ -278,26 +277,22 @@ describe("flair#2708 — rem restore target (CLI)", () => {
     expect(b.requests()).toEqual([]);
   }, 60_000);
 
-  test("with no configured pair, refuses an operations port that belongs to another instance before any listing or write", async () => {
+  test("with FLAIR_OPS_PORT naming another instance, lists and writes on the FLAIR_URL target only", async () => {
     const a = await startInstance();
     const b = await startInstance();
-    // No config.yaml: the paired resolver has no configured pair to compare
-    // the two named ports with, so only the live pair check can tell them apart.
+    // No config.yaml. FLAIR_URL names B; FLAIR_OPS_PORT still names A, the
+    // endpoint restore used to list through. The restore must list and write
+    // on B only and leave A's candidate untouched.
     const { home, date } = await makeHome();
 
     const result = await runRestore({ home, date, env: { FLAIR_URL: b.httpUrl, FLAIR_OPS_PORT: String(a.opsPort) } });
 
-    expect(result.code).not.toBe(0);
-    expect(result.stderr).toContain(
-      `operations port ${a.opsPort} belongs to the instance serving HTTP port ${a.httpPort}, not restore target ${b.httpUrl}`,
-    );
-    expect(result.stderr).toContain("nothing was listed, deleted or written");
-
-    // A answered one configuration read and nothing else: no listing there.
-    expect(a.requests()).toEqual([{ endpoint: "ops", method: "POST", path: "/", operation: "get_configuration", auth: "basic" }]);
-    // B, the write target, received nothing at all.
-    expect(b.requests()).toEqual([]);
-    expect(result.fetches.map((f) => f.host)).toEqual([hostOf(a, "ops")]);
+    expect(result.code, result.stderr).toBe(0);
+    expect(result.stdout).toContain("Status:       completed");
+    expect(result.stdout).toContain("1 candidates");
+    expect(a.requests()).toEqual([]);
+    expect(b.requests().some((r) => r.endpoint === "http" && r.method === "DELETE" && r.path === "/MemoryCandidate/c-1")).toBe(true);
+    expect([...new Set(result.fetches.map((f) => f.host))]).toEqual([hostOf(b, "http")]);
   }, 60_000);
 
   test("sends nothing to a FLAIR_OPS_TARGET that names another endpoint, and refuses before any request", async () => {
@@ -329,7 +324,7 @@ describe("flair#2708 — rem restore target (CLI)", () => {
     expect(result.stdout).toContain("Status:       completed");
     expect(b.requests().some(isListing)).toBe(true);
     expect(a.requests()).toEqual([]);
-    expect([...new Set(result.fetches.map((f) => f.host))].sort()).toEqual([hostOf(b, "http"), hostOf(b, "ops")].sort());
+    expect([...new Set(result.fetches.map((f) => f.host))]).toEqual([hostOf(b, "http")]);
   }, 60_000);
 
   test("refuses a credential-bearing target URL before any request, and prints none of its values", async () => {
@@ -572,189 +567,6 @@ describe("flair#2708 — resolveRestoreTarget", () => {
     }
     expect(message).toContain("FLAIR_URL is not an http:// or https:// URL");
     expect(message).not.toContain(SECRET);
-  });
-});
-
-// ─── establishRestorePair: a non-loopback target, against real local servers ─
-
-/** How one endpoint answers its `flair.Instance` read. */
-type IdentityAnswer =
-  | { rows: unknown[] }
-  | { status: number }
-  | { redirect: 302 | 307 }
-  | { body: string };
-
-interface RecordedCall {
-  method: string;
-  path: string;
-  operation?: string;
-}
-
-interface RemoteEndpoints {
-  target: RestoreTarget;
-  httpCalls: RecordedCall[];
-  opsCalls: RecordedCall[];
-  /** Requests that reached the redirect destination. */
-  elsewhere: RecordedCall[];
-  stop: () => void;
-}
-
-const instanceRow = (id: string) => ({ id, role: "hub", publicKey: "pk", status: "active", createdAt: "2026-01-01T00:00:00.000Z" });
-
-function answer(a: IdentityAnswer, redirectTo: string): Response {
-  if ("rows" in a) return Response.json(a.rows);
-  if ("status" in a) return new Response("refused", { status: a.status });
-  if ("redirect" in a) return new Response(null, { status: a.redirect, headers: { location: redirectTo } });
-  return new Response(a.body, { headers: { "content-type": "application/json" } });
-}
-
-/**
- * Two real local HTTP servers acting as a non-loopback target's HTTP endpoint and
- * operations endpoint, plus a redirect destination that answers the identity
- * `destinationId` reports. The operations endpoint always reports, through
- * `get_configuration`, exactly the two ports the target names, so matching
- * port numbers are available to a check that would wrongly accept them.
- */
-function startRemoteEndpoints(httpIdentity: IdentityAnswer, opsIdentity: IdentityAnswer, destinationId = "instance-1"): RemoteEndpoints {
-  const httpCalls: RecordedCall[] = [];
-  const opsCalls: RecordedCall[] = [];
-  const elsewhere: RecordedCall[] = [];
-  const destination = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    async fetch(req) {
-      const body = req.method === "POST" ? await req.json().catch(() => undefined) : undefined;
-      elsewhere.push({ method: req.method, path: new URL(req.url).pathname, operation: body?.operation });
-      return Response.json([instanceRow(destinationId)]);
-    },
-  });
-  const destinationUrl = `http://127.0.0.1:${destination.port}`;
-  const http = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    fetch(req) {
-      const path = new URL(req.url).pathname;
-      httpCalls.push({ method: req.method, path });
-      if (req.method === "GET" && path === "/Instance/") return answer(httpIdentity, `${destinationUrl}/Instance/`);
-      return new Response("not found", { status: 404 });
-    },
-  });
-  const ops = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    async fetch(req: Request): Promise<Response> {
-      const body = await req.json().catch(() => undefined);
-      opsCalls.push({ method: req.method, path: new URL(req.url).pathname, operation: body?.operation });
-      if (body?.operation === "get_configuration") {
-        return Response.json({ http: { port: http.port }, operationsApi: { network: { port: ops.port } } });
-      }
-      if (body?.operation === "sql") return answer(opsIdentity, `${destinationUrl}/`);
-      return Response.json([]);
-    },
-  });
-  return {
-    target: {
-      baseUrl: `http://127.0.0.1:${http.port}`,
-      opsUrl: `http://127.0.0.1:${ops.port}`,
-      httpPort: http.port!,
-      opsPort: ops.port!,
-      loopback: false,
-    },
-    httpCalls,
-    opsCalls,
-    elsewhere,
-    stop: () => {
-      http.stop(true);
-      ops.stop(true);
-      destination.stop(true);
-    },
-  };
-}
-
-const ADMIN = { user: "admin", pass: "test-admin-pass" };
-
-async function remoteCheck(httpIdentity: IdentityAnswer, opsIdentity: IdentityAnswer): Promise<{ error: string | null; endpoints: RemoteEndpoints }> {
-  const endpoints = startRemoteEndpoints(httpIdentity, opsIdentity);
-  try {
-    await establishRestorePair(endpoints.target, ADMIN);
-    return { error: null, endpoints };
-  } catch (err: any) {
-    return { error: String(err?.message ?? err), endpoints };
-  } finally {
-    endpoints.stop();
-  }
-}
-
-/** No listing, delete or write reached either endpoint. */
-function expectNoRestoreTraffic(endpoints: RemoteEndpoints): void {
-  expect(endpoints.opsCalls.some((c) => c.operation === "search_by_conditions")).toBe(false);
-  expect(endpoints.httpCalls.every((c) => c.method === "GET" && c.path === "/Instance/")).toBe(true);
-}
-
-describe("flair#2708 — establishRestorePair for a non-loopback target (real local servers)", () => {
-  test("passes when both endpoints report the same single instance identity", async () => {
-    const { error, endpoints } = await remoteCheck({ rows: [instanceRow("instance-1")] }, { rows: [instanceRow("instance-1")] });
-    expect(error).toBeNull();
-    expect(endpoints.httpCalls).toEqual([{ method: "GET", path: "/Instance/" }]);
-    expect(endpoints.opsCalls).toEqual([{ method: "POST", path: "/", operation: "sql" }]);
-    expect(endpoints.elsewhere).toEqual([]);
-  });
-
-  test("refuses two different instance identities", async () => {
-    const { error, endpoints } = await remoteCheck({ rows: [instanceRow("instance-1")] }, { rows: [instanceRow("instance-2")] });
-    expect(error).toContain("report different flair.Instance ids");
-    expect(error).toContain("nothing was listed, deleted or written");
-    expectNoRestoreTraffic(endpoints);
-  });
-
-  test("refuses when both identity reads are empty, though the configuration reports matching ports", async () => {
-    const { error, endpoints } = await remoteCheck({ rows: [] }, { rows: [] });
-    expect(error).toContain("the HTTP endpoint's GET /Instance/ reports no flair.Instance row");
-    expect(error).toContain("the operations endpoint's Instance read reports no flair.Instance row");
-    expect(error).toContain("restore requires both endpoints to report exactly one flair.Instance row with the same id");
-    expect(error).toContain("flair federation status --target <its URL>");
-    expectNoRestoreTraffic(endpoints);
-  });
-
-  test("refuses when one side's identity read is empty or unreadable", async () => {
-    const one = { rows: [instanceRow("instance-1")] };
-    const cases: Array<[IdentityAnswer, IdentityAnswer, string]> = [
-      [{ rows: [] }, one, "the HTTP endpoint's GET /Instance/ reports no flair.Instance row"],
-      [one, { rows: [] }, "the operations endpoint's Instance read reports no flair.Instance row"],
-      [{ status: 500 }, one, "the HTTP endpoint's GET /Instance/ answered HTTP 500"],
-      [one, { body: "not json" }, "the operations endpoint's Instance read answered a body that is not JSON"],
-      [one, { body: JSON.stringify({ rows: "no" }) }, "the operations endpoint's Instance read answered a body that is not a row list"],
-      [{ rows: [{ role: "hub" }] }, one, "the HTTP endpoint's GET /Instance/ answered a row without a usable id"],
-      [one, { rows: [instanceRow("instance-1"), instanceRow("instance-3")] }, "the operations endpoint's Instance read reports 2 flair.Instance rows, not one"],
-    ];
-    for (const [httpIdentity, opsIdentity, detail] of cases) {
-      const { error, endpoints } = await remoteCheck(httpIdentity, opsIdentity);
-      expect(error).toContain(detail);
-      expect(error).toContain("nothing was listed, deleted or written");
-      expectNoRestoreTraffic(endpoints);
-    }
-  });
-
-  test("a redirected identity read fails the check, and the redirect destination receives no request", async () => {
-    const one = { rows: [instanceRow("instance-1")] };
-    // The destination would answer the same identity as the other side, so
-    // following the redirect, or skipping the redirected side, would pass.
-    for (const [httpIdentity, opsIdentity, detail] of [
-      [{ redirect: 302 }, one, "the HTTP endpoint's GET /Instance/ answered with a redirect (HTTP 302), which restore does not follow"],
-      [{ redirect: 307 }, one, "the HTTP endpoint's GET /Instance/ answered with a redirect (HTTP 307), which restore does not follow"],
-      [one, { redirect: 307 }, "the operations endpoint's Instance read answered with a redirect (HTTP 307), which restore does not follow"],
-    ] as Array<[IdentityAnswer, IdentityAnswer, string]>) {
-      const { error, endpoints } = await remoteCheck(httpIdentity, opsIdentity);
-      expect(endpoints.elsewhere).toEqual([]);
-      expect(error).toContain(detail);
-      expectNoRestoreTraffic(endpoints);
-    }
-  });
-
-  test("a refused admin credential names the credential remedy", async () => {
-    const { error } = await remoteCheck({ status: 401 }, { rows: [instanceRow("instance-1")] });
-    expect(error).toContain("answered HTTP 401");
-    expect(error).toContain("Check that the admin credential restore uses");
   });
 });
 

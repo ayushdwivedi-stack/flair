@@ -1,0 +1,1 @@
+- **`flair rem restore --apply` lists leftover candidates on its write target.** The admin-only `GET /AdminMemoryCandidates/{agentId}` route returns one agent's candidate ids, bounded by `limit`; a target older than Flair 0.63.0 is refused with that version named.

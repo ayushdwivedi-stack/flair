@@ -13,7 +13,7 @@ import { describe, it, expect, beforeEach, afterEach, jest } from "bun:test";
 import { mkdirSync, rmSync, readFileSync, writeFileSync, existsSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { applySnapshot, type ApiCall, type OpsSearch } from "../src/rem/restore.ts";
+import { applySnapshot, type ApiCall } from "../src/rem/restore.ts";
 import { ApiHttpError } from "../src/lib/auth-resolve.ts";
 import { buildOpsSearch } from "../src/commands/rem.ts";
 import { createSnapshot } from "../src/rem/snapshot.ts";
@@ -62,6 +62,7 @@ function recordingApi(handlers: Record<string, (path: string, body?: unknown) =>
     // Default fall-throughs for the read endpoints when not stubbed
     if (method === "GET" && path.startsWith("/Memory?")) return [];
     if (method === "GET" && path.startsWith("/Soul?")) return [];
+    if (method === "GET" && path.startsWith("/AdminMemoryCandidates/")) return { candidates: [], hasMore: false };
     if (method === "DELETE" || method === "PUT") return { ok: true };
     throw new Error(`unexpected api: ${method}:${path}`);
   };
@@ -93,6 +94,9 @@ function statefulApi(seed: { memories?: any[]; souls?: any[]; candidates?: any[]
     calls.push({ method, path, body });
     if (method === "GET" && path.startsWith("/Memory?")) return Array.from(state.memories.values());
     if (method === "GET" && path.startsWith("/Soul?")) return Array.from(state.souls.values());
+    if (method === "GET" && path.startsWith("/AdminMemoryCandidates/")) {
+      return { candidates: Array.from(state.candidates.values()).map((c) => ({ id: c.id })), hasMore: false };
+    }
     if (method === "DELETE" && path.startsWith("/Memory/")) {
       state.memories.delete(decodeURIComponent(path.split("/")[2]));
       return { ok: true };
@@ -129,23 +133,15 @@ describe("applySnapshot — dry-run", () => {
     const { api, calls } = recordingApi({
       "GET:/Memory": () => current,
       "GET:/Soul": () => [{ id: "current-soul", agentId: "test-agent" }],
+      // Candidates are listed through the same apiCall the writes use, on the
+      // admin-only route `/AdminMemoryCandidates/{agentId}`.
+      "GET:/AdminMemoryCandidates": () => ({ candidates: [{ id: "cand-1" }, { id: "cand-2" }], hasMore: false }),
     });
-    // Candidates are listed through the injected ops-API helper (admin-authed
-    // ops port), NOT `apiCall` with the REST URL suffix Harper 405s.
-    const opsSearchCalls: Array<{ table: string; conditions: any[]; getAttributes: string[] }> = [];
-    const opsSearch: OpsSearch = async (table, conditions, getAttributes) => {
-      opsSearchCalls.push({ table, conditions, getAttributes });
-      return [
-        { id: "cand-1", agentId: "test-agent", claim: "leftover claim" },
-        { id: "cand-2", agentId: "test-agent", claim: "another claim" },
-      ];
-    };
     const r = await applySnapshot({
       agentId: "test-agent",
       snapshotPath,
       flairVersion: "0.0.0-test",
       apiCall: api,
-      opsSearch,
       preRestoreSnapshotRoot: snapshotRoot,
       tmpRootOverride: testRoot,
       dryRun: true,
@@ -159,36 +155,30 @@ describe("applySnapshot — dry-run", () => {
     expect(r.preRestoreSnapshotPath).toBeUndefined();
     expect(r.errors).toEqual([]);
 
-    expect(calls.some((c) => c.method === "POST" && c.path === "/MemoryCandidate/search_by_conditions")).toBe(false);
+    expect(calls.some((c) => c.method === "GET" && c.path === "/AdminMemoryCandidates/test-agent?limit=500")).toBe(true);
     expect(calls.some((c) => c.path.includes("search_by_conditions"))).toBe(false);
-    expect(opsSearchCalls.length).toBe(1);
-    expect(opsSearchCalls[0].table).toBe("MemoryCandidate");
-    expect(opsSearchCalls[0].conditions).toEqual([
-      { search_attribute: "agentId", search_type: "equals", search_value: "test-agent" },
-    ]);
     const writes = calls.filter((c) => c.method === "DELETE" || c.method === "PUT");
     expect(writes).toEqual([]);
   });
 
-  it("reports an unrecognised ops-API candidate body as an error, not as no candidates (flair#2680)", async () => {
+  it("reports an unrecognised candidate-route body as an error, not as no candidates", async () => {
     const snapshotPath = await makeTestSnapshot();
     const { api } = recordingApi({
       "GET:/Memory": () => [],
       "GET:/Soul": () => [],
+      "GET:/AdminMemoryCandidates": () => ({ error: "fixture" }),
     });
-    const fakeFetch = (async () => new Response(JSON.stringify({ error: "fixture" }), { status: 200 })) as unknown as typeof fetch;
     const r = await applySnapshot({
       agentId: "test-agent",
       snapshotPath,
       flairVersion: "0.0.0-test",
       apiCall: api,
-      opsSearch: buildOpsSearch({ opsPort: 19926, adminPass: "s3cret" }, fakeFetch),
       preRestoreSnapshotRoot: snapshotRoot,
       tmpRootOverride: testRoot,
       dryRun: true,
     });
     expect(r.status).toBe("failed");
-    expect(r.errors).toEqual(["fetch-current: ops API returned an unexpected response shape"]);
+    expect(r.errors).toEqual(["fetch-current: GET /AdminMemoryCandidates returned an unexpected response shape"]);
   });
 });
 
@@ -345,14 +335,11 @@ describe("applySnapshot — real restore", () => {
       souls: [],
       candidates: [leftover],
     });
-    const opsSearch: OpsSearch = async () => Array.from(state.candidates.values());
-
     const r = await applySnapshot({
       agentId: "test-agent",
       snapshotPath,
       flairVersion: "0.0.0-test",
       apiCall: api,
-      opsSearch,
       preRestoreSnapshotRoot: snapshotRoot,
       tmpRootOverride: testRoot,
     });
@@ -404,17 +391,14 @@ describe("applySnapshot — real restore", () => {
     const { api, calls } = recordingApi({
       "GET:/Memory": () => [{ id: "mem-1", agentId: "test-agent" }],
       "GET:/Soul": () => [{ id: "soul-1", agentId: "test-agent" }],
+      "GET:/AdminMemoryCandidates": () => { throw new Error("route down"); },
     });
-    const opsSearch: OpsSearch = async () => {
-      throw new Error("ops down");
-    };
 
     const r = await applySnapshot({
       agentId: "test-agent",
       snapshotPath,
       flairVersion: "0.0.0-test",
       apiCall: api,
-      opsSearch,
       preRestoreSnapshotRoot: snapshotRoot,
       tmpRootOverride: testRoot,
     });
@@ -423,7 +407,63 @@ describe("applySnapshot — real restore", () => {
     const writes = calls.filter((c) => ["DELETE", "PUT", "POST", "PATCH"].includes(c.method));
     expect(writes).toEqual([]);
     expect(r.deleted).toEqual({ memories: 0, souls: 0, candidates: 0 });
-    expect(r.errors).toEqual(["fetch-candidates: ops down"]);
+    expect(r.errors).toEqual(["fetch-candidates: route down"]);
+  });
+
+  it("lists through the target's apiCall, never an injected operations search", async () => {
+    const snapshotPath = await makeTestSnapshot();
+    const { api, calls } = recordingApi({
+      "GET:/Memory": () => [],
+      "GET:/Soul": () => [],
+      "GET:/AdminMemoryCandidates": () => ({ candidates: [{ id: "target-candidate" }], hasMore: false }),
+    });
+    let opsCalls = 0;
+    const opts: any = {
+      agentId: "test-agent",
+      snapshotPath,
+      flairVersion: "0.0.0-test",
+      apiCall: api,
+      opsSearch: async () => {
+        opsCalls++;
+        return [{ id: "other-endpoint-candidate" }];
+      },
+      preRestoreSnapshotRoot: snapshotRoot,
+      tmpRootOverride: testRoot,
+      verifyPostRestore: false,
+    };
+
+    const r = await applySnapshot(opts);
+
+    expect(r.status).toBe("completed");
+    expect(opsCalls).toBe(0);
+    expect(calls.some((c) => c.method === "GET" && c.path.startsWith("/AdminMemoryCandidates/"))).toBe(true);
+    expect(calls.some((c) => c.method === "DELETE" && c.path === "/MemoryCandidate/target-candidate")).toBe(true);
+    expect(calls.some((c) => c.path === "/MemoryCandidate/other-endpoint-candidate")).toBe(false);
+  });
+
+  it("an older target without the candidate route is refused with the server version needed, before any delete or write", async () => {
+    const snapshotPath = await makeTestSnapshot();
+    const { api, calls } = recordingApi({
+      "GET:/Memory": () => [{ id: "mem-1", agentId: "test-agent" }],
+      "GET:/Soul": () => [{ id: "soul-1", agentId: "test-agent" }],
+      "GET:/AdminMemoryCandidates": () => { throw new ApiHttpError(404, "Not found"); },
+    });
+
+    const r = await applySnapshot({
+      agentId: "test-agent",
+      snapshotPath,
+      flairVersion: "0.0.0-test",
+      apiCall: api,
+      preRestoreSnapshotRoot: snapshotRoot,
+      tmpRootOverride: testRoot,
+    });
+
+    expect(r.status).toBe("failed");
+    expect(r.errors).toHaveLength(1);
+    expect(r.errors[0]).toContain("GET /AdminMemoryCandidates");
+    expect(r.errors[0]).toContain("Flair server 0.63.0");
+    expect(r.errors[0]).toContain("Nothing was deleted or written.");
+    expect(calls.filter((c) => ["DELETE", "PUT", "POST", "PATCH"].includes(c.method))).toEqual([]);
   });
 });
 
@@ -597,6 +637,7 @@ function retryingTarget(putFailures: unknown[]): {
     calls.push({ method, path, body });
     if (method === "GET" && path.startsWith("/Memory?")) return Array.from(state.memories.values());
     if (method === "GET" && path.startsWith("/Soul?")) return Array.from(state.souls.values());
+    if (method === "GET" && path.startsWith("/AdminMemoryCandidates/")) return { candidates: [], hasMore: false };
     if (method === "DELETE") return { ok: true };
     if (method === "PUT" && path.startsWith("/Memory/")) {
       const failure = putFailures[memoryPuts++];

@@ -391,6 +391,7 @@ All `/Admin*` routes require **Admin Basic**.
 | `/AdminConnectors` | OAuth clients and sessions |
 | `/AdminIdp` | IdP configuration |
 | `/AdminMemory` | Browse / search memory as operator |
+| `/AdminMemoryCandidates/{agentId}` | JSON: one agent's MemoryCandidate ids (`limit`, default 200, max 500), used by `flair rem restore` |
 | `/AdminInstance` | Federation status, peers, instance |
 
 ---

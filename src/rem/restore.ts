@@ -58,15 +58,11 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/**
- * Ops-API `search_by_conditions` helper (admin-authed). Harper's REST layer
- * maps `POST /<table>` to `resource.post()` and has no URL-suffix routing, so
- * candidate rows must be listed through the ops port with an
- * `{operation:"search_by_conditions"}` body. The CLI injects this when admin
- * credentials are available; when absent, candidate listing is best-effort
- * empty (mirrors runner.ts).
- */
-export type OpsSearch = (table: string, conditions: any[], getAttributes: string[]) => Promise<any[]>;
+/** The server release that first serves `GET /AdminMemoryCandidates/{agentId}`. */
+export const CANDIDATE_LIST_MIN_SERVER_VERSION = "0.63.0";
+
+/** The page size restore asks the admin-only candidate route for. */
+export const CANDIDATE_LIST_LIMIT = 500;
 
 export interface RestoreOpts {
   agentId: string;
@@ -74,11 +70,12 @@ export interface RestoreOpts {
   flairVersion: string;
   apiCall: ApiCall;
   /**
-   * Ops-API `search_by_conditions` helper (admin-authed). Injected by the CLI;
-   * candidates live on the ops port, which the agent-signed `apiCall` cannot
-   * reach. When absent, `listAgentCandidates` returns no rows.
+   * When false, the dry run does not list leftover candidates. Only a dry run
+   * without an admin credential sets this: `GET /AdminMemoryCandidates` is
+   * admin-only, so a signed-only dry run cannot read it. A live restore always
+   * lists (the CLI requires the admin credential).
    */
-  opsSearch?: OpsSearch;
+  listCandidates?: boolean;
   /**
    * Operator/internal caller for Soul DELETE/PUT. Required in production:
    * `apiCall` extracts `agentId` from snapshot rows and signs as that agent.
@@ -158,11 +155,36 @@ function soulWrite(opts: RestoreOpts): ApiCall {
   return opts.soulApiCall ?? opts.apiCall;
 }
 
-async function listAgentCandidates(opsSearch: OpsSearch | undefined, agentId: string): Promise<any[]> {
-  if (!opsSearch) return [];
-  return asArray(await opsSearch("MemoryCandidate", [
-    { search_attribute: "agentId", search_type: "equals", search_value: agentId },
-  ], ["id", "claim"]));
+function olderServerCandidateRoute(err: unknown): boolean {
+  return err instanceof ApiHttpError && err.status === 404;
+}
+
+/**
+ * One agent's leftover candidates, read through the same `apiCall` restore
+ * uses for its deletes and writes, so the listing and those operations reach
+ * one endpoint. The route returns ids only; restore needs nothing else.
+ */
+async function listAgentCandidates(apiCall: ApiCall, agentId: string): Promise<any[]> {
+  const body = await apiCall(
+    "GET",
+    `/AdminMemoryCandidates/${encodeURIComponent(agentId)}?limit=${CANDIDATE_LIST_LIMIT}`,
+  );
+  if (!body || typeof body !== "object" || !Array.isArray((body as any).candidates)) {
+    throw new Error("GET /AdminMemoryCandidates returned an unexpected response shape");
+  }
+  if ((body as any).hasMore === true) {
+    throw new Error(
+      `the target holds more than ${CANDIDATE_LIST_LIMIT} leftover MemoryCandidate rows for agent ${agentId}; nothing was deleted or written`,
+    );
+  }
+  return (body as any).candidates;
+}
+
+/** The operator message for a target that predates the admin candidate route. */
+function olderServerCandidateMessage(err: ApiHttpError): string {
+  return `restore lists leftover MemoryCandidate rows through GET /AdminMemoryCandidates on the restore target, and the target answered HTTP ${err.status}. `
+    + `That route is part of Flair server ${CANDIDATE_LIST_MIN_SERVER_VERSION}; upgrade the target to ${CANDIDATE_LIST_MIN_SERVER_VERSION} or newer, then retry. `
+    + "Nothing was deleted or written.";
 }
 
 function parseJsonlSafe(text: string): any[] {
@@ -266,7 +288,9 @@ export async function applySnapshot(opts: RestoreOpts): Promise<RestoreResult> {
     try {
       const currentMem = asArray(await opts.apiCall("GET", `/Memory?agentId=${encodeURIComponent(opts.agentId)}`));
       const currentSouls = asArray(await opts.apiCall("GET", `/Soul?agentId=${encodeURIComponent(opts.agentId)}`));
-      const currentCandidates = await listAgentCandidates(opts.opsSearch, opts.agentId);
+      const currentCandidates = opts.listCandidates === false
+        ? []
+        : await listAgentCandidates(opts.apiCall, opts.agentId);
       result.deleted.memories = currentMem.length;
       result.deleted.souls = currentSouls.length;
       result.deleted.candidates = currentCandidates.length;
@@ -274,7 +298,9 @@ export async function applySnapshot(opts: RestoreOpts): Promise<RestoreResult> {
       result.restored.souls = souls.length;
       result.status = "dry-run";
     } catch (err: any) {
-      errors.push(`fetch-current: ${err?.message ?? String(err)}`);
+      errors.push(
+        `fetch-current: ${olderServerCandidateRoute(err) ? olderServerCandidateMessage(err) : err?.message ?? String(err)}`,
+      );
       result.status = "failed";
     }
     rmSync(tmp, { recursive: true, force: true });
@@ -311,13 +337,17 @@ export async function applySnapshot(opts: RestoreOpts): Promise<RestoreResult> {
   // so a leftover row 403s Soul PUT after operator auth succeeds. A failed
   // candidate listing stops the restore before any delete.
   let currentCandidates: any[] = [];
-  try {
-    currentCandidates = await listAgentCandidates(opts.opsSearch, opts.agentId);
-  } catch (err: any) {
-    errors.push(`fetch-candidates: ${err?.message ?? String(err)}`);
-    result.status = "failed";
-    rmSync(tmp, { recursive: true, force: true });
-    return result;
+  if (opts.listCandidates !== false) {
+    try {
+      currentCandidates = await listAgentCandidates(opts.apiCall, opts.agentId);
+    } catch (err: any) {
+      errors.push(
+        `fetch-candidates: ${olderServerCandidateRoute(err) ? olderServerCandidateMessage(err) : err?.message ?? String(err)}`,
+      );
+      result.status = "failed";
+      rmSync(tmp, { recursive: true, force: true });
+      return result;
+    }
   }
   for (const m of currentMem) {
     if (!m?.id) continue;

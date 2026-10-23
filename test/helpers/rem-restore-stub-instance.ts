@@ -11,8 +11,9 @@
  *
  * The operations port answers `get_configuration` with the process's own two
  * ports and `search_by_conditions` on MemoryCandidate from the seeded rows.
- * The HTTP port serves GET/PUT/DELETE on Memory, Soul and MemoryCandidate, or
- * answers every PUT and DELETE with a 307 when `redirectWritesTo` is seeded.
+ * The HTTP port serves GET/PUT/DELETE on Memory, Soul and MemoryCandidate, the
+ * admin-only `/AdminMemoryCandidates/{agentId}` listing, or answers every PUT
+ * and DELETE with a 307 when `redirectWritesTo` is seeded.
  *
  * Every request either port receives is appended to a log file that
  * `requests()` reads: each handler first reads the body as text (the
@@ -134,6 +135,14 @@ async function httpFetch(req) {
     return new Response(null, { status: 307, headers: { location: seed.redirectWritesTo + url.pathname } });
   }
   const [table, rawId] = url.pathname.split("/").filter(Boolean);
+  if (table === "AdminMemoryCandidates") {
+    const agent = decodeURIComponent(rawId ?? "");
+    const requested = Number(url.searchParams.get("limit") ?? 200);
+    const limit = Number.isInteger(requested) && requested > 0 ? Math.min(requested, 500) : 200;
+    const matching = [...tables.MemoryCandidate.values()].filter((r) => r.agentId === agent);
+    const page = matching.slice(0, limit);
+    return Response.json({ candidates: page.map((r) => ({ id: r.id })), hasMore: matching.length > page.length });
+  }
   const rows = tables[table];
   const id = rawId ? decodeURIComponent(rawId) : "";
   if (!rows) return new Response("not found", { status: 404 });
