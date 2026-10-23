@@ -113,7 +113,7 @@ When an entry expires the build fails and a human re-decides. **That is the mech
 
 Run it locally with `node scripts/audit-gate.mjs --explain`.
 
-`node scripts/ci/list-harper-bundled.mjs` prints harper's bundled packages and installed versions from `node_modules/harper/node_modules`. Root overrides do not replace those copies in a bun install, and `bun audit` reads only `bun.lock`, so it does not report them.
+`node scripts/ci/list-harper-bundled.mjs` prints harper's bundled packages and installed versions from `node_modules/harper/node_modules`. Root overrides do not replace those copies in a bun install, and `bun audit` reads only `bun.lock`, where those copies do not appear.
 
 **Standing rule for every check in this repo:** any check that is advisory-only must carry, in a comment at its own definition, what would make it blocking and when that gets re-evaluated. Advisory is a terminating state with a defined promotion event, never a resting place.
 
