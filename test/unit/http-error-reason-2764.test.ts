@@ -743,6 +743,28 @@ describe("flair#2764 — the request's credential values are removed from the se
     }
   });
 
+  test("a scheme in another case or followed by a tab is read as the server reads it", async () => {
+    const password = "pw-2764-lower-case";
+    const basic = await failEcho(
+      `basic ${Buffer.from(`admin:${password}`).toString("base64")}`,
+      () => JSON.stringify({ error: `bad ${password}`, detail: password }),
+      true,
+    );
+    const signature = Buffer.from("signature-2764-tab").toString("base64");
+    const signed = await failEcho(
+      `TPS-Ed25519\tagent-a:1760000000000:nonce-2764:${signature}`,
+      () => JSON.stringify({ error: `bad ${signature}`, detail: signature }),
+      true,
+    );
+    for (const [{ err, stderr }, secret] of [[basic, password], [signed, signature]] as const) {
+      const display = describeReflectError(err).text;
+      expect(err.message).toBe("HTTP 500: bad [redacted]");
+      expect(err.body).toBe('{"error":"bad [redacted]","detail":"[redacted]"}');
+      expect(display).toBe("bad [redacted]");
+      for (const text of [err.message, err.body!, stderr, display]) expect(text).not.toContain(secret);
+    }
+  });
+
   test("a body that carries no credential value is unchanged", async () => {
     const { err, stderr } = await failEcho(BASIC, () => "upstream unavailable", true);
     expect(err.message).toBe("HTTP 500: upstream unavailable");

@@ -154,24 +154,28 @@ export const REDACTED_CREDENTIAL = "[redacted]";
  * The credential values an Authorization header carries (flair#2764), read
  * from the value Fetch sends: the header with leading and trailing HTTP
  * whitespace (tab, line feed, carriage return, space) removed, as Fetch
- * normalizes it. The values are that header value, the part after its scheme
- * (as written and with surrounding whitespace trimmed), for Basic the decoded
- * `user:password` and the password, and for TPS-Ed25519 the signature (its
- * last `:`-separated field). Empty values are left out.
+ * normalizes it. The scheme is the text before the first run of spaces or
+ * tabs, compared without regard to case, as Flair's server reads it. The
+ * values are that header value, the part after its scheme (as written and
+ * with surrounding whitespace trimmed), for Basic the decoded `user:password`
+ * and the password, and for TPS-Ed25519 the signature (the text after the
+ * third `:` of `agentId:timestamp:nonce:signature`, or the last `:`-separated
+ * field when there are fewer). Empty values are left out.
  */
 function sentCredentialValues(authHeader: string | undefined): string[] {
   if (!authHeader) return [];
   const sent = authHeader.replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, "");
-  const space = sent.indexOf(" ");
-  const scheme = space === -1 ? "" : sent.slice(0, space);
-  const credential = space === -1 ? sent : sent.slice(space + 1);
+  const parts = /^(\S+)[\t ]+([\s\S]*)$/.exec(sent);
+  const scheme = parts ? parts[1]!.toLowerCase() : "";
+  const credential = parts ? parts[2]! : sent;
   const values = [sent, credential, credential.trim()];
-  if (scheme === "Basic") {
+  if (scheme === "basic") {
     const decoded = Buffer.from(credential.trim(), "base64").toString("utf8");
     const colon = decoded.indexOf(":");
     if (colon !== -1) values.push(decoded, decoded.slice(colon + 1));
-  } else if (scheme === "TPS-Ed25519") {
-    values.push(credential.slice(credential.lastIndexOf(":") + 1).trim());
+  } else if (scheme === "tps-ed25519") {
+    const fields = credential.trim().split(":");
+    values.push(fields.length > 4 ? fields.slice(3).join(":") : fields[fields.length - 1]!);
   }
   return values.filter((value) => value.length > 0);
 }
