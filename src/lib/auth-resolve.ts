@@ -167,16 +167,62 @@ function sentCredentialValues(authHeader: string | undefined): string[] {
   return values.filter((value) => value.length > 0);
 }
 
-const HEX = /^[0-9A-Fa-f]{2}$/;
+const HEX2 = /^[0-9A-Fa-f]{2}$/;
+const HEX4 = /^[0-9A-Fa-f]{4}$/;
+
+/** The character each one-character JSON string escape (backslash, then this character) stands for. */
+const JSON_SHORT_ESCAPES: Record<string, string> = {
+  '"': '"',
+  "\\": "\\",
+  "/": "/",
+  b: "\b",
+  f: "\f",
+  n: "\n",
+  r: "\r",
+  t: "\t",
+};
+
+/**
+ * One decoded unit of credentialIntervals' view at `i` in `text`: the string it
+ * stands for and how many characters of `text` it spans. A valid %XX escape
+ * (either hex case) stands for its byte, given as a one-byte buffer; a JSON
+ * string escape (backslash then one of the characters in JSON_SHORT_ESCAPES,
+ * or backslash-u with four hex digits, a surrogate pair of two such escapes
+ * read as one character) stands for its character; anything else stands for
+ * itself.
+ */
+function viewUnit(text: string, i: number): { bytes: Buffer; width: number } {
+  if (text[i] === "%" && HEX2.test(text.slice(i + 1, i + 3))) {
+    return { bytes: Buffer.from([Number.parseInt(text.slice(i + 1, i + 3), 16)]), width: 3 };
+  }
+  if (text[i] === "\\" && i + 1 < text.length) {
+    const next = text[i + 1]!;
+    const short = JSON_SHORT_ESCAPES[next];
+    if (short !== undefined) return { bytes: Buffer.from(short, "utf8"), width: 2 };
+    if (next === "u" && HEX4.test(text.slice(i + 2, i + 6))) {
+      const unit = Number.parseInt(text.slice(i + 2, i + 6), 16);
+      if (unit >= 0xd800 && unit <= 0xdbff && text.slice(i + 6, i + 8) === "\\u" && HEX4.test(text.slice(i + 8, i + 12))) {
+        const low = Number.parseInt(text.slice(i + 8, i + 12), 16);
+        if (low >= 0xdc00 && low <= 0xdfff) {
+          return { bytes: Buffer.from(String.fromCharCode(unit, low), "utf8"), width: 12 };
+        }
+      }
+      if (unit < 0xd800 || unit > 0xdfff) return { bytes: Buffer.from(String.fromCharCode(unit), "utf8"), width: 6 };
+    }
+  }
+  const width = (text.codePointAt(i) ?? 0) > 0xffff ? 2 : 1;
+  return { bytes: Buffer.from(text.slice(i, i + width), "utf8"), width };
+}
 
 /**
  * Every occurrence in `text` of each value in `sentValues`, overlapping ones
  * included, as merged [start, end) intervals of `text` (flair#2764): intervals
  * that overlap or touch become one. A value is found where `text` holds it
- * literally, and, when `text` contains a "%", where `text` spells it with %XX
- * escapes (either hex case, all or some of its characters): that search runs
- * over a view of `text` with each valid escape decoded to its byte, and maps
- * each match back to the characters it came from.
+ * literally, and, when `text` contains a "%" or a backslash, where `text`
+ * spells it with %XX escapes (either hex case) or JSON string escapes, for all
+ * or some of its characters: that search runs over a view of `text` with each
+ * such escape decoded (viewUnit), and maps each match back to the characters
+ * it came from. This holds whether or not `text` as a whole is valid JSON.
  */
 function credentialIntervals(text: string, sentValues: readonly string[]): Array<[number, number]> {
   const found: Array<[number, number]> = [];
@@ -187,32 +233,25 @@ function credentialIntervals(text: string, sentValues: readonly string[]): Array
       found.push([at, at + value.length]);
     }
   }
-  if (text.includes("%")) {
+  if (text.includes("%") || text.includes("\\")) {
     // bytes: the decoded view; from/to: the [start, end) of `text` each byte came from.
     const bytes: number[] = [];
     const from: number[] = [];
     const to: number[] = [];
     for (let i = 0; i < text.length; ) {
-      if (text[i] === "%" && HEX.test(text.slice(i + 1, i + 3))) {
-        bytes.push(Number.parseInt(text.slice(i + 1, i + 3), 16));
-        from.push(i);
-        to.push(i + 3);
-        i += 3;
-        continue;
-      }
-      const width = (text.codePointAt(i) ?? 0) > 0xffff ? 2 : 1;
-      for (const byte of Buffer.from(text.slice(i, i + width), "utf8")) {
+      const unit = viewUnit(text, i);
+      for (const byte of unit.bytes) {
         bytes.push(byte);
         from.push(i);
-        to.push(i + width);
+        to.push(i + unit.width);
       }
-      i += width;
+      i += unit.width;
     }
     const view = Buffer.from(bytes);
     for (const value of values) {
       const needle = Buffer.from(value, "utf8");
       for (let at = view.indexOf(needle); at !== -1; at = view.indexOf(needle, at + 1)) {
-        found.push([from[at], to[at + needle.length - 1]]);
+        found.push([from[at]!, to[at + needle.length - 1]!]);
       }
     }
   }
@@ -258,7 +297,7 @@ function redactJsonStrings(value: unknown, sentValues: readonly string[]): unkno
   return value;
 }
 
-/** What displayBody shows when a body that may be JSON cannot be decoded, redacted and re-serialized. */
+/** What displayBody shows for a body it cannot show: see displayBody. */
 export const BODY_WITHHELD = "[body withheld]";
 
 /**

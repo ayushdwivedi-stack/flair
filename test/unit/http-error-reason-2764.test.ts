@@ -600,6 +600,20 @@ describe("flair#2764 — the request's credential values are redacted in every o
     }
   });
 
+  test("a malformed JSON body holding a\\/b: the escape is decoded for the search, so no output shows it", async () => {
+    const bs = String.fromCharCode(92);
+    const raw = `{"error":"a${bs}/b"`;
+    const { err, stderr } = await failEcho(`Basic ${Buffer.from("admin:a/b").toString("base64")}`, () => raw, true);
+    const display = describeReflectError(err).text;
+    expect(err.body).toBe('{"error":"[redacted]"');
+    expect(err.message).toBe('HTTP 500: {"error":"[redacted]"');
+    expect(stderr).toBe(`[flair] GET /echo answered HTTP 500; response body: ${JSON.stringify('{"error":"[redacted]"')}\n`);
+    expect(display).toBe(err.message);
+    for (const text of [err.message, err.body!, stderr, display]) {
+      for (const spelling of ["a/b", `a${bs}/b`, `a${bs}${bs}/b`]) expect(text).not.toContain(spelling);
+    }
+  });
+
   test("a valid JSON body nested too deep to redact is withheld from every output", async () => {
     const bs = String.fromCharCode(92);
     const depth = 1_000_000;

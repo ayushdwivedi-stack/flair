@@ -12,13 +12,13 @@
   sent (the Authorization header value, the part after its scheme, a Basic
   header's decoded `user:password` and password, a TPS-Ed25519 signature)
   with `[redacted]`; the `HTTP <status>` prefix is not changed. The stderr
-  line shows a JSON body re-serialized (withheld when it cannot be decoded,
-  redacted and re-serialized) and the request path percent-decoded (withheld
-  when it does not decode or holds a control character). Redaction covers a
-  response that repeats the request's credential values literally, inside any
-  JSON string (whatever escaping the JSON uses), or percent-encoded (either
-  hex case). A server that transforms a credential some other way is not
-  covered; that server already received the credential.
+  line shows a JSON body re-serialized (withheld when it parses as JSON but
+  cannot be redacted and re-serialized) and the request path percent-decoded
+  (withheld when it does not decode or holds a control character). Redaction
+  covers a response that repeats the request's credential values literally,
+  inside any JSON string (whatever escaping the JSON uses), or percent-encoded
+  (either hex case). A server that transforms a credential some other way is
+  not covered; that server already received the credential.
 
   An HTTP error response whose body mentions `fetch failed` or `unable to
   connect` is no longer treated as a failed connection: the CLI no longer
