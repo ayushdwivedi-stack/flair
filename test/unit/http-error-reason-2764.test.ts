@@ -4,12 +4,15 @@
  * response with `Content-Length: 0`), the ApiHttpError message is
  * `HTTP <status>` plus the JSON body's named error, or else a bounded one-line
  * excerpt of the body, and the error keeps the body, which sendJsonRequest
- * writes to stderr only with FLAIR_DEBUG set. The message, `body` and that
- * stderr line are each redacted as their last step: every credential value the
- * request sent, in its literal, JSON-escaped and percent-encoded forms, becomes
- * `[redacted]`. Classifiers read the unredacted body. A zero-length failure
- * keeps the message `HTTP <status>`, and the credential-less 403 keeps main's
- * hint.
+ * writes to stderr only with FLAIR_DEBUG set (a JSON body shown re-serialized).
+ * The message, `body`, that stderr line and the rem display texts replace the
+ * credential values the request sent with `[redacted]`. Scope: redaction
+ * covers a response that repeats the request's credential values literally,
+ * inside any JSON string (whatever escaping the JSON uses), or percent-encoded
+ * (either hex case). A server that transforms a credential some other way is
+ * not covered; that server already received the credential. Classifiers read
+ * the unredacted body. A zero-length failure keeps the message `HTTP <status>`,
+ * and the credential-less 403 keeps main's hint.
  *
  * Every request goes through the real sendJsonRequest to a node HTTP listener
  * on 127.0.0.1 that this file starts. Two kinds of case spawn the built CLI
@@ -442,7 +445,7 @@ describe("flair#2764 — an ApiHttpError is never a connect failure", () => {
   }, 30_000);
 });
 
-describe("flair#2764 — each printed string is redacted with the request's credential values as its last step", () => {
+describe("flair#2764 — the request's credential values are redacted in every output, within the stated scope", () => {
   const PASSWORD = "s3cret-pass-2764-fixture";
   const BASIC_CREDENTIAL = Buffer.from(`admin:${PASSWORD}`).toString("base64");
   const BASIC = `Basic ${BASIC_CREDENTIAL}`;
@@ -470,7 +473,7 @@ describe("flair#2764 — each printed string is redacted with the request's cred
       await echo.close();
     }
     expect(caught).toBeInstanceOf(ApiHttpError);
-    return { err: caught as ApiHttpError, stderr: written.filter((w) => w.startsWith("[flair] GET /echo")).join("") };
+    return { err: caught as ApiHttpError, stderr: written.filter((w) => w.startsWith("[flair] GET ")).join("") };
   }
 
   for (const debug of [false, true]) {
@@ -489,7 +492,7 @@ describe("flair#2764 — each printed string is redacted with the request's cred
         expect(text).not.toContain(PASSWORD);
         expect(text).not.toContain(BASIC_CREDENTIAL);
       }
-      // The unredacted text stays available to classifiers, which only compare it.
+      // The unredacted text stays available to classifiers, which read it.
       expect(apiErrorRawBody(err)).toContain(PASSWORD);
     });
   }
@@ -562,6 +565,61 @@ describe("flair#2764 — each printed string is redacted with the request's cred
     expect(err.message).toBe(`HTTP 500: ${"x".repeat(190)}[redacted]...`);
     for (const text of [err.message, err.body!, stderr]) {
       for (let i = 0; i + 8 <= token.length; i++) expect(text).not.toContain(token.slice(i, i + 8));
+    }
+  });
+
+  test("a credential repeated back to back: one merged [redacted], no run of 8 or more of its characters in any output", async () => {
+    const token = "A".repeat(32);
+    for (const [shape, body, message] of [
+      ["JSON", JSON.stringify({ error: "A".repeat(63) }), "HTTP 500: [redacted]"],
+      ["text", "A".repeat(63), "HTTP 500: [redacted]"],
+    ] as const) {
+      const { err, stderr } = await failEcho(`Bearer ${token}`, () => body, true);
+      const display = describeReflectError(err).text;
+      expect(err.message, shape).toBe(message);
+      expect(err.body, shape).toBe(shape === "JSON" ? '{"error":"[redacted]"}' : "[redacted]");
+      // describeReflectError shows the named error of a JSON body, else the message.
+      expect(display, shape).toBe(shape === "JSON" ? "[redacted]" : message);
+      for (const text of [err.message, err.body!, stderr, display]) expect(text, shape).not.toMatch(/A{8,}/);
+    }
+  });
+
+  test("a Basic password a/b echoed in JSON as a\\/b, as a\\u002fb and as a/b is absent from every output", async () => {
+    const { err, stderr } = await failEcho(
+      `Basic ${Buffer.from("admin:a/b").toString("base64")}`,
+      () => String.raw`{"error":"bad a\/b","detail":"a/b and a/b"}`,
+      true,
+    );
+    const display = describeReflectError(err).text;
+    expect(err.message).toBe("HTTP 500: bad [redacted]");
+    expect(err.body).toBe('{"error":"bad [redacted]","detail":"[redacted] and [redacted]"}');
+    expect(display).toBe("bad [redacted]");
+    for (const text of [err.message, err.body!, stderr, display]) {
+      for (const spelling of ["a/b", String.raw`a\/b`, String.raw`a\\/b`, String.raw`a/b`]) expect(text).not.toContain(spelling);
+    }
+  });
+
+  test("a request path holding the credential lower-case percent-encoded: the debug line shows it decoded and redacted", async () => {
+    const token = "tok/2764+path";
+    const { stderr } = await failEcho(`Bearer ${token}`, () => "nope", true, "/echo/tok%2f2764%2bpath");
+    expect(stderr).toBe(`[flair] GET /echo/[redacted] answered HTTP 500; response body: "nope"\n`);
+  });
+
+  test("a request path holding the credential percent-encoded twice is decoded once and still redacted; an undecodable path is withheld", async () => {
+    const token = "tok/2764+path";
+    const twice = await failEcho(`Bearer ${token}`, () => "nope", true, "/echo/tok%252f2764%252bpath");
+    expect(twice.stderr).toBe(`[flair] GET /echo/[redacted] answered HTTP 500; response body: "nope"\n`);
+    const broken = await failEcho(`Bearer ${token}`, () => "nope", true, "/echo/%E0%A4%A");
+    expect(broken.stderr).toBe(`[flair] GET [path withheld] answered HTTP 500; response body: "nope"\n`);
+  });
+
+  test("a response body holding the credential percent-encoded, in either hex case, is redacted", async () => {
+    const token = "tok/2764+path";
+    for (const encoded of ["tok%2f2764%2bpath", "tok%2F2764%2Bpath", "tok%2F2764+path"]) {
+      const { err, stderr } = await failEcho(`Bearer ${token}`, () => `rejected ${encoded}`, true);
+      expect(err.message, encoded).toBe("HTTP 500: rejected [redacted]");
+      expect(err.body, encoded).toBe("rejected [redacted]");
+      expect(stderr, encoded).toBe(`[flair] GET /echo answered HTTP 500; response body: "rejected [redacted]"\n`);
     }
   });
 
