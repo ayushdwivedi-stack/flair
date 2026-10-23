@@ -251,7 +251,7 @@ export function collectDeps(pkgs, keepCurrent) {
 }
 
 /**
- * Every ranged declaration the bake-time gate age-checks through the lockfile:
+ * Every ranged declaration the bake-time gate resolves through the lockfile:
  * ranges in `dependencies`, `devDependencies` and `optionalDependencies` of
  * every manifest, and every ranged `overrides` rule, nested rules included.
  * Each entry is { kind, name, target, spec, declaredIn, at, workspaceDir }
@@ -391,13 +391,16 @@ function lockEntryDependencyNames(entry, version, workspaces) {
 export function lockCopies(lock) {
   const byKey = new Map();
   const byName = new Map();
-  const packages = lock?.packages ?? {};
+  const packages = lock?.packages;
   const workspaces = isPlainObject(lock?.workspaces) ? lock.workspaces : {};
-  if (!isPlainObject(packages)) return { byKey, byName };
+  // A copy the gate cannot read could be one a range covers: refuse, never skip it.
+  if (!isPlainObject(packages)) throw new Error(`bun.lock "packages" must be an object, not ${describeType(packages)}`);
   for (const [key, entry] of Object.entries(packages)) {
     const resolution = lockEntryResolution(entry);
     const segments = lockKeySegments(key);
-    if (resolution === null || segments === null) continue;
+    if (resolution === null || segments === null) {
+      throw new Error(`bun.lock packages[${JSON.stringify(key)}] does not name a package and version`);
+    }
     const copy = {
       key,
       name: segments[segments.length - 1],
@@ -428,8 +431,8 @@ function resolveDependencyCopy(from, dep, byKey) {
 /**
  * Every copy installed below `starts` (their dependencies, transitively). A
  * copy whose dependencies the lock does not record is returned as `unknown`:
- * what lies below it cannot be decided. Each key is visited once, so the walk
- * is bounded by the size of the lock.
+ * what lies below it cannot be decided. A key is queued at most once below the
+ * starts, so the walk is bounded by the size of the lock.
  */
 function copiesBelow(starts, byKey) {
   const below = new Map();

@@ -333,6 +333,14 @@ describe("resolveRangedDeps", () => {
     }]);
   });
 
+  it("refuses an unreadable packages map or lock entry instead of skipping it", () => {
+    const deps = collectRangedDeps([{ pkg: { overrides: { "some-pin": "^1.0.0" } }, path: "package.json" }], new Set());
+    expect(() => resolveRangedDeps(deps, { packages: [] } as never)).toThrow('bun.lock "packages" must be an object, not an array');
+    expect(() => resolveRangedDeps(deps, { packages: { "some-pin": ["some-pin"] } })).toThrow(
+      'bun.lock packages["some-pin"] does not name a package and version',
+    );
+  });
+
   it("resolves a scoped package name from a lock key", () => {
     const deps = collectRangedDeps([{ pkg: { dependencies: { "@scope/pkg": "^4.0.0" } }, path: "package.json" }], new Set());
     expect(resolveRangedDeps(deps, lock).resolved[0].version).toBe("4.0.0");
@@ -519,7 +527,7 @@ const PACKUMENT_INTEGRITY = `sha512-${new Bun.CryptoHasher("sha512").update("dep
  * Generate a REAL bun.lock in `root`: `bun install --lockfile-only` for
  * `manifest`, against a registry served from this process whose packuments
  * carry each version's dependencies (`packages[name][version]`). Returns the
- * parsed lockfile. No tarball is fetched and nothing reaches the network.
+ * parsed lockfile. No tarball is fetched.
  */
 async function bunGeneratedLock(
   root: string,
@@ -599,8 +607,8 @@ const ALIAS_MANIFEST = {
 /*
  * Nested overrides: outer-dep -> inner-dep@1 -> child-dep ~1.1.0 and
  * other-dep -> inner-dep@2 -> child-dep ~1.2.0, with child-dep@2.0.0 at the
- * root. Bun writes three child-dep copies (bun 1.3 warns that it does not
- * apply nested overrides, so these are its own resolutions).
+ * root. Bun writes three child-dep copies (bun 1.3.10 warns that it does not
+ * support nested overrides, so these are its own resolutions).
  */
 const NESTED_PACKAGES = {
   "child-dep": { "1.1.0": {}, "1.1.5": {}, "1.2.0": {}, "1.2.5": {}, "2.0.0": {} },
