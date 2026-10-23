@@ -30,7 +30,7 @@ import {
 } from "../lib/federation-pair-access.js";
 import {
   ApiHttpError,
-  apiErrorBody,
+  apiErrorRawBody,
   defaultAdminPassPath,
   isLocalBase,
   resolveAdminPassFromSources,
@@ -594,8 +594,9 @@ export function describeFederationStatusFetchFailed(url: string, setting: string
  *  `TypeError: fetch failed`, Bun's `Unable to connect…`, or a cause
  *  carrying a connect/DNS errno. Auth and HTTP errors stay out. */
 export function isFederationStatusConnectFailure(err: unknown): boolean {
-  // An ApiHttpError means an HTTP response arrived, so the connection did not
-  // fail, whatever its body says (flair#2764).
+  // Every ApiHttpError is excluded: the ones sendJsonRequest raises are built
+  // only after a response arrived, so that connection did not fail, whatever
+  // the body says (flair#2764).
   if (err instanceof ApiHttpError) return false;
   const msg = err instanceof Error ? err.message : String(err);
   if (/\bfetch failed\b/i.test(msg)) return true;
@@ -630,7 +631,7 @@ export function isFederationStatusAuthFailure(err: unknown): boolean {
     const status = (err as { status?: unknown }).status;
     if (status === 401 || status === 403) return true;
   }
-  const m = apiErrorBody(err) || (err instanceof Error
+  const m = apiErrorRawBody(err) || (err instanceof Error
     ? err.message
     : String(typeof err === "object" && err && "message" in err
       ? (err as { message?: unknown }).message ?? err
@@ -650,7 +651,7 @@ export function isFederationStatusAuthRemedy(err: unknown): boolean {
   if (typeof err === "object" && "status" in err && (err as { status?: unknown }).status === 401) {
     return true;
   }
-  const m = apiErrorBody(err) || (err instanceof Error
+  const m = apiErrorRawBody(err) || (err instanceof Error
     ? err.message
     : String(typeof err === "object" && err && "message" in err
       ? (err as { message?: unknown }).message ?? err

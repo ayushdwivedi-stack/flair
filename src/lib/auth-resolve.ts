@@ -89,10 +89,12 @@ import { resolveHome } from "./home.js";
  *     case — distinguishes "we had nothing to send" from "we sent
  *     something and it was rejected", which is exactly the signal
  *     `authedRequest` uses to decide whether tier 5 (the floor) applies.
- *   - `body` (flair#2764): the response body as received, set by
- *     `fromResponse`. The message carries only `describeHttpFailure`'s
- *     bounded reason; code that classifies by the server's text reads the
- *     body through `apiErrorBody`.
+ *   - `body` (flair#2764): the response body, set by `fromResponse`. When
+ *     `sendJsonRequest` builds the error, every credential value the request
+ *     sent is already replaced by "[redacted]" in it (`withoutSentCredentials`).
+ *     The message carries only `describeHttpFailure`'s bounded reason of that
+ *     text. Code that classifies by the server's text reads the unredacted
+ *     text through `apiErrorRawBody` and never prints it.
  */
 export class ApiHttpError extends Error {
   readonly status: number;
@@ -106,10 +108,72 @@ export class ApiHttpError extends Error {
     this.body = body;
   }
 
-  /** The error for a non-2xx response, built from its body text. */
-  static fromResponse(status: number, body: string): ApiHttpError {
-    return new ApiHttpError(status, describeHttpFailure(status, body), false, body);
+  /**
+   * The error for a non-2xx response, built from its body text. `rawBody` is
+   * the text before credential redaction, kept for apiErrorRawBody only.
+   */
+  static fromResponse(status: number, body: string, rawBody: string = body): ApiHttpError {
+    const err = new ApiHttpError(status, describeHttpFailure(status, body), false, body);
+    rawBodies.set(err, rawBody);
+    return err;
   }
+}
+
+/**
+ * Response text before credential redaction (flair#2764), readable only
+ * through apiErrorRawBody, so the error's printable fields never carry it.
+ */
+const rawBodies = new WeakMap<ApiHttpError, string>();
+
+/** What a credential value the request sent becomes in printed server text. */
+export const REDACTED_CREDENTIAL = "[redacted]";
+
+/**
+ * The credential values an Authorization header carries (flair#2764): the
+ * header value, the part after its scheme, for Basic the decoded
+ * `user:password` and the password, and for TPS-Ed25519 the signature (its
+ * last `:`-separated field). Empty values are left out.
+ */
+function sentCredentialValues(authHeader: string | undefined): string[] {
+  if (!authHeader) return [];
+  const space = authHeader.indexOf(" ");
+  const scheme = space === -1 ? "" : authHeader.slice(0, space);
+  const credential = space === -1 ? authHeader : authHeader.slice(space + 1);
+  const values = [authHeader, credential];
+  if (scheme === "Basic") {
+    const decoded = Buffer.from(credential, "base64").toString("utf8");
+    const colon = decoded.indexOf(":");
+    if (colon !== -1) values.push(decoded, decoded.slice(colon + 1));
+  } else if (scheme === "TPS-Ed25519") {
+    values.push(credential.slice(credential.lastIndexOf(":") + 1));
+  }
+  return values.filter((value) => value.length > 0);
+}
+
+/**
+ * `text` with every occurrence of a credential value this request sent (see
+ * sentCredentialValues) replaced by REDACTED_CREDENTIAL (flair#2764). Exact
+ * matches only, found in one left-to-right pass; where two values start at the
+ * same place, the longer one is replaced.
+ */
+export function withoutSentCredentials(text: string, authHeader: string | undefined): string {
+  const values = [...new Set(sentCredentialValues(authHeader))].sort((a, b) => b.length - a.length);
+  if (values.length === 0 || text.length === 0) return text;
+  // next[j]: the first index at or after `at` where values[j] occurs (-1: none left).
+  const next = values.map((value) => text.indexOf(value));
+  let out = "";
+  let at = 0;
+  for (;;) {
+    let pick = -1;
+    for (let j = 0; j < values.length; j++) {
+      if (next[j] !== -1 && next[j] < at) next[j] = text.indexOf(values[j], at);
+      if (next[j] !== -1 && (pick === -1 || next[j] < next[pick])) pick = j;
+    }
+    if (pick === -1) break;
+    out += text.slice(at, next[pick]) + REDACTED_CREDENTIAL;
+    at = next[pick] + values[pick].length;
+  }
+  return out + text.slice(at);
 }
 
 /** The most characters boundServerText keeps before it cuts the text and appends "..." (flair#2764). */
@@ -170,18 +234,32 @@ export function describeHttpFailure(status: number, body: string): string {
 }
 
 /**
- * The full response body an ApiHttpError carries, for code that classifies a
- * failure by the server's text; undefined for any other error (flair#2764).
+ * The response body an ApiHttpError carries (`body`), safe to print: when
+ * sendJsonRequest built the error, the request's credential values in it are
+ * replaced. Undefined for any other error (flair#2764).
  */
 export function apiErrorBody(err: unknown): string | undefined {
   return err instanceof ApiHttpError ? err.body : undefined;
 }
 
 /**
+ * The response text before credential redaction, for code that classifies a
+ * failure by comparing the server's text (flair#2764). It may hold a credential
+ * the request sent, so callers only compare it and never print it. For an
+ * ApiHttpError not built by fromResponse it is `body`; undefined for any other
+ * error.
+ */
+export function apiErrorRawBody(err: unknown): string | undefined {
+  if (!(err instanceof ApiHttpError)) return undefined;
+  return rawBodies.get(err) ?? err.body;
+}
+
+/**
  * With FLAIR_DEBUG set (any non-empty value), write the body of a failed
  * response to stderr as one JSON string (flair#2764). `sendJsonRequest` calls
- * it where it builds the error from the body. `env` and `write` are injectable
- * for tests.
+ * it where it builds the error from the body, passing that body with the
+ * request's credential values already replaced. `env` and `write` are
+ * injectable for tests.
  */
 export function emitHttpErrorBodyDebug(
   method: string,
@@ -661,8 +739,12 @@ export async function sendJsonRequest(
   }
   const text = await res.text();
   if (!res.ok) {
-    emitHttpErrorBodyDebug(method, url.pathname, res.status, text);
-    throw ApiHttpError.fromResponse(res.status, text);
+    // Both outputs (the FLAIR_DEBUG line and the message) and `body` are built
+    // from the text with this request's credential values replaced; the
+    // unredacted text is kept for apiErrorRawBody's classifiers only.
+    const shown = withoutSentCredentials(text, authHeader);
+    emitHttpErrorBodyDebug(method, url.pathname, res.status, shown);
+    throw ApiHttpError.fromResponse(res.status, shown, text);
   }
   if (!text) return { ok: true };
   return JSON.parse(text);

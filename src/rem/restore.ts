@@ -23,7 +23,7 @@
  * Cross-agent restore is a 1.1+ feature.
  */
 import { encodeRecordId } from "../lib/record-id-path.js";
-import { ApiHttpError, apiErrorBody } from "../lib/auth-resolve.js";
+import { ApiHttpError, apiErrorRawBody } from "../lib/auth-resolve.js";
 import { readFileSync, existsSync, rmSync, mkdtempSync, statSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { tmpdir } from "node:os";
@@ -36,12 +36,12 @@ const RESTORE_PROVIDER_RETRY_DELAY_MS = 1_000;
 
 /**
  * The server's `error` code on an `ApiHttpError`, parsed from the response body
- * that error carries (`apiErrorBody`; the message is never read). Returns
+ * that error carries (`apiErrorRawBody`; the message is never read). Returns
  * undefined for a non-HTTP error, an error that carries no body, or a body
  * without a string `error` field.
  */
 function apiErrorCode(err: unknown): string | undefined {
-  const text = apiErrorBody(err);
+  const text = apiErrorRawBody(err);
   if (text === undefined) return undefined;
   try {
     const body = JSON.parse(text);

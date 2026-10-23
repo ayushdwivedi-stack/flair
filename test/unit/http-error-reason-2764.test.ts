@@ -3,14 +3,18 @@
  * body (every failure except a refused redirect, a credential-less 403 and a
  * response with `Content-Length: 0`), the ApiHttpError message is
  * `HTTP <status>` plus the JSON body's named error, or else a bounded one-line
- * excerpt of the body, and the error keeps the body as received, which
- * sendJsonRequest writes to stderr only with FLAIR_DEBUG set. A zero-length
- * failure keeps the message `HTTP <status>`, and the credential-less 403 keeps
- * main's hint.
+ * excerpt of the body, and the error keeps the body, which sendJsonRequest
+ * writes to stderr only with FLAIR_DEBUG set. Each credential value the request
+ * sent is replaced by `[redacted]` in that body, and so in the message and the
+ * stderr line. A zero-length failure keeps the message `HTTP <status>`, and the
+ * credential-less 403 keeps main's hint.
  *
  * Every request goes through the real sendJsonRequest to a node HTTP listener
- * on 127.0.0.1 that this file starts; the last describe spawns the built CLI
- * against another such listener, with a scratch HOME and FLAIR_URL naming it.
+ * on 127.0.0.1 that this file starts. Two kinds of case spawn the built CLI
+ * with a scratch HOME: the run-once describe names its listener with FLAIR_URL,
+ * and the alternate-port case sets no FLAIR_URL, naming one listener in the
+ * scratch `~/.flair/data/harper-config.yaml` and another in
+ * `~/.flair/config.yaml`.
  */
 import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { spawn } from "node:child_process";
@@ -19,7 +23,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import nacl from "tweetnacl";
-import { ApiHttpError, apiErrorBody, sendJsonRequest } from "../../src/lib/auth-resolve.ts";
+import { ApiHttpError, apiErrorBody, apiErrorRawBody, sendJsonRequest } from "../../src/lib/auth-resolve.ts";
 import { isNoBackendConfigured, isRemAbortedFailure, runNightlyCycle } from "../../src/rem/runner.ts";
 import { describeReflectError } from "../../src/commands/rem.ts";
 import {
@@ -38,14 +42,14 @@ import { nodeBin } from "../helpers/node-runtime.js";
 
 type Reply = { status: number; body: string };
 
-async function startListener(route: (line: string) => Reply) {
+async function startListener(route: (line: string, req: IncomingMessage) => Reply) {
   const seen: string[] = [];
   const server: Server = createServer((req: IncomingMessage, res: ServerResponse) => {
     req.resume();
     req.on("end", () => {
       const line = `${req.method} ${req.url}`;
       seen.push(line);
-      const reply = route(line);
+      const reply = route(line, req);
       res.writeHead(reply.status, { "Content-Type": "text/plain" });
       res.end(reply.body);
     });
@@ -434,4 +438,88 @@ describe("flair#2764 — an ApiHttpError is never a connect failure", () => {
       rmSync(recordedHome, { recursive: true, force: true });
     }
   }, 30_000);
+});
+
+describe("flair#2764 — credential values the request sent are replaced before either output", () => {
+  const PASSWORD = "s3cret-pass-2764-fixture";
+  const BASIC_CREDENTIAL = Buffer.from(`admin:${PASSWORD}`).toString("base64");
+  const BASIC = `Basic ${BASIC_CREDENTIAL}`;
+
+  /** GET /echo from a listener that answers 500 with a body built from the request's Authorization header. */
+  async function failEcho(authHeader: string, bodyOf: (sent: string) => string, debug: boolean) {
+    const echo = await startListener((_line, req) => ({ status: 500, body: bodyOf(String(req.headers.authorization ?? "")) }));
+    const written: string[] = [];
+    const spy = spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
+      written.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write);
+    const saved = process.env.FLAIR_DEBUG;
+    let caught: unknown;
+    try {
+      if (debug) process.env.FLAIR_DEBUG = "1";
+      else delete process.env.FLAIR_DEBUG;
+      await sendJsonRequest(new URL("/echo", `http://127.0.0.1:${echo.port}`), "GET", undefined, authHeader, true);
+    } catch (err) {
+      caught = err;
+    } finally {
+      spy.mockRestore();
+      if (saved === undefined) delete process.env.FLAIR_DEBUG;
+      else process.env.FLAIR_DEBUG = saved;
+      await echo.close();
+    }
+    expect(caught).toBeInstanceOf(ApiHttpError);
+    return { err: caught as ApiHttpError, stderr: written.filter((w) => w.startsWith("[flair] GET /echo")).join("") };
+  }
+
+  for (const debug of [false, true]) {
+    test(`a body echoing the Basic header, its credential, user:password and password${debug ? ", with FLAIR_DEBUG" : ""}`, async () => {
+      const { err, stderr } = await failEcho(
+        BASIC,
+        (sent) => JSON.stringify({ error: `bad credential ${sent}`, detail: `password ${PASSWORD}; basic ${BASIC_CREDENTIAL}; user admin:${PASSWORD}` }),
+        debug,
+      );
+      const shown = JSON.stringify({ error: "bad credential [redacted]", detail: "password [redacted]; basic [redacted]; user [redacted]" });
+      expect(err.message).toBe("HTTP 500: bad credential [redacted]");
+      expect(err.body).toBe(shown);
+      expect(apiErrorBody(err)).toBe(shown);
+      expect(stderr).toBe(debug ? `[flair] GET /echo answered HTTP 500; response body: ${JSON.stringify(shown)}\n` : "");
+      for (const text of [err.message, err.body!, stderr]) {
+        expect(text).not.toContain(PASSWORD);
+        expect(text).not.toContain(BASIC_CREDENTIAL);
+      }
+      // The unredacted text stays available to classifiers, which only compare it.
+      expect(apiErrorRawBody(err)).toContain(PASSWORD);
+    });
+  }
+
+  test("a body echoing a Bearer token and a TPS-Ed25519 signature", async () => {
+    const token = `tok-2764-${"q".repeat(40)}`;
+    const bearer = await failEcho(`Bearer ${token}`, (sent) => `rejected ${sent} (token ${token})`, true);
+    expect(bearer.err.message).toBe("HTTP 500: rejected [redacted] (token [redacted])");
+    expect(bearer.stderr).toBe(`[flair] GET /echo answered HTTP 500; response body: ${JSON.stringify("rejected [redacted] (token [redacted])")}\n`);
+    const signature = Buffer.from("signature-2764-fixture").toString("base64");
+    const signed = await failEcho(`TPS-Ed25519 agent-a:1760000000000:nonce-2764:${signature}`, () => `bad signature ${signature}`, true);
+    expect(signed.err.message).toBe("HTTP 500: bad signature [redacted]");
+    for (const text of [bearer.err.message, bearer.stderr, signed.err.message, signed.stderr]) {
+      expect(text).not.toContain(token);
+      expect(text).not.toContain(signature);
+    }
+  });
+
+  test("a body that is only the credential is replaced before the message is bounded", async () => {
+    const shortPass = await failEcho(`Basic ${Buffer.from("admin:pw2764").toString("base64")}`, () => "pw2764", false);
+    expect(shortPass.err.message).toBe("HTTP 500: [redacted]");
+    const longToken = `tok-${"k".repeat(296)}`;
+    const long = await failEcho(`Bearer ${longToken}`, () => longToken, false);
+    expect(long.err.message).toBe("HTTP 500: [redacted]");
+    expect(long.err.message).not.toContain("kkkk");
+  });
+
+  test("a body that carries no credential value is unchanged", async () => {
+    const { err, stderr } = await failEcho(BASIC, () => "upstream unavailable", true);
+    expect(err.message).toBe("HTTP 500: upstream unavailable");
+    expect(err.body).toBe("upstream unavailable");
+    expect(apiErrorRawBody(err)).toBe("upstream unavailable");
+    expect(stderr).toBe(`[flair] GET /echo answered HTTP 500; response body: "upstream unavailable"\n`);
+  });
 });

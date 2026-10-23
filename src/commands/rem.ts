@@ -637,8 +637,9 @@ export function candidateIncompleteFlag(claim: unknown): string | null {
 
 /**
  * Classifies a thrown /ReflectMemories execute-mode error for CLI display.
- * `api()` throws an ApiHttpError whose `body` is the response text for a non-2xx
- * response with a body (flair#2764) — the two classified distillation failures are:
+ * `api()` throws an ApiHttpError whose `body` is the response text, with the
+ * request's credential values replaced, for a non-2xx response with a body
+ * (flair#2764) — the two classified distillation failures are:
  *   503 no-backend:        { error: "No generative backend configured..." }
  *   502 distillation_failed: { error: "distillation_failed", detail: "..." }
  * The 503 pause refusal ({ error: "rem_aborted", detail: "..." }, sent while the

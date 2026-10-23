@@ -14,7 +14,7 @@
  * own messages unless the body is specifically a missing pairing role.
  */
 
-import { apiErrorBody } from "./auth-resolve.js";
+import { apiErrorRawBody } from "./auth-resolve.js";
 
 export const FEDERATION_INSTANCE_PATH = "/FederationInstance";
 export const FEDERATION_PAIR_LOCAL_ACCESS_ERROR_NAME = "FederationPairLocalAccessError";
@@ -49,7 +49,7 @@ export class FederationPairHubAccessError extends Error {
 }
 
 function errorText(err: unknown): string {
-  const body = apiErrorBody(err);
+  const body = apiErrorRawBody(err);
   if (body) return body;
   if (err instanceof Error) return err.message;
   if (typeof err === "object" && err && "message" in err) {

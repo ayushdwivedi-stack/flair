@@ -5,7 +5,13 @@
   line: line breaks become spaces, other control characters are removed, and
   text past 200 characters is cut and marked `...`. When the helper builds that
   message from a response body it read and `FLAIR_DEBUG` is set, it also writes
-  that body to stderr as received, encoded as one JSON string (#2764).
+  that body to stderr, encoded as one JSON string (#2764).
+
+  Before the message or that stderr line is built, every occurrence in the
+  response body of a credential value the request sent is replaced with
+  `[redacted]`: the Authorization header value, the part after its scheme, a
+  Basic header's decoded `user:password` and password, and a TPS-Ed25519
+  signature.
 
   An HTTP error response whose body mentions `fetch failed` or `unable to
   connect` is no longer treated as a failed connection: the CLI no longer

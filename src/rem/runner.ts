@@ -59,7 +59,7 @@ import { dirname, resolve } from "node:path";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import { createSnapshot } from "./snapshot.js";
 import { resolveHome } from "../lib/home.js";
-import { apiErrorBody, boundServerText } from "../lib/auth-resolve.js";
+import { apiErrorBody, apiErrorRawBody, boundServerText } from "../lib/auth-resolve.js";
 
 export const REM_PAUSE_FLAG = resolve(resolveHome(), ".flair", "rem.paused");
 export const REM_NIGHTLY_LOG = resolve(resolveHome(), ".flair", "logs", "rem-nightly.jsonl");
@@ -509,7 +509,8 @@ function rowsFromRead(raw: unknown, label: string): any[] {
 /**
  * Best-effort extraction of a readable message out of a thrown API error.
  * `api()` (src/cli.ts) throws an ApiHttpError whose `body` is the response
- * text for a non-2xx HTTP response with a body (flair#2764) — /ReflectMemories's
+ * text, with the request's credential values replaced, for a non-2xx HTTP
+ * response with a body (flair#2764) — /ReflectMemories's
  * 503 (no backend configured) and 502 (distillation_failed) bodies are JSON
  * `{ error: string, detail?: string }`. A JSON object with a string `error`
  * becomes one bounded line, `error: detail` when `detail` is a non-empty
@@ -532,7 +533,7 @@ function describeApiError(err: unknown): string {
 }
 
 function structuredApiError(err: unknown): string | null {
-  const message = apiErrorBody(err) || (typeof err === "string" ? err : (err as { message?: unknown })?.message);
+  const message = apiErrorRawBody(err) || (typeof err === "string" ? err : (err as { message?: unknown })?.message);
   if (typeof message !== "string") return null;
   try {
     const body = JSON.parse(message);
