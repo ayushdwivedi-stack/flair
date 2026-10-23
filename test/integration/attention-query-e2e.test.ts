@@ -97,15 +97,13 @@ describe("AttentionQuery e2e (real Harper)", () => {
     //
     // NOTE (measured, not assumed): table-backed resources (WorkspaceState/
     // Memory/OrgEvent/Relationship — every class shaped `extends
-    // (databases as any).flair.X`) only expose PUT over real HTTP, WITH the
-    // id in the URL path — the same restriction resources/Memory.ts's own
-    // comment documents ("the Memory schema only exposes PUT over HTTP...
-    // Memory.post() IS reachable, but only via an in-process resource
-    // instantiation"). A bare `POST /WorkspaceState` (what the shipped
-    // `flair workspace set` CLI command sent) was probed against this same
-    // real Harper and returned 405 "does not have a post method implemented
-    // to handle HTTP method POST" — a PRE-EXISTING gap in that CLI command,
-    // filed as flair#679 and FIXED there: `flair workspace set` and `flair
+    // (databases as any).flair.X`) accept writes at PUT /<Table>/<id>; HTTP
+    // POST /Memory additionally reaches Memory.post(), and flair-client's
+    // write()/update() use PUT. A bare `POST /WorkspaceState` (what the
+    // shipped `flair workspace set` CLI command sent) was probed against this
+    // same real Harper and returned 405 "does not have a post method
+    // implemented to handle HTTP method POST" — a PRE-EXISTING gap in that
+    // CLI command, filed as flair#679 and FIXED there: `flair workspace set` and `flair
     // orgevent` now both write via PUT /<Table>/{id} (src/cli.ts), verified
     // end-to-end against a real spawned Harper in
     // test/integration/workspace-orgevent-cli-e2e.test.ts. (`flair orgevent`'s

@@ -116,7 +116,7 @@ export class ReflectMemories extends Resource {
     // Authenticated identity comes from getContext().request, not this.request
     // (see SemanticSearch / MemoryBootstrap for the same bug class). The prior
     // check was silently bypassed — bob could reflect on alice's memories and
-    // mutate alice's records via the lastReflected patchRecordSilent below.
+    // mutate alice's records through the lastReflected stamp below.
     const ctx = (this as any).getContext?.();
     const request = ctx?.request ?? ctx;
     const actorId: string | undefined = request?.tpsAgent;
@@ -318,7 +318,10 @@ export class ReflectMemories extends Resource {
         // Write-window atomicity (#1263): generate has already succeeded.
         // Each MemoryCandidate.put is its own short commit. A throw mid-loop
         // leaves earlier puts durable and skips lastReflected (never reached).
-        // lastReflected is patchRecordSilent — it cannot fail the request.
+        // The stamp runs patchRecord under withMemoryWriteLockOnce and confirms
+        // its committed row; a held lock, a refused write-back or an
+        // unconfirmed row logs and skips the stamp for that id. A stamp
+        // failure does not fail the request.
         // 502/503 stay generate-only (no_backend / distillation_failed).
         const staged: any[] = [];
         for (const c of toStage) {
