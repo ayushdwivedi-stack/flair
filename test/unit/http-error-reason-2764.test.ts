@@ -585,17 +585,61 @@ describe("flair#2764 — the request's credential values are redacted in every o
   });
 
   test("a Basic password a/b echoed in JSON as a\\/b, as a\\u002fb and as a/b is absent from every output", async () => {
-    const { err, stderr } = await failEcho(
-      `Basic ${Buffer.from("admin:a/b").toString("base64")}`,
-      () => String.raw`{"error":"bad a\/b","detail":"a/b and a/b"}`,
-      true,
-    );
+    const bs = String.fromCharCode(92);
+    const raw = `{"error":"bad a${bs}/b","detail":"a/b and a${bs}u002fb"}`;
+    const { err, stderr } = await failEcho(`Basic ${Buffer.from("admin:a/b").toString("base64")}`, () => raw, true);
+    // The fixture holds all three spellings.
+    expect(apiErrorRawBody(err)).toBe(raw);
+    expect(raw).toContain(`a${bs}u002fb`);
     const display = describeReflectError(err).text;
     expect(err.message).toBe("HTTP 500: bad [redacted]");
     expect(err.body).toBe('{"error":"bad [redacted]","detail":"[redacted] and [redacted]"}');
     expect(display).toBe("bad [redacted]");
     for (const text of [err.message, err.body!, stderr, display]) {
-      for (const spelling of ["a/b", String.raw`a\/b`, String.raw`a\\/b`, String.raw`a/b`]) expect(text).not.toContain(spelling);
+      for (const spelling of ["a/b", `a${bs}/b`, `a${bs}${bs}/b`, `a${bs}u002fb`, `a${bs}${bs}u002fb`]) expect(text).not.toContain(spelling);
+    }
+  });
+
+  test("a valid JSON body nested too deep to redact is withheld from every output", async () => {
+    const bs = String.fromCharCode(92);
+    const depth = 1_000_000;
+    const { err, stderr } = await failEcho(
+      `Basic ${Buffer.from("admin:a/b").toString("base64")}`,
+      () => `${"[".repeat(depth)}"a${bs}/b"${"]".repeat(depth)}`,
+      true,
+    );
+    const display = describeReflectError(err).text;
+    expect(err.body).toBe("[body withheld]");
+    expect(err.message).toBe("HTTP 500: [body withheld]");
+    expect(stderr).toBe('[flair] GET /echo answered HTTP 500; response body: "[body withheld]"\n');
+    expect(display).toBe(err.message);
+    for (const text of [err.message, err.body!, stderr, display]) {
+      for (const spelling of ["a/b", `a${bs}/b`]) expect(text).not.toContain(spelling);
+    }
+  }, 30_000);
+
+  test("the HTTP prefix and the cut marker are not passed through redaction", async () => {
+    const prefixPass = await failEcho(`Basic ${Buffer.from("admin:HTTP").toString("base64")}`, () => "HTTP gateway down", false);
+    expect(prefixPass.err.message).toBe("HTTP 500: [redacted] gateway down");
+    // A password of "..." is never printed as the marker: the cut text ends without it.
+    const dots = await failEcho(`Basic ${Buffer.from("admin:...").toString("base64")}`, () => "x".repeat(300), false);
+    expect(dots.err.message).toBe(`HTTP 500: ${"x".repeat(200)}`);
+    // Where the marker would complete the password, the kept text ends before it.
+    const tail = await failEcho(`Basic ${Buffer.from("admin:x...").toString("base64")}`, () => `${"a".repeat(199)}xq${"b".repeat(50)}`, false);
+    expect(tail.err.message).toBe(`HTTP 500: ${"a".repeat(199)}...`);
+    for (const { err } of [prefixPass, dots, tail]) expect(err.message.length).toBeLessThanOrEqual("HTTP 500: ".length + 200 + 3);
+  });
+
+  test("a decoded path holding control characters is withheld, and C1 controls in the body are escaped", async () => {
+    const token = "tok-2764-control";
+    const path = await failEcho(`Bearer ${token}`, () => "nope", true, "/echo/%0A%1B%5B2J");
+    expect(path.stderr).toBe('[flair] GET [path withheld] answered HTTP 500; response body: "nope"\n');
+    const csi = String.fromCharCode(0x9b);
+    const body = await failEcho(`Bearer ${token}`, () => `bad${csi}[2Jthing`, true);
+    expect(body.err.message).toBe("HTTP 500: bad[2Jthing");
+    expect(body.stderr).toBe(`[flair] GET /echo answered HTTP 500; response body: "bad${String.fromCharCode(92)}u009b[2Jthing"\n`);
+    for (const line of [path.stderr, body.stderr]) {
+      expect(line.slice(0, -1)).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
     }
   });
 

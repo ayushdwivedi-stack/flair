@@ -2,9 +2,9 @@
  * flair#2764 against a real Harper started with FLAIR_REM_PAUSE=1. Each refused
  * request below sends a credential, so sendJsonRequest builds the error from
  * the response body: the message is a bounded `HTTP <status>: <reason>`, the
- * error keeps the body as received, the pair command's AccessViolation rewrite
- * still recognises Harper's real 403 body, and rem's pause check still
- * classifies the real /ReflectMemories 503.
+ * error keeps the body in its display form (a JSON body re-serialized), the
+ * pair command's AccessViolation rewrite still recognises Harper's real 403
+ * body, and rem's pause check still classifies the real /ReflectMemories 503.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import nacl from "tweetnacl";
