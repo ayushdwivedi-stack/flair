@@ -61,6 +61,9 @@ export interface SpawnOffender {
 export function topLevelArgs(src: string, open: number): { spans: Array<{ start: number; end: number; text: string }>; close: number } | null;
 export function cliEntryIdentifiers(source: string): Set<string>;
 export function aliasedSpawnFns(source: string): Map<string, string>;
+/** The source with every JSX text node masked by spaces, keeping length and line breaks (flair#2808). */
+export function maskJsxText(source: string, fileName?: string): string;
+
 /** Throws, naming `fileName`, when TypeScript's parser reports a syntax error in `source` (flair#2774). */
 export function findSpawnCalls(source: string, fileName?: string): { calls: SpawnCall[]; ids: Set<string> };
 export function functionBodies(source: string): Array<{ name: string; start: number; end: number }>;

@@ -198,23 +198,29 @@ function parseSourceFile(src, fileName = UNNAMED_SOURCE) {
 }
 
 /**
- * Whether `fileName` selects a script kind in which TypeScript parses JSX
- * (`.tsx` / `.jsx`).
+ * Whether `fileName` selects a script kind in which TypeScript parses JSX:
+ * `.tsx` and `.jsx` (`ScriptKind.TSX` / `ScriptKind.JSX`), and `.js`, `.mjs`
+ * and `.cjs` (`ScriptKind.JS`, which TypeScript also parses as the JSX
+ * language variant). `.ts`, `.mts` and `.cts` are parsed as standard
+ * TypeScript and cannot contain JSX.
  */
 function isJsxFileName(fileName) {
-  const ext = /\.([^./\\]+)$/.exec(fileName)?.[1]?.toLowerCase();
-  return ext === "tsx" || ext === "jsx";
+  const kind = scriptKindFor(fileName);
+  return kind === ts.ScriptKind.TSX || kind === ts.ScriptKind.JSX || kind === ts.ScriptKind.JS;
 }
 
 /**
  * The source with every JSX TEXT node replaced by spaces, keeping its length and
- * its newlines (flair#2808). JSX text is prose to the parser, not code: an
+ * its line breaks (flair#2808). JSX text is prose to the parser, not code: an
  * apostrophe, quote or `//` in it otherwise opens a string or a comment in the
- * text-based bracket walks and swallows the closing paren of the call or case
- * around it. A JSX attribute's string value is a TypeScript string literal, which
- * the literal masker already blanks (and `skipNonCode` already skips).
+ * text-based walks and swallows the closing paren of the call or case around
+ * it. Each `JsxText` node is masked from `pos` to `end`, replacing every
+ * character except `\n`, `\r` and the pair `\r\n` with a space, so lengths
+ * and line/column positions stay aligned. A JSX attribute's string value is a
+ * TypeScript string literal, which the literal masker already blanks (and
+ * `skipNonCode` already skips).
  */
-function maskJsxText(src, fileName = UNNAMED_SOURCE) {
+export function maskJsxText(src, fileName = UNNAMED_SOURCE) {
   if (!isJsxFileName(fileName)) return src;
   const sf = parseSourceFile(src, fileName);
   const out = src.split("");
@@ -222,8 +228,9 @@ function maskJsxText(src, fileName = UNNAMED_SOURCE) {
   const visit = (node) => {
     if (node.kind === ts.SyntaxKind.JsxText) {
       masked = true;
-      const start = node.getStart(sf);
-      for (let j = start; j < node.end && j < src.length; j++) if (src[j] !== "\n") out[j] = " ";
+      for (let j = node.pos; j < node.end && j < src.length; j++) {
+        if (src[j] !== "\n" && src[j] !== "\r") out[j] = " ";
+      }
       return;
     }
     ts.forEachChild(node, visit);
@@ -667,9 +674,9 @@ function optionsDeadlineMs(arg) {
 
 /** All spawn-family calls in the file (node forms + Bun forms), with CLI-entry targeting. */
 export function findSpawnCalls(source, fileName = UNNAMED_SOURCE) {
-  // JSX text is masked first, so both the literal masker's bracket walks and the
-  // text-based identifier scans see prose as spaces (flair#2808). Indices still
-  // point at the original source, which the call text is sliced from.
+  // JSX text is masked first, so the literal masker and the text-based
+  // identifier scans see prose as spaces (flair#2808). Indices still point at
+  // the original source, which the call text is sliced from.
   const jsxSafe = maskJsxText(source, fileName);
   const sf = parseSourceFile(jsxSafe, fileName);
   const scan = maskLiteralsAndComments(jsxSafe, fileName, sf);
@@ -1082,7 +1089,9 @@ function scopeOf(index, bodies, cases) {
 export function analyzeTestFile(source, fileName = UNNAMED_SOURCE) {
   const { calls, ids } = findSpawnCalls(source, fileName);
   // The case/helper walks match brackets in TEXT, so they read the source with
-  // JSX text masked too; every index still points at the original character.
+  // JSX text masked in every file kind TypeScript parses JSX in (tsx, jsx,
+  // js/mjs/cjs); the mask keeps length and line breaks, so every index still
+  // points at the original character.
   const jsxSafe = maskJsxText(source, fileName);
   const helpers = localHelpersThatSpawn(jsxSafe, calls);
   const bodies = functionBodies(jsxSafe);
