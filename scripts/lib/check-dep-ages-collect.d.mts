@@ -102,8 +102,9 @@ export function classifyOverrides(overrides: unknown): OverrideRule[];
  *
  * Exemptions: `@tpsdev-ai/*`, keep-current list, `workspace:`, `file:`/`link:`,
  * `git+`/`github:`. A `dependencies` / `optionalDependencies` entry is
- * classified by the same classifier the override grammar uses; only an exact
- * version is collected here (collectRangedDeps collects ranges).
+ * classified by classifyDependencySpec, the override value classifier except
+ * that "" and "*" are ranges (as overrides they override nothing); only an
+ * exact version is collected here (collectRangedDeps collects ranges).
  *
  * `peerDependencies` are NOT checked: peers are resolved from a range by the
  * consumer's install, so an exact-pin check of our declaration does not

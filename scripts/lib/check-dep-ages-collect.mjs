@@ -14,12 +14,13 @@
  * - `dependencies` / `optionalDependencies`: npm and bun install
  *   optionalDependencies by default (a failed install is non-fatal, not
  *   skipped), so they install just like any other dep and represent the same
- *   supply-chain risk. An entry is classified by the same classifier the
- *   override grammar uses (classifyRegistrySpec): an exact version is
- *   age-checked, a range is age-checked at the version bun.lock resolves it
- *   to (resolveRangedDeps), a form the classifier refuses fails the gate
- *   (collectUnsupportedDeps), and an exact `npm:` alias is checked at its
- *   target's version.
+ *   supply-chain risk. An entry is classified by classifyDependencySpec,
+ *   which is the override value classifier (classifyOverrideValue) except
+ *   that "" and "*" are ranges (as overrides they override nothing): an exact
+ *   version is age-checked, a range is age-checked at the version bun.lock
+ *   resolves it to (resolveRangedDeps), a form the classifier refuses fails
+ *   the gate (collectUnsupportedDeps), and an exact `npm:` alias is checked at
+ *   its target's version.
  * - `devDependencies`: ranges are age-checked at their lock resolution, like
  *   dependencies; exact pins are not age-checked, as before; a form the
  *   classifier refuses fails the gate (collectUnsupportedDeps).
@@ -135,7 +136,7 @@ function classifyOverrideValue(name, spec) {
   return classifyRegistrySpec(name, spec);
 }
 
-/** Classify a `dependencies` / `optionalDependencies` specifier; there "" and "*" are ranges. */
+/** Classify a `dependencies` / `devDependencies` / `optionalDependencies` specifier: as an override value, except that "" and "*" are ranges (as overrides they override nothing). */
 function classifyDependencySpec(name, spec) {
   if (spec === "" || spec === "*") return { kind: "range", name, spec };
   return classifyOverrideValue(name, spec);
@@ -207,7 +208,8 @@ function formatOverridePath(path) {
  *
  * Exemptions: `@tpsdev-ai/*`, keep-current list, `workspace:`, `file:`/`link:`,
  * `git+`/`github:`. A `dependencies` / `optionalDependencies` entry is
- * classified by classifyRegistrySpec; only an exact version is collected here
+ * classified by classifyDependencySpec (the override value classifier, except
+ * that "" and "*" are ranges); only an exact version is collected here
  * (collectRangedDeps collects ranges).
  *
  * `peerDependencies` are NOT checked: peers are resolved from a range by the
