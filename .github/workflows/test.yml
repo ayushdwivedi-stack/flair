@@ -2111,7 +2111,7 @@ jobs:
           consumer_install "$OPENCLAW_PREFIX" --legacy-peer-deps "$CLIENT_TGZ" "$OPENCLAW_TGZ"
           consumer_install "$PI_PREFIX" "$CLIENT_TGZ" "$PI_TGZ"
           consumer_install "$N8N_PREFIX" --legacy-peer-deps "$CLIENT_TGZ" "$N8N_TGZ"
-          consumer_install "$BENCH_PREFIX" "$CLIENT_TGZ" "$BENCH_TGZ"
+          consumer_install "$BENCH_PREFIX" "$BENCH_TGZ"
           bun "$GITHUB_WORKSPACE/scripts/audit-gate.mjs" --explain \
             --npm-install-prefix "$PREFIX" \
             --adk-npm-install-prefix "$ADK_PREFIX" \
